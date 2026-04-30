@@ -4,6 +4,8 @@
 
 This document describes a practical framework layered on top of `wingui` for applications that want a graphical terminal with optional audio, while keeping the application's own logic off the foreground UI thread.
 
+The missing top-level coordination component in that framework is the product-facing runtime we should call `SuperTerminal`: a single API surface that composes declarative native UI, fast-path Direct3D panes, input, audio, and lifecycle into one application model.
+
 The intended model is:
 
 - The framework starts the `wingui` window and message pump on the foreground thread.
@@ -29,9 +31,37 @@ That split matches the current `wingui` surface well: window creation, message p
 - Treating every terminal write as an immediate render call.
 - Supporting multiple client threads in the first version.
 
+## The Missing Coordination Layer: SuperTerminal
+
+The current design already describes the right primitives, but it still reads like two neighboring systems:
+
+- a declarative native UI framework for Win32 controls
+- a fast-path Direct3D terminal and graphics surface host
+
+What is missing is the explicit coordination component that turns those primitives into one coherent application API.
+
+That component should be named `SuperTerminal`.
+
+`SuperTerminal` is not another renderer and not a second UI toolkit. It is the composition root and public runtime contract for applications that want all of the following at once:
+
+- declarative menus, forms, lists, dialogs, and chrome
+- one or more hosted text-grid panes
+- one or more hosted indexed-graphics panes
+- one or more hosted RGBA panes
+- unified input, lifecycle, and audio services
+- a single client-thread programming model
+
+The key idea is that an application should not think in terms of "the native UI system over here" and "the Direct3D panes over there". It should think in terms of one `SuperTerminal` app model where:
+
+- the declarative tree defines the window structure and pane placement
+- the fast-path commands stream content into pane ids declared by that tree
+- the host coordinates both under one queue, one lifecycle, and one event model
+
+Without this coordination layer, the design remains technically correct but product-incomplete.
+
 ## Core Architecture
 
-The framework should be split into three layers.
+The framework should be split into four layers.
 
 ### 1. Wingui platform layer
 
@@ -42,24 +72,42 @@ This is the existing `wingui` library.
 - D3D11 context and renderers
 - Audio and MIDI services
 
-### 2. Terminal framework layer
+### 2. Hosted presentation engines
 
-This is the new host runtime built on `wingui`.
+These are the retained presentation subsystems coordinated by the runtime.
 
-- Owns the window, renderer instances, and terminal state model
+- native declarative UI host and reconciler
+- text-grid surface host
+- indexed-graphics surface host
+- RGBA pane surface host
+- menu and pane layout state
+
+These are UI-thread owned implementation pieces, not the public app-facing API.
+
+### 3. SuperTerminal coordination layer
+
+This is the missing product-facing runtime built on top of `wingui` and the hosted presentation engines.
+
+It is the layer applications should target.
+
+- Owns the window, renderer instances, native UI engine, and pane registry
 - Starts and joins the client thread
 - Drains client-to-UI commands
 - Collects UI-to-client input events
 - Coordinates shutdown and error reporting
+- Presents one coherent app model instead of exposing adjacent subsystems
+- Defines the contract between declarative pane layout and fast-path surface updates
 
-### 3. Client application layer
+### 4. Client application layer
 
 This is the user's application.
 
 - Receives a startup callback on a worker thread
-- Pushes terminal/UI commands through a host context
+- Pushes terminal/UI commands through a SuperTerminal client context
 - Reads keyboard, mouse, resize, and control events from an event queue
 - Does not call `wingui_create_window_utf8`, `wingui_create_context`, or any renderer functions directly
+
+In other words: `wingui` is the platform, the hosted native and Direct3D pieces are retained engines, and `SuperTerminal` is the actual application runtime.
 
 ## Threading Model
 
@@ -73,6 +121,7 @@ The foreground thread owns:
 - `WinguiContext`
 - `WinguiTextGridRenderer`
 - `WinguiIndexedGraphicsRenderer` and `WinguiRgbaPaneRenderer` if enabled
+- the reconciled declarative layout that positions both standard Win32 controls and hosted Direct3D panes
 - terminal presentation state
 - menu state
 - framework lifecycle state visible to Win32
@@ -82,6 +131,7 @@ The UI thread is responsible for:
 - creating the window
 - pumping Win32 messages
 - draining the command queue
+- reconciling the declarative tree into control layout, pane layout, and retained host state
 - updating retained terminal state
 - rendering frames
 - forwarding user input into the event queue
@@ -156,14 +206,47 @@ When commands are drained, the host updates its retained model and reconciles th
 
 This design intentionally establishes a dual-latency model across the strict queue boundary, treating it as a core architectural feature:
 
-- **Fast Path (Binary/Dense):** Commands mutating the terminal grid or sprite surfaces pass dense, binary C-structs (e.g., `WINGUI_TERMINAL_CMD_WRITE_GLYPHS`). Because these surfaces are flat 2D arrays that never change structural topology, the client can safely blast thousands of high-speed, low-latency updates per frame with near-zero allocation overhead.
+- **Fast Path (Binary/Dense):** Commands mutating the terminal grid or sprite surfaces pass dense, binary C-structs (e.g., `SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS`). Because these surfaces are flat 2D arrays that never change structural topology, the client can safely blast thousands of high-speed, low-latency updates per frame with near-zero allocation overhead.
 - **Slow Path (Structural/Sparse):** The native UI "chrome" (menus, lists, dialogs) manages complex hierarchical layouts, nested scrolling, and focus trees. Manipulating this via the `ui_model` Virtual DOM and JSON patches incurs a small serialization overhead, yielding a perfectly acceptable 1-2 frame asynchronous UI latency.
 
 By preserving this duality, the client application achieves maximum throughput for its core terminal/graphical canvas, while enjoying the safety and ergonomics of a declarative, web-like UI model for its HUD and tooling—without either path ever violating the strict thread isolation rules.
 
+## SuperTerminal Responsibilities
+
+`SuperTerminal` should be the only high-level API most applications need to understand.
+
+Its responsibilities are:
+
+- own the UI-thread host runtime and all retained presentation subsystems
+- expose a single startup entry point for launching an application
+- define how declarative layout names and places fast-path panes
+- route client commands either to the slow structural path or the fast binary path
+- translate UI-thread events into one ordered client-visible event stream
+- provide a single shutdown, diagnostics, and error-reporting model
+
+That means the lower-level pieces should be treated as implementation detail boundaries:
+
+- `wingui.h` remains the platform and rendering primitive layer
+- `native_ui.h` remains the Win32 declarative host and reconciler layer
+- `ui_model.h` remains the client-side authoring and diff layer
+- `SuperTerminal` becomes the composition and usage layer tying them together
+
 ## Runtime Components
 
 The framework layer should expose a small set of internal components.
+
+### SuperTerminal
+
+Public coordination object.
+
+Suggested responsibilities:
+
+- present one unified application API to the client
+- own the internal `TerminalHost`
+- bind declarative pane definitions to fast-path surface instances
+- manage lifecycle, diagnostics, and policy choices visible at the API boundary
+
+The important distinction is that `TerminalHost` is the internal host/runtime object, while `SuperTerminal` is the public conceptual product and API surface built on top of it.
 
 ### TerminalHost
 
@@ -181,21 +264,21 @@ Suggested responsibilities:
 Suggested fields:
 
 ```c
-typedef struct WinguiTerminalHost {
+typedef struct TerminalHost {
     WinguiWindow* window;
     WinguiContext* context;
     WinguiTextGridRenderer* text_renderer;
     WinguiIndexedGraphicsRenderer* graphics_renderer;
     WinguiRgbaPaneRenderer* rgba_renderer;
     WinguiNativeUiHost* native_ui;
-    WinguiTerminalCommandQueue ui_queue;
-    WinguiTerminalEventQueue client_queue;
-    WinguiTerminalSurface surface;
-    WinguiTerminalLifecycle lifecycle;
+    SuperTerminalCommandQueue ui_queue;
+    SuperTerminalEventQueue client_queue;
+    TerminalSurface surface;
+    SuperTerminalLifecycle lifecycle;
     void* client_thread_handle;
     uint32_t wake_message;
     int32_t exit_code;
-} WinguiTerminalHost;
+} TerminalHost;
 ```
 
 ### TerminalSurface
@@ -228,11 +311,134 @@ Recommended contents:
 
 This object belongs to `TerminalHost`, is owned by the UI thread, and should be treated as another retained presentation surface rather than a separate application runtime.
 
+### Pane registry and layout bridge
+
+This is the internal bridge that makes `SuperTerminal` feel unified instead of split.
+
+Recommended contents:
+
+- authoritative pane ids exported from the declarative tree
+- pane type metadata (`text-grid`, `indexed-graphics`, `rgba-pane`)
+- resolved client rectangles for each pane
+- bindings from pane id to renderer-owned retained surface state
+- dirty and visibility state for each hosted pane
+
+This bridge is what lets the declarative tree own structure while the fast path owns content.
+
+## Unified Surface Model
+
+The central design rule for `SuperTerminal` is that declarative layout and Direct3D pane streaming are two views of the same UI, not two unrelated APIs.
+
+The declarative tree should be authoritative for structure:
+
+- window title and high-level window props
+- split views, stacks, rows, tabs, cards, forms, and menus
+- standard Win32 controls and their placement inside that layout
+- hosted pane placeholder nodes with stable ids and types
+
+The hosted application should remain authoritative for its own logical model.
+
+That means:
+
+- the backend computes and owns the application state that produces the declarative tree
+- the reactive model publishes full trees or patches for structural UI and standard control updates
+- the same backend separately emits high-speed binary commands for text-grid and graphics pane content
+- the UI thread never becomes the source of truth for application state; it only retains and reconciles the latest published view of it
+
+The fast-path commands should be authoritative for content:
+
+- text cell data for a text-grid pane id
+- indexed framebuffer, sprite atlas, and palette updates for an indexed pane id
+- BGRA buffer allocation, upload, and present requests for an RGBA pane id
+
+Standard Win32 controls participate through the reactive path:
+
+- their position and lifetime come from the declarative layout
+- their property updates come from declarative publishes or patches
+- their user interactions are translated into semantic events and sent back to the backend model
+
+This yields a clean mental model:
+
+1. The backend owns the application model and publishes a declarative tree that says which controls and panes exist and where they live.
+2. The UI thread reconciles that tree into Win32 control placement and authoritative pane rectangles.
+3. Native controls raise semantic events back to the backend, which updates its model and publishes patches when needed.
+4. The backend streams fast content updates into the declared pane ids.
+5. The host renders the combined result as one window.
+
+That is the actual value of `SuperTerminal`: it unifies structural layout and real-time graphics into one runtime contract.
+
+## Public API Shape
+
+The public API should be framed around `SuperTerminal`, not around the individual hosted subsystems.
+
+Conceptually, the surface should look like this:
+
+```c
+typedef struct SuperTerminalApp SuperTerminalApp;
+typedef struct SuperTerminalClientContext SuperTerminalClientContext;
+typedef struct SuperTerminalPaneId {
+    uint64_t value;
+} SuperTerminalPaneId;
+
+typedef struct SuperTerminalAppDesc {
+    const char* title_utf8;
+    uint32_t flags;
+    const char* initial_ui_json_utf8;
+    int32_t (WINGUI_CALL *startup)(SuperTerminalClientContext* ctx, void* user_data);
+    void (WINGUI_CALL *shutdown)(void* user_data);
+    void* user_data;
+} SuperTerminalAppDesc;
+```
+
+The exact names can change. The important part is that the app launches one coordinated runtime, not a bag of neighboring services.
+
+From that client context, the app should be able to:
+
+- publish or patch the declarative UI model
+- stream text-grid, indexed, and RGBA content into named panes
+- receive input and native control events through one event queue
+- sample high-speed keyboard and mouse sensor state once per frame without reconstructing it from events
+- trigger audio and lifecycle requests through the same runtime
+
+More concretely, the API boundary should expose four categories of operation:
+
+- lifecycle: create, run, stop, and join one `SuperTerminal` app instance
+- structural UI: publish or patch the declarative tree that defines controls, panes, menus, and layout
+- pane streaming: send dense binary updates into a previously declared pane id
+- event/input: consume one ordered event stream plus optional polled key and mouse state
+
+That is the crucial split: structure is declarative and comparatively slow; pane content is binary and comparatively fast.
+
+## Relationship to Existing Pieces
+
+`SuperTerminal` should be implemented mostly as composition, not reinvention.
+
+Existing pieces already line up well:
+
+- `native_ui.cpp` already knows how to reconcile declarative Win32 UI and expose pane placeholders
+- `ui_model.cpp` already gives the client a strongly-typed builder and diff layer for structural UI
+- `wingui.cpp` already provides the text-grid, indexed-graphics, RGBA, window, input, and audio primitives
+
+The missing work is to define and document the coordinating boundary that owns them together.
+
+Put differently:
+
+- `native_ui` should not be presented as a separate app runtime
+- fast-path panes should not be presented as a separate rendering product
+- both should be subsumed under `SuperTerminal`
+
 ### Command queue
 
 Carries client-to-UI operations.
 
 This queue should be bounded and typed. For the first implementation, a mutex-protected ring buffer is acceptable. If throughput later matters, it can become an SPSC lock-free ring without changing the public API.
+
+The queue should be treated as two logical lanes carried by one physical transport:
+
+- structural commands: `SUPERTERMINAL_CMD_NATIVE_UI_*` and related window/menu commands
+- fast-path pane commands: `SUPERTERMINAL_CMD_TEXT_GRID_*`, `SUPERTERMINAL_CMD_INDEXED_*`, and `SUPERTERMINAL_CMD_RGBA_*`
+
+They can share one bounded queue implementation, but the command taxonomy must keep them visibly distinct.
 
 ### Event queue
 
@@ -262,12 +468,12 @@ Direction:
 
 Use it for:
 
-- terminal writes
-- native UI publish/patch/update commands
-- title changes
-- palette changes
-- bell/audio requests
-- cursor updates
+- structural `NATIVE_UI_*` commands
+- pane-targeted text-grid commands
+- pane-targeted indexed-graphics commands
+- pane-targeted RGBA commands
+- title and window state changes
+- audio requests
 - clipboard requests
 - menu state changes
 - controlled shutdown requests
@@ -283,6 +489,7 @@ Use it for:
 
 - input events
 - native control dispatch events
+- pane input and focus events
 - window resize notifications
 - focus changes
 - close requests
@@ -294,8 +501,8 @@ Do not make the UI thread poll aggressively.
 
 When the client enqueues a command, it should also wake the UI thread. On Windows, the cleanest option is a custom posted message:
 
-- reserve `WM_APP + N` for `WINGUI_TERMINAL_WAKE`
-- after pushing one or more commands, call `PostMessage(hwnd, WINGUI_TERMINAL_WAKE, 0, 0)`
+- reserve `WM_APP + N` for `SUPERTERMINAL_WAKE`
+- after pushing one or more commands, call `PostMessage(hwnd, SUPERTERMINAL_WAKE, 0, 0)`
 
 The UI thread then drains the queue during normal message processing or before rendering the next frame.
 
@@ -308,79 +515,248 @@ Commands should be explicit tagged unions, not loosely structured callbacks.
 Example:
 
 ```c
-typedef enum WinguiTerminalCommandType {
-    WINGUI_TERMINAL_CMD_NOP = 0,
-    WINGUI_TERMINAL_CMD_WRITE_GLYPHS,
-    WINGUI_TERMINAL_CMD_CLEAR_REGION,
-    WINGUI_TERMINAL_CMD_SCROLL_REGION,
-    WINGUI_TERMINAL_CMD_SET_CURSOR,
-    WINGUI_TERMINAL_CMD_SET_TITLE,
-    WINGUI_TERMINAL_CMD_SET_PALETTE,
-    WINGUI_TERMINAL_CMD_NATIVE_UI_PUBLISH,
-    WINGUI_TERMINAL_CMD_NATIVE_UI_PATCH,
-    WINGUI_TERMINAL_CMD_PLAY_SOUND,
-    WINGUI_TERMINAL_CMD_REQUEST_PRESENT,
-    WINGUI_TERMINAL_CMD_REQUEST_CLOSE
-} WinguiTerminalCommandType;
+typedef enum SuperTerminalCommandType {
+    SUPERTERMINAL_CMD_NOP = 0,
 
-typedef struct WinguiTerminalCommand {
-    WinguiTerminalCommandType type;
+    /* Structural and reactive UI lane. */
+    SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH,
+    SUPERTERMINAL_CMD_NATIVE_UI_PATCH,
+    SUPERTERMINAL_CMD_NATIVE_UI_SET_MENU,
+    SUPERTERMINAL_CMD_NATIVE_UI_CLEAR_MENU,
+    SUPERTERMINAL_CMD_WINDOW_SET_TITLE,
+    SUPERTERMINAL_CMD_WINDOW_SET_STATE,
+    SUPERTERMINAL_CMD_WINDOW_FLASH,
+    SUPERTERMINAL_CMD_CLIPBOARD_SET_TEXT,
+    SUPERTERMINAL_CMD_CLIPBOARD_REQUEST_TEXT,
+
+    /* Fast text-grid pane lane. */
+    SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS,
+    SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION,
+    SUPERTERMINAL_CMD_TEXT_GRID_SCROLL_REGION,
+    SUPERTERMINAL_CMD_TEXT_GRID_SET_CURSOR,
+    SUPERTERMINAL_CMD_TEXT_GRID_SET_PALETTE,
+
+    /* Fast indexed-graphics pane lane. */
+    SUPERTERMINAL_CMD_INDEXED_DEFINE_PALETTE,
+    SUPERTERMINAL_CMD_INDEXED_UPLOAD_TILES,
+    SUPERTERMINAL_CMD_INDEXED_UPLOAD_SPRITES,
+    SUPERTERMINAL_CMD_INDEXED_PRESENT,
+
+    /* Fast RGBA pane lane. */
+    SUPERTERMINAL_CMD_RGBA_ALLOCATE_BUFFER,
+    SUPERTERMINAL_CMD_RGBA_UPLOAD_RECT,
+    SUPERTERMINAL_CMD_RGBA_PRESENT,
+
+    /* Shared control lane. */
+    SUPERTERMINAL_CMD_AUDIO_PLAY,
+    SUPERTERMINAL_CMD_REQUEST_PRESENT,
+    SUPERTERMINAL_CMD_REQUEST_CLOSE
+} SuperTerminalCommandType;
+
+typedef struct SuperTerminalNativeUiPublish {
+    const char* json_utf8;
+} SuperTerminalNativeUiPublish;
+
+typedef struct SuperTerminalNativeUiPatch {
+    const char* patch_json_utf8;
+} SuperTerminalNativeUiPatch;
+
+typedef struct SuperTerminalTextGridWriteCells {
+    SuperTerminalPaneId pane_id;
+    const SuperTerminalGlyphSpan* spans;
+    uint32_t span_count;
+} SuperTerminalTextGridWriteCells;
+
+typedef struct SuperTerminalIndexedPresent {
+    SuperTerminalPaneId pane_id;
+    const SuperTerminalIndexedFrame* frame;
+} SuperTerminalIndexedPresent;
+
+typedef struct SuperTerminalRgbaPresent {
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;
+} SuperTerminalRgbaPresent;
+
+typedef struct SuperTerminalCommand {
+    SuperTerminalCommandType type;
     uint32_t sequence;
     union {
-        WinguiTerminalWriteGlyphs write_glyphs;
-        WinguiTerminalClearRegion clear_region;
-        WinguiTerminalScrollRegion scroll_region;
-        WinguiTerminalSetCursor set_cursor;
-        WinguiTerminalSetTitle set_title;
-        WinguiTerminalSetPalette set_palette;
-        WinguiTerminalNativeUiPublish native_ui_publish;
-        WinguiTerminalNativeUiPatch native_ui_patch;
-        WinguiTerminalPlaySound play_sound;
+        SuperTerminalNativeUiPublish native_ui_publish;
+        SuperTerminalNativeUiPatch native_ui_patch;
+        SuperTerminalSetMenu set_menu;
+        SuperTerminalSetTitle set_title;
+        SuperTerminalSetWindowState set_window_state;
+        SuperTerminalClipboardSetText clipboard_set_text;
+        SuperTerminalTextGridWriteCells text_grid_write_cells;
+        SuperTerminalTextGridClearRegion text_grid_clear_region;
+        SuperTerminalTextGridScrollRegion text_grid_scroll_region;
+        SuperTerminalTextGridSetCursor text_grid_set_cursor;
+        SuperTerminalTextGridSetPalette text_grid_set_palette;
+        SuperTerminalIndexedDefinePalette indexed_define_palette;
+        SuperTerminalIndexedUploadTiles indexed_upload_tiles;
+        SuperTerminalIndexedUploadSprites indexed_upload_sprites;
+        SuperTerminalIndexedPresent indexed_present;
+        SuperTerminalRgbaAllocateBuffer rgba_allocate_buffer;
+        SuperTerminalRgbaUploadRect rgba_upload_rect;
+        SuperTerminalRgbaPresent rgba_present;
+        SuperTerminalPlaySound play_sound;
     } data;
-} WinguiTerminalCommand;
+} SuperTerminalCommand;
 ```
 
-    For native UI specifically, the command payload should still describe state, not imperative widget operations. A publish command should carry a full declarative tree. A patch command should carry a patch document or another copied state-delta representation that the UI thread can validate and reconcile.
+For native UI specifically, the command payload should still describe state, not imperative widget operations. A publish command should carry a full declarative tree. A patch command should carry a patch document or another copied state-delta representation that the UI thread can validate and reconcile.
+
+### Structural command lane
+
+The structural lane exists to mutate the retained declarative model and everything derived from it.
+
+Recommended commands:
+
+- `SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH`: replace the authoritative declarative tree
+- `SUPERTERMINAL_CMD_NATIVE_UI_PATCH`: apply a structural patch to that tree
+- `SUPERTERMINAL_CMD_NATIVE_UI_SET_MENU`: replace menu model or menu subtree
+- `SUPERTERMINAL_CMD_NATIVE_UI_CLEAR_MENU`: clear menu state
+- `SUPERTERMINAL_CMD_WINDOW_SET_TITLE`: update top-level title
+- `SUPERTERMINAL_CMD_WINDOW_SET_STATE`: minimize, maximize, restore, fullscreen if supported
+
+Rules for this lane:
+
+- payloads are semantic and structural, not renderer-facing
+- pane ids appear here as declarations inside the tree, not as frame data
+- the UI thread validates, stores, and reconciles these updates before any renderer state is touched
+
+### Fast pane command lanes
+
+The fast lanes exist to mutate retained content inside pane ids already declared by the structural lane.
+
+Text-grid commands:
+
+- `SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS`
+- `SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION`
+- `SUPERTERMINAL_CMD_TEXT_GRID_SCROLL_REGION`
+- `SUPERTERMINAL_CMD_TEXT_GRID_SET_CURSOR`
+- `SUPERTERMINAL_CMD_TEXT_GRID_SET_PALETTE`
+
+Indexed-graphics commands:
+
+- `SUPERTERMINAL_CMD_INDEXED_DEFINE_PALETTE`
+- `SUPERTERMINAL_CMD_INDEXED_UPLOAD_TILES`
+- `SUPERTERMINAL_CMD_INDEXED_UPLOAD_SPRITES`
+- `SUPERTERMINAL_CMD_INDEXED_PRESENT`
+
+RGBA pane commands:
+
+- `SUPERTERMINAL_CMD_RGBA_ALLOCATE_BUFFER`
+- `SUPERTERMINAL_CMD_RGBA_UPLOAD_RECT`
+- `SUPERTERMINAL_CMD_RGBA_PRESENT`
+
+Rules for these lanes:
+
+- every payload targets a `pane_id` resolved by the declarative layout bridge
+- commands mutate retained pane content, not pane placement
+- if a pane id is missing, mismatched, or hidden, the host rejects or ignores the command according to policy
+- these commands should avoid JSON and favor copied binary structs or stable buffer handles
 
 ### Command design rules
 
 1. Commands should describe intent, not expose renderer internals.
 2. Commands should contain copied data or stable references with explicit lifetime rules.
-3. Most commands should be fire-and-forget.
-4. A small number of commands may support request/response semantics through a completion token.
+3. Structural commands own layout and standard control state; fast commands own pane content only.
+4. Most commands should be fire-and-forget.
+5. A small number of commands may support request/response semantics through a completion token.
 
 ## Event Model
 
 Events should also use a tagged union.
 
 ```c
-typedef enum WinguiTerminalEventType {
-    WINGUI_TERMINAL_EVENT_NONE = 0,
-    WINGUI_TERMINAL_EVENT_KEY,
-    WINGUI_TERMINAL_EVENT_CHAR,
-    WINGUI_TERMINAL_EVENT_MOUSE,
-    WINGUI_TERMINAL_EVENT_RESIZE,
-    WINGUI_TERMINAL_EVENT_FOCUS,
-    WINGUI_TERMINAL_EVENT_NATIVE_UI,
-    WINGUI_TERMINAL_EVENT_CLOSE_REQUESTED,
-    WINGUI_TERMINAL_EVENT_HOST_STOPPING
-} WinguiTerminalEventType;
+typedef enum SuperTerminalEventType {
+    SUPERTERMINAL_EVENT_NONE = 0,
+    SUPERTERMINAL_EVENT_KEY,
+    SUPERTERMINAL_EVENT_CHAR,
+    SUPERTERMINAL_EVENT_MOUSE,
+    SUPERTERMINAL_EVENT_PANE_INPUT,
+    SUPERTERMINAL_EVENT_RESIZE,
+    SUPERTERMINAL_EVENT_FOCUS,
+    SUPERTERMINAL_EVENT_NATIVE_UI,
+    SUPERTERMINAL_EVENT_CLIPBOARD_TEXT,
+    SUPERTERMINAL_EVENT_FILE_DROP,
+    SUPERTERMINAL_EVENT_CLOSE_REQUESTED,
+    SUPERTERMINAL_EVENT_HOST_STOPPING,
+    SUPERTERMINAL_EVENT_DIAGNOSTIC
+} SuperTerminalEventType;
+
+typedef enum SuperTerminalNativeUiEventKind {
+    SUPERTERMINAL_NATIVE_UI_BUTTON_CLICKED = 0,
+    SUPERTERMINAL_NATIVE_UI_VALUE_CHANGED,
+    SUPERTERMINAL_NATIVE_UI_SELECTION_CHANGED,
+    SUPERTERMINAL_NATIVE_UI_SUBMIT,
+    SUPERTERMINAL_NATIVE_UI_CUSTOM_JSON
+} SuperTerminalNativeUiEventKind;
+
+typedef struct SuperTerminalNativeUiEvent {
+    SuperTerminalNativeUiEventKind kind;
+    char node_id_utf8[128];
+    const char* value_utf8;
+    const char* payload_json_utf8;
+} SuperTerminalNativeUiEvent;
+
+typedef struct SuperTerminalPaneInputEvent {
+    SuperTerminalPaneId pane_id;
+    uint32_t device_kind;
+    int32_t x;
+    int32_t y;
+    uint32_t modifiers;
+} SuperTerminalPaneInputEvent;
+
+typedef struct SuperTerminalEvent {
+    SuperTerminalEventType type;
+    uint32_t sequence;
+    union {
+        SuperTerminalKeyEvent key;
+        SuperTerminalCharEvent character;
+        SuperTerminalMouseEvent mouse;
+        SuperTerminalPaneInputEvent pane_input;
+        SuperTerminalResizeEvent resize;
+        SuperTerminalFocusEvent focus;
+        SuperTerminalNativeUiEvent native_ui;
+        SuperTerminalClipboardTextEvent clipboard_text;
+        SuperTerminalFileDropEvent file_drop;
+        SuperTerminalHostStoppingEvent host_stopping;
+        SuperTerminalDiagnosticEvent diagnostic;
+    } data;
+} SuperTerminalEvent;
 ```
 
 Important point: the client should consume semantic terminal events, not raw Win32 messages. The framework is the translation boundary.
 
 That same translation rule applies to hosted native controls: the client should receive semantic native-ui events such as "button clicked", "selection changed", or a JSON event payload emitted by the native-ui host, rather than direct `WM_COMMAND` or `WM_NOTIFY` traffic.
 
+The event stream should also preserve the same structural-vs-pane distinction as the command stream:
+
+- `SUPERTERMINAL_EVENT_NATIVE_UI` carries semantic control events from the reconciled declarative control tree
+- `SUPERTERMINAL_EVENT_PANE_INPUT` carries pointer, focus, or capture events targeted at a specific hosted pane id
+
+That way the client can react differently to, for example, a button click in the declarative chrome versus a drag gesture inside an RGBA pane.
+
 ### Dual Input Model (Events vs. Polled Sensors)
 
 Just as output is split into fast (binary struct) and slow (JSON patch) paths, input requires a split between **event-driven** and **polled** processing to support both UI applications and low-latency game loops.
 
 1. **Event-Driven (The Event Queue):**
-   The UI thread translates Win32 messages into structured `WinguiTerminalEvent` entries (`EVENT_KEY`, `EVENT_MOUSE`, `EVENT_CHAR`, `EVENT_NATIVE_UI`). This is mandatory for accurate typing, scroll-wheel deltas, tracking mouse trajectories, and interacting with hierarchical native UI dialogs.
+    The UI thread translates Win32 messages into structured `SuperTerminalEvent` entries (`EVENT_KEY`, `EVENT_MOUSE`, `EVENT_CHAR`, `EVENT_NATIVE_UI`, `EVENT_PANE_INPUT`). This is mandatory for accurate typing, scroll-wheel deltas, tracking mouse trajectories, and interacting with hierarchical native UI dialogs.
 
 2. **Polled Sensors (High-Speed Game Input):**
    Games frequently prefer to sample the state of the keyboard or mouse at the beginning of a simulation tick (e.g., "is WASD or the Spacebar down right now?") without writing boilerplate to drain and track up/down events manually.
-   **Requirement:** The `TerminalHost` should maintain a lock-free, thread-safe (e.g., shared atomic byte array) representation of the 256 virtual keys and mouse buttons, updated instantly by the UI thread's message pump. The framework exposes polling functions like `wingui_terminal_get_key_state(ctx, WINGUI_VK_W)` and `wingui_terminal_get_mouse_state(ctx)`.
+    **Requirement:** The host should maintain a lock-free, thread-safe sensor snapshot for the 256 virtual keys and mouse buttons, updated directly by the UI thread's message pump instead of the slower native-controls event path. The framework should expose both single-key probes and dense snapshot reads so games can sample once per frame with stable cost.
+
+   Concretely, the public surface should include both of these styles:
+
+   - `super_terminal_get_key_state(ctx, WINGUI_KEY_SPACE)` for targeted checks
+   - `super_terminal_get_keyboard_state(ctx, &keyboard_state)` for one bulk frame snapshot
+   - `super_terminal_get_mouse_state(ctx, &mouse_state)` for pointer/buttons
+
+   The bulk keyboard snapshot is the important part for games: it avoids 256 individual API calls per frame and gives the client a fast "sensor lane" that is separate from ordered UI/control events.
 
 This duality guarantees that a client game loop can achieve zero-queue-latency read access to player movement controls, while concurrently receiving perfectly ordered events for text boxes, chat windows, and declarative configuration menus.
 
@@ -405,7 +781,7 @@ Suggested states:
 3. Main thread creates the D3D context and required renderer objects.
 4. Main thread initializes audio services if configured.
 5. Main thread starts the client thread.
-6. Client thread enters the user startup callback with a `WinguiTerminalClientContext*`.
+6. Client thread enters the user startup callback with a `SuperTerminalClientContext*`.
 7. Main thread shows the window and enters the message loop.
 
 ### Steady-state loop
@@ -546,41 +922,72 @@ The public framework API should stay small and procedural.
 Example sketch:
 
 ```c
-typedef struct WinguiTerminalAppDesc {
-    const char* title_utf8;
-    uint32_t columns;
-    uint32_t rows;
-    uint32_t flags;
-    void* user_data;
-    int32_t (WINGUI_CALL *startup)(WinguiTerminalClientContext* ctx, void* user_data);
-    void (WINGUI_CALL *shutdown)(void* user_data);
-} WinguiTerminalAppDesc;
-
-typedef struct WinguiTerminalRunResult {
+typedef struct SuperTerminalRunResult {
     int32_t exit_code;
     int32_t host_error_code;
     const char* message_utf8;
-} WinguiTerminalRunResult;
+} SuperTerminalRunResult;
 
-WINGUI_API int32_t WINGUI_CALL wingui_terminal_run(
-    const WinguiTerminalAppDesc* desc,
-    WinguiTerminalRunResult* out_result);
+typedef struct SuperTerminalAppDesc {
+    const char* title_utf8;
+    uint32_t flags;
+    const char* initial_ui_json_utf8;
+    void* user_data;
+    int32_t (WINGUI_CALL *startup)(SuperTerminalClientContext* ctx, void* user_data);
+    void (WINGUI_CALL *shutdown)(void* user_data);
+} SuperTerminalAppDesc;
 
-WINGUI_API int32_t WINGUI_CALL wingui_terminal_enqueue(
-    WinguiTerminalClientContext* ctx,
-    const WinguiTerminalCommand* command);
+WINGUI_API int32_t WINGUI_CALL super_terminal_run(
+    const SuperTerminalAppDesc* desc,
+    SuperTerminalRunResult* out_result);
 
-WINGUI_API int32_t WINGUI_CALL wingui_terminal_wait_event(
-    WinguiTerminalClientContext* ctx,
+WINGUI_API int32_t WINGUI_CALL super_terminal_enqueue(
+    SuperTerminalClientContext* ctx,
+    const SuperTerminalCommand* command);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_wait_event(
+    SuperTerminalClientContext* ctx,
     uint32_t timeout_ms,
-    WinguiTerminalEvent* out_event);
+    SuperTerminalEvent* out_event);
 
-WINGUI_API int32_t WINGUI_CALL wingui_terminal_request_stop(
-    WinguiTerminalClientContext* ctx,
+WINGUI_API int32_t WINGUI_CALL super_terminal_request_stop(
+    SuperTerminalClientContext* ctx,
     int32_t exit_code);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json(
+    SuperTerminalClientContext* ctx,
+    const char* json_utf8);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
+    SuperTerminalClientContext* ctx,
+    const char* patch_json_utf8);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_key_state(
+    SuperTerminalClientContext* ctx,
+    uint32_t virtual_key);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_mouse_state(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalMouseState* out_state);
 ```
 
-### Why a single `wingui_terminal_run` entry point is useful
+If convenience helpers are added, they should follow the same split explicitly.
+
+Structural helpers:
+
+- `super_terminal_publish_ui_json(...)`
+- `super_terminal_patch_ui_json(...)`
+- `super_terminal_set_menu_json(...)`
+
+Fast-pane helpers:
+
+- `super_terminal_text_grid_write_cells(...)`
+- `super_terminal_indexed_present(...)`
+- `super_terminal_rgba_present(...)`
+
+Those helpers should compile down to ordinary `SuperTerminalCommand` enqueue operations rather than opening a second hidden control path.
+
+### Why a single `super_terminal_run` entry point is useful
 
 It gives the framework one place to own:
 
@@ -600,21 +1007,21 @@ The client callback should feel like writing a terminal application, not a GUI c
 Example shape:
 
 ```c
-int32_t WINGUI_CALL my_app_startup(WinguiTerminalClientContext* ctx, void* user_data) {
-    wingui_terminal_write_text(ctx, 0, 0, "System ready");
-    wingui_terminal_present(ctx);
+int32_t WINGUI_CALL my_app_startup(SuperTerminalClientContext* ctx, void* user_data) {
+    super_terminal_publish_ui_json(ctx, "{\"type\":\"window\",\"title\":\"System ready\"}");
+    super_terminal_request_present(ctx);
 
     for (;;) {
-        WinguiTerminalEvent event;
-        if (!wingui_terminal_wait_event(ctx, 100, &event)) {
+        SuperTerminalEvent event;
+        if (!super_terminal_wait_event(ctx, 100, &event)) {
             continue;
         }
 
-        if (event.type == WINGUI_TERMINAL_EVENT_CLOSE_REQUESTED) {
+        if (event.type == SUPERTERMINAL_EVENT_CLOSE_REQUESTED) {
             return 0;
         }
 
-        if (event.type == WINGUI_TERMINAL_EVENT_CHAR) {
+        if (event.type == SUPERTERMINAL_EVENT_CHAR) {
             handle_char_input(ctx, &event);
         }
     }
@@ -628,32 +1035,32 @@ This style is easy to reason about and makes it feasible to host shells, emulato
 Beyond the basic text grid and input processing, a hosted terminal application needs several capabilities to function as a fully-featured tool (like an editor, shell, or interactive utility). The framework must route these securely without violating the threading rules.
 
 ### 1. Waitable Event Handles (for Async I/O)
-A pure `wingui_terminal_wait_event` call is sufficient for simple apps, but real-world terminal applications often multiplex UI events with network sockets, file I/O, sub-processes, or system timers.
+A pure `super_terminal_wait_event` call is sufficient for simple apps, but real-world terminal applications often multiplex UI events with network sockets, file I/O, sub-processes, or system timers.
 **Requirement**: The framework's event queue should expose access to a native Win32 `HANDLE` (an Event) that becomes signaled when UI events are available in the queue. This allows the client thread to use `MsgWaitForMultipleObjects` or `WaitForMultipleObjects` to sleep efficiently until *either* a UI event or an external I/O event occurs.
 
 ### 2. Clipboard Access (Async)
 Reading and writing the clipboard safely requires UI-thread ownership in Win32 to avoid locking issues and hangs.
 **Requirement**: 
-- **Write**: The client enqueues a `WINGUI_TERMINAL_CMD_SET_CLIPBOARD` command containing the text string.
-- **Read**: The client enqueues a `WINGUI_TERMINAL_CMD_REQUEST_CLIPBOARD` command. The UI thread retrieves the text and pushes it back into the client queue as a `WINGUI_TERMINAL_EVENT_CLIPBOARD_DATA` event.
+- **Write**: The client enqueues a `SUPERTERMINAL_CMD_CLIPBOARD_SET_TEXT` command containing the text string.
+- **Read**: The client enqueues a `SUPERTERMINAL_CMD_CLIPBOARD_REQUEST_TEXT` command. The UI thread retrieves the text and pushes it back into the client queue as a `SUPERTERMINAL_EVENT_CLIPBOARD_TEXT` event.
 
 ### 3. Drag and Drop Integration
 Many terminal and editor applications allow dragging files into the window to paste their paths.
-**Requirement**: The UI thread should listen for `WM_DROPFILES`, extract the paths, and push a `WINGUI_TERMINAL_EVENT_FILE_DROP` event into the client queue, containing the list of UTF-8 file paths.
+**Requirement**: The UI thread should listen for `WM_DROPFILES`, extract the paths, and push a `SUPERTERMINAL_EVENT_FILE_DROP` event into the client queue, containing the list of UTF-8 file paths.
 
 ### 4. Advanced Window Control
 The client application may need to control the physical window state or alert the user.
-**Requirement**: Provide commands for `WINGUI_TERMINAL_CMD_FLASH_WINDOW` (to get user attention in the taskbar) and commands to Minimize, Maximize, and Restore the window. 
+**Requirement**: Provide commands for `SUPERTERMINAL_CMD_WINDOW_FLASH` (to get user attention in the taskbar) and commands to Minimize, Maximize, and Restore the window. 
 
 ### 5. Configurable Input Modes
 Different terminal applications require varying levels of input verbosity.
-**Requirement**: The framework should support a `WINGUI_TERMINAL_CMD_SET_INPUT_MODE` command. This should toggle features like:
+**Requirement**: The framework should support a `SUPERTERMINAL_CMD_SET_INPUT_MODE`-style command or configuration update. This should toggle features like:
 - **Mouse tracking**: Clicks only vs. report all mouse motion (dragging, hover). This prevents flooding the event queue with mouse-move events when the app only cares about clicks.
 - **Raw keyboard mode**: Deciding whether to process Win32 `WM_CHAR` translated characters, or report pure `WM_KEYDOWN` virtual key codes without layout translation.
 
 ### 6. System Metrics & Layout Data
 If the user moves the window to a different monitor with a different scaling factor, or resizes it, the text scale and grid dimensions might change.
-**Requirement**: The `WINGUI_TERMINAL_EVENT_RESIZE` event must include the current DPI scale, cellular dimensions, and the total column/row count so the client application can accurately layout its UI.
+**Requirement**: The `SUPERTERMINAL_EVENT_RESIZE` event must include the current DPI scale, cellular dimensions, and the total column/row count so the client application can accurately layout its UI.
 
 ## UI Message Handling
 
@@ -661,9 +1068,9 @@ The framework window procedure should stay thin.
 
 It should mostly do four things:
 
-1. translate Win32 input into `WinguiTerminalEvent`
+1. translate Win32 input into `SuperTerminalEvent`
 2. enqueue resize and control notifications
-3. react to `WINGUI_TERMINAL_WAKE`
+3. react to `SUPERTERMINAL_WAKE`
 4. begin shutdown on `WM_CLOSE`
 
 It should not contain application logic.
@@ -743,7 +1150,7 @@ Implement the first framework version as a single-host, single-client-thread run
 - a bounded client-to-UI command queue
 - a bounded UI-to-client event queue
 - a retained text-grid surface model
-- a single `wingui_terminal_run` entry point
+- a single `super_terminal_run` entry point
 - orderly, explicit shutdown with wake messages and join semantics
 
 That design is simple enough to implement cleanly, strong enough to avoid the usual Win32 threading mistakes, and flexible enough to support a real terminal-style application framework rather than a one-off demo shell.

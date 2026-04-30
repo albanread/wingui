@@ -6,7 +6,15 @@ The `wingui` platform currently presents `native_ui` as an independent blocking 
 
 However, the intention for the Wingui Terminal Framework (as described in `terminal_framework_design.md`) is a strict two-thread architecture where the UI thread owns the window, DX contexts, and renderers, while a background Client thread offloads logic and uses discrete message queues (Commands and Events) to communicate with the UI.
 
+That review also exposes a naming and architecture gap: native UI integration is being discussed as if it were a neighboring subsystem beside the Direct3D panes, when what we actually need is a top-level coordination layer. That layer should be called `SuperTerminal`.
+
 In this context, the legacy "Native UI reactive framework" needs to act as a **drop-in extension** to the Terminal Framework, integrating through the same Command/Event queue architecture rather than running its own isolated loop.
+
+More importantly, it needs to be treated as one half of a unified `SuperTerminal` app model:
+
+- declarative native UI defines structure and pane placement
+- fast Direct3D surfaces provide real-time content inside those panes
+- `SuperTerminal` coordinates both as one public API
 
 ## Evaluating Native UI as a Drop-In
 
@@ -75,6 +83,8 @@ public:
 
 ## Integration Strategy
 
+This integration should be framed as implementing the native-UI side of `SuperTerminal`, not as shipping a separate native host product.
+
 1. **Refactor State:** Migrate the `g_native` singleton in `native_ui.cpp` into a cohesive `WinguiNativeUiEngine` object.
 2. **Terminal Host Extension:** Add `WinguiNativeUiEngine* native_ui;` to the `WinguiTerminalHost` structure.
 3. **Hook up Queues:** In the UI thread command loop drainer, if a `NATIVE_UI_*` command comes in, forward it to `native_ui->ApplyPatch(...)`. 
@@ -82,3 +92,13 @@ public:
 5. **C++ Queue Abstraction:** Use a thread-safe MPSC or SPMC `std::queue` or `moodycamel::ConcurrentQueue` for fast JSON message passing.
 
 This fulfills the reactive structural requirement while adhering to the threading guarantees required by `terminal_framework_design.md`.
+
+## SuperTerminal Interpretation
+
+Once that is in place, the correct public framing is:
+
+- `native_ui` is the structural layout and Win32 reconciliation engine
+- text-grid, indexed, and RGBA panes are the fast-path presentation engines
+- `SuperTerminal` is the coordinating runtime that exposes them as one application contract
+
+That is the missing component the repo design needs to name explicitly.

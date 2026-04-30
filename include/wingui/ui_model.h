@@ -90,12 +90,33 @@ public:
     UiNode& checked(bool v)          { return prop("checked", uv(v)); }
     UiNode& enabled(bool v)          { return prop("enabled", uv(v)); }
     UiNode& hidden(bool v)           { return prop("hidden", uv(v)); }
+    UiNode& focused(bool v)          { return prop("focused", uv(v)); }
+    UiNode& disabled(bool v)         { return prop("disabled", uv(v)); }
+    UiNode& collapsed(bool v)        { return prop("collapsed", uv(v)); }
     UiNode& src(std::string v)       { return prop("src",   uv(std::move(v))); }
     UiNode& alt(std::string v)       { return prop("alt",   uv(std::move(v))); }
     UiNode& title(std::string v)     { return prop("title", uv(std::move(v))); }
+    UiNode& href(std::string v)      { return prop("href", uv(std::move(v))); }
+    UiNode& fit(std::string v)       { return prop("fit", uv(std::move(v))); }
     UiNode& orientation(std::string v){ return prop("orientation", uv(std::move(v))); }
     UiNode& width(int64_t v)         { return prop("width",  uv(v)); }
     UiNode& height(int64_t v)        { return prop("height", uv(v)); }
+    UiNode& padding(int64_t v)       { return prop("padding", uv(v)); }
+    UiNode& gap(int64_t v)           { return prop("gap", uv(v)); }
+    UiNode& divider_size(int64_t v)  { return prop("dividerSize", uv(v)); }
+    UiNode& live_resize(bool v)      { return prop("liveResize", uv(v)); }
+    UiNode& size(double v)           { return prop("size", uv(v)); }
+    UiNode& rows(int64_t v)          { return prop("rows", uv(v)); }
+    UiNode& columns(int64_t v)       { return prop("columns", uv(v)); }
+    UiNode& step(double v)           { return prop("step", uv(v)); }
+    UiNode& min_height(int64_t v)    { return prop("minHeight", uv(v)); }
+    UiNode& min_size(int64_t v)      { return prop("minSize", uv(v)); }
+    UiNode& max_size(int64_t v)      { return prop("maxSize", uv(v)); }
+    UiNode& selected_id(std::string v){ return prop("selectedId", uv(std::move(v))); }
+    UiNode& toggle_event(std::string v){ return prop("toggleEvent", uv(std::move(v))); }
+    UiNode& activate_event(std::string v){ return prop("activateEvent", uv(std::move(v))); }
+    UiNode& show_buttons(bool v)     { return prop("showButtons", uv(v)); }
+    UiNode& show_root_lines(bool v)  { return prop("showRootLines", uv(v)); }
     UiNode& min_val(double v)        { return prop("min", uv(v)); }
     UiNode& max_val(double v)        { return prop("max", uv(v)); }
 
@@ -108,6 +129,7 @@ public:
 
     // Tree-view items.
     UiNode& items(Json items_array);
+    UiNode& expanded_ids(Json expanded_ids_array);
 
     // Tabs list for a tabs node.
     UiNode& tabs(Json tabs_array);
@@ -132,14 +154,14 @@ public:
 
     const Json& props() const { return props_; }
     const std::vector<UiNode>& child_list() const { return children_; }
-    const std::optional<UiNode>& body_node() const { return body_; }
+    const UiNode* body_node() const { return body_.empty() ? nullptr : &body_.front(); }
 
 private:
     std::string type_;
     std::string id_;
     Json props_ = Json::object();
     std::vector<UiNode> children_;
-    std::optional<UiNode> body_;
+    std::vector<UiNode> body_;
 };
 
 // ---------------------------------------------------------------------------
@@ -152,6 +174,7 @@ public:
 
     UiWindow& title(std::string t)   { title_ = std::move(t); return *this; }
     UiWindow& prop(const std::string& key, UiValue value);
+    UiWindow& focused_pane_id(std::string id) { return prop("focusedPaneId", uv(std::move(id))); }
     UiWindow& menu_bar(Json menu_json);
 
     Json to_json() const;
@@ -306,8 +329,25 @@ UiNode ui_divider();
 
 // Splits
 UiNode ui_split_pane(std::string id, std::vector<UiNode> children = {});
+UiNode ui_split_pane(std::string id, bool focused, std::vector<UiNode> children);
+UiNode ui_split_pane(std::string id,
+                     double size,
+                     int64_t min_size,
+                     int64_t max_size,
+                     bool collapsed,
+                     bool focused,
+                     std::vector<UiNode> children = {});
 UiNode ui_split_view(std::string orientation, std::string event_name,
                      UiNode first_pane, UiNode second_pane);
+UiNode ui_split_view(std::string orientation,
+                     std::string event_name,
+                     UiNode first_pane,
+                     UiNode second_pane,
+                     int64_t width,
+                     int64_t height,
+                     int64_t divider_size,
+                     bool live_resize,
+                     bool disabled = false);
 
 // Text / media
 UiNode ui_text(std::string text);
@@ -332,8 +372,11 @@ UiNode ui_canvas(int64_t width, int64_t height, Json commands = Json::array());
 
 // Custom D3D surfaces
 UiNode ui_text_grid(int64_t columns, int64_t rows, std::string event_name = "");
+UiNode ui_text_grid(std::string id, int64_t columns, int64_t rows, std::string event_name = "", bool focused = false);
 UiNode ui_indexed_graphics(int64_t width, int64_t height, std::string event_name = "");
+UiNode ui_indexed_graphics(std::string id, int64_t width, int64_t height, std::string event_name = "", bool focused = false);
 UiNode ui_rgba_pane(int64_t width, int64_t height, std::string event_name = "");
+UiNode ui_rgba_pane(std::string id, int64_t width, int64_t height, std::string event_name = "", bool focused = false);
 
 // Collections
 UiNode ui_select(std::string label, std::string value,
@@ -345,8 +388,21 @@ UiNode ui_radio_group(std::string label, std::string value,
 UiNode ui_table(std::string label, Json columns, Json rows,
                 std::string event_name);
 UiNode ui_tree_view(std::string label, Json items, std::string event_name);
+UiNode ui_tree_view(std::string label,
+                    Json items,
+                    std::string selected_id,
+                    Json expanded_ids,
+                    std::string event_name,
+                    std::string toggle_event = "tree-toggle",
+                    std::string activate_event = "tree-activate");
 UiNode ui_tabs(std::string label, std::string value,
                std::string event_name, Json tabs);
+UiNode ui_tabs(std::string label,
+               std::string value,
+               std::string event_name,
+               Json tabs,
+               int64_t width,
+               int64_t height = 0);
 UiNode ui_context_menu(Json items, UiNode content);
 
 // Data helpers (produce plain Json objects, not UiNodes)
@@ -354,6 +410,7 @@ Json ui_option(std::string value, std::string text);
 Json ui_column(std::string key, std::string title);
 Json ui_table_row(std::string id, Json props);
 Json ui_tree_item(std::string id, std::string text, Json children = Json::array());
+Json ui_tree_item(std::string id, std::string text, Json children, Json tag);
 Json ui_tab(std::string value, std::string text, const UiNode& content);
 
 // Menu helpers (produce plain Json objects for the window menu-bar prop)

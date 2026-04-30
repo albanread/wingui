@@ -1,9 +1,22 @@
+#ifndef WINGUI_BUILD_DLL
+#define WINGUI_BUILD_DLL
+#endif
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
 #include <windows.h>
 #include <commctrl.h>
 #include <richedit.h>
 #include <wincodec.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <condition_variable>
@@ -31,6 +44,7 @@ using Int64NoArgFn = int64_t (*)();
 constexpr UINT kMsgNativeReload = WM_APP + 101;
 constexpr UINT kMsgNativeShow = WM_APP + 102;
 constexpr UINT kMsgNativePatch = WM_APP + 103;
+constexpr wchar_t kNativeWindowClassName[] = L"WinSchemeUserAppNativeWindow";
 constexpr UINT_PTR kContainerSubclassId = 0x57534E43; // WSNC
 constexpr UINT_PTR kCanvasSubclassId = 0x57534356;    // WSCV
 constexpr UINT_PTR kImageSubclassId = 0x5753494D;     // WSIM
@@ -78,6 +92,7 @@ struct ControlBinding {
 struct MeasuredSize;
 
 bool isTruthyJson(const ordered_json& value);
+std::string jsonString(const ordered_json& node, const char* key, const std::string& fallback);
 MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, int y, int max_width);
 MeasuredSize layoutChildrenStack(HWND parent,
                                  HDC hdc,
@@ -95,11 +110,16 @@ bool relayoutSplitViewControl(HWND container,
 bool setUserAppNodeProp(ordered_json& spec, const std::string& node_id, const char* key, const ordered_json& value);
 void rebuildNativeContainerContents(HWND container, const ordered_json& node);
 void rebuildNativeWindow(HWND hwnd);
+void repopulateTableRows(HWND hwnd, ControlBinding& binding, const ordered_json& rows, const std::string& selected_id);
 ordered_json buildSplitSizesPayload(const ControlBinding& binding);
 void dispatchUiEventJson(const ordered_json& event);
 bool executeNativePublishJson(const char* utf8);
 bool executeNativePatchJson(const char* utf8);
 bool executeNativeHostRun();
+bool attachEmbeddedNativeHost(const WinguiNativeEmbeddedHostDesc& desc);
+bool ensureNativeThread();
+bool validateUserAppSpec(const ordered_json& spec, std::string& error);
+LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
 struct NativeHostState {
     std::mutex mutex;
@@ -133,7 +153,127 @@ struct NativeHostState {
     std::deque<NativeQueuedEvent> event_queue;
     HANDLE event_handle = nullptr;
     uint64_t next_event_sequence = 1;
+    bool embedded_mode = false;
+    HWND parent_hwnd = nullptr;
+    std::atomic<uint64_t> publish_count{0};
+    std::atomic<uint64_t> patch_request_count{0};
+    std::atomic<uint64_t> patch_direct_apply_count{0};
+    std::atomic<uint64_t> patch_subtree_rebuild_count{0};
+    std::atomic<uint64_t> patch_window_rebuild_count{0};
+    std::atomic<uint64_t> patch_resize_reject_count{0};
+    std::atomic<uint64_t> patch_failed_count{0};
 } g_native;
+
+void setNativeLastError(const std::string& error);
+
+bool tryGetNativeNodeBounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
+    if (!node_id_utf8 || !out_bounds) {
+        setNativeLastError("Native UI node bounds query requires an id and output buffer.");
+        return false;
+    }
+
+    HWND node_hwnd = nullptr;
+    HWND target_hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        auto it = g_native.node_controls.find(node_id_utf8);
+        if (it == g_native.node_controls.end()) {
+            std::memset(out_bounds, 0, sizeof(*out_bounds));
+            return false;
+        }
+        node_hwnd = it->second;
+        target_hwnd = (g_native.embedded_mode && g_native.parent_hwnd && IsWindow(g_native.parent_hwnd))
+            ? g_native.parent_hwnd
+            : g_native.hwnd;
+    }
+
+    if (!node_hwnd || !IsWindow(node_hwnd) || !target_hwnd || !IsWindow(target_hwnd)) {
+        std::memset(out_bounds, 0, sizeof(*out_bounds));
+        return false;
+    }
+
+    RECT rect{};
+    if (!GetClientRect(node_hwnd, &rect)) {
+        std::memset(out_bounds, 0, sizeof(*out_bounds));
+        return false;
+    }
+    MapWindowPoints(node_hwnd, target_hwnd, reinterpret_cast<LPPOINT>(&rect), 2);
+    out_bounds->x = rect.left;
+    out_bounds->y = rect.top;
+    out_bounds->width = std::max(0, static_cast<int32_t>(rect.right - rect.left));
+    out_bounds->height = std::max(0, static_cast<int32_t>(rect.bottom - rect.top));
+    out_bounds->visible = IsWindowVisible(node_hwnd) ? 1 : 0;
+    return true;
+}
+
+bool findFocusedPaneIdInNode(const ordered_json& node, std::string& out_id) {
+    if (!node.is_object()) return false;
+
+    auto focused_pane_it = node.find("focusedPaneId");
+    if (focused_pane_it != node.end() && focused_pane_it->is_string()) {
+        out_id = focused_pane_it->get<std::string>();
+        return true;
+    }
+
+    const std::string node_id = jsonString(node, "id", "");
+    const std::string type = jsonString(node, "type", "");
+    auto focused_it = node.find("focused");
+    if (!node_id.empty() && focused_it != node.end() && isTruthyJson(*focused_it) &&
+        (type == "split-pane" || type == "text-grid-pane" || type == "text-grid" ||
+         type == "indexed-graphics" || type == "rgba-pane" || type == "pane")) {
+        out_id = node_id;
+        return true;
+    }
+
+    auto body_it = node.find("body");
+    if (body_it != node.end() && findFocusedPaneIdInNode(*body_it, out_id)) {
+        return true;
+    }
+
+    auto children_it = node.find("children");
+    if (children_it != node.end() && children_it->is_array()) {
+        for (const auto& child : *children_it) {
+            if (findFocusedPaneIdInNode(child, out_id)) {
+                return true;
+            }
+        }
+    }
+
+    auto tabs_it = node.find("tabs");
+    if (tabs_it != node.end() && tabs_it->is_array()) {
+        for (const auto& tab : *tabs_it) {
+            if (!tab.is_object()) continue;
+            auto content_it = tab.find("content");
+            if (content_it != tab.end() && findFocusedPaneIdInNode(*content_it, out_id)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool copyFocusedPaneIdUtf8(char* buffer_utf8, uint32_t buffer_size) {
+    if (!buffer_utf8 || buffer_size == 0) {
+        setNativeLastError("Focused pane id buffer is required.");
+        return false;
+    }
+
+    std::string focused_id;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        if (g_native.spec.is_object()) {
+            findFocusedPaneIdInNode(g_native.spec, focused_id);
+        }
+    }
+
+    std::memset(buffer_utf8, 0, buffer_size);
+    if (!focused_id.empty()) {
+        std::strncpy(buffer_utf8, focused_id.c_str(), buffer_size - 1);
+        buffer_utf8[buffer_size - 1] = '\0';
+    }
+    return true;
+}
 
 struct MenuBuildResult {
     HMENU menu = nullptr;
@@ -899,6 +1039,30 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
         const std::wstring label = utf8ToWide(jsonString(node, "label"));
         int width = std::max(80, jsonInt(node, "width", 320));
         int height = std::max(60, jsonInt(node, "height", 180));
+        if (!label.empty()) {
+            const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, width);
+            width = std::max(width, static_cast<int>(label_size.cx));
+            height += static_cast<int>(label_size.cy + 8);
+        }
+        return {width, height};
+    }
+
+    if (type == "text-grid" || type == "text-grid-pane") {
+        const std::wstring label = utf8ToWide(jsonString(node, "label"));
+        int width = std::max(120, jsonInt(node, "width", std::max(160, jsonInt(node, "columns", 80) * 10)));
+        int height = std::max(80, jsonInt(node, "height", std::max(80, jsonInt(node, "rows", 25) * 18)));
+        if (!label.empty()) {
+            const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, width);
+            width = std::max(width, static_cast<int>(label_size.cx));
+            height += static_cast<int>(label_size.cy + 8);
+        }
+        return {width, height};
+    }
+
+    if (type == "indexed-graphics" || type == "rgba-pane" || type == "pane") {
+        const std::wstring label = utf8ToWide(jsonString(node, "label"));
+        int width = std::max(120, jsonInt(node, "width", 320));
+        int height = std::max(80, jsonInt(node, "height", 180));
         if (!label.empty()) {
             const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, width);
             width = std::max(width, static_cast<int>(label_size.cx));
@@ -2063,12 +2227,137 @@ bool selectComboByValue(HWND hwnd, ControlBinding& binding, const std::string& v
     return true;
 }
 
+std::string choiceValue(const ordered_json& option, const std::string& fallback) {
+    return jsonString(option, "value", jsonString(option, "text", jsonString(option, "label", fallback)));
+}
+
+std::wstring choiceText(const ordered_json& option, const std::string& fallback) {
+    return utf8ToWide(jsonString(option, "text", jsonString(option, "label", fallback)));
+}
+
+bool copyPatchedNodeForMeasurement(const std::string& node_id,
+                                   const ordered_json& props,
+                                   ordered_json* out_old_node,
+                                   ordered_json* out_new_node) {
+    if (node_id.empty() || !out_old_node || !out_new_node) return false;
+
+    std::lock_guard<std::mutex> lock(g_native.mutex);
+    ordered_json* target = nullptr;
+    if (!findUserAppNodeById(g_native.spec, node_id, &target) || !target || !target->is_object()) {
+        return false;
+    }
+
+    *out_old_node = *target;
+    *out_new_node = *target;
+    for (auto it = props.begin(); it != props.end(); ++it) {
+        (*out_new_node)[it.key()] = it.value();
+    }
+    return true;
+}
+
+bool patchWouldResizeNode(HWND control,
+                          const std::string& node_id,
+                          const ordered_json& props) {
+    if (!control || !IsWindow(control) || node_id.empty()) return true;
+
+    ordered_json old_node = nullptr;
+    ordered_json new_node = nullptr;
+    if (!copyPatchedNodeForMeasurement(node_id, props, &old_node, &new_node)) {
+        return true;
+    }
+
+    HWND measure_host = GetParent(control);
+    if (!measure_host || !IsWindow(measure_host)) {
+        measure_host = control;
+    }
+
+    RECT rc{};
+    GetClientRect(measure_host, &rc);
+    const int max_width = std::max(24, static_cast<int>(rc.right - rc.left));
+
+    HDC hdc = GetDC(measure_host);
+    if (!hdc) return true;
+    ensureFonts();
+    SelectObject(hdc, g_native.ui_font);
+    const MeasuredSize old_size = measureNode(hdc, old_node, max_width);
+    const MeasuredSize new_size = measureNode(hdc, new_node, max_width);
+    ReleaseDC(measure_host, hdc);
+    return old_size.width != new_size.width || old_size.height != new_size.height;
+}
+
+bool syncComboOptions(HWND hwnd,
+                      ControlBinding& binding,
+                      const ordered_json& options,
+                      const std::string& selected_value) {
+    if (!options.is_array()) return false;
+
+    SendMessageW(hwnd, CB_RESETCONTENT, 0, 0);
+    binding.option_values.clear();
+
+    int selected_index = -1;
+    int option_index = 0;
+    for (const auto& option : options) {
+        if (!option.is_object()) continue;
+        const std::string option_value = choiceValue(option, "option-" + std::to_string(option_index));
+        const std::wstring option_text = choiceText(option, option_value);
+        SendMessageW(hwnd, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option_text.c_str()));
+        binding.option_values.push_back(option_value);
+        if (selected_index < 0 && option_value == selected_value) {
+            selected_index = option_index;
+        }
+        ++option_index;
+    }
+
+    if (selected_index >= 0) {
+        SendMessageW(hwnd, CB_SETCURSEL, static_cast<WPARAM>(selected_index), 0);
+        binding.value_text = selected_value;
+    } else if (!binding.option_values.empty()) {
+        SendMessageW(hwnd, CB_SETCURSEL, 0, 0);
+        binding.value_text = selected_value;
+    } else {
+        binding.value_text = selected_value;
+    }
+    return true;
+}
+
 bool selectListBoxByValue(HWND hwnd, ControlBinding& binding, const std::string& value) {
     auto it = std::find(binding.option_values.begin(), binding.option_values.end(), value);
     if (it == binding.option_values.end()) return false;
     const int index = static_cast<int>(std::distance(binding.option_values.begin(), it));
     SendMessageW(hwnd, LB_SETCURSEL, static_cast<WPARAM>(index), 0);
     binding.value_text = value;
+    return true;
+}
+
+bool syncListBoxOptions(HWND hwnd,
+                        ControlBinding& binding,
+                        const ordered_json& options,
+                        const std::string& selected_value) {
+    if (!options.is_array()) return false;
+
+    SendMessageW(hwnd, LB_RESETCONTENT, 0, 0);
+    binding.option_values.clear();
+
+    int selected_index = -1;
+    int option_index = 0;
+    for (const auto& option : options) {
+        if (!option.is_object()) continue;
+        const std::string option_value = choiceValue(option, "option-" + std::to_string(option_index));
+        const std::wstring option_text = choiceText(option, option_value);
+        SendMessageW(hwnd, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(option_text.c_str()));
+        binding.option_values.push_back(option_value);
+        if (selected_index < 0 && option_value == selected_value) {
+            selected_index = option_index;
+        }
+        ++option_index;
+    }
+
+    if (selected_index >= 0) {
+        SendMessageW(hwnd, LB_SETCURSEL, static_cast<WPARAM>(selected_index), 0);
+        binding.value_text = selected_value;
+    } else {
+        binding.value_text = selected_value;
+    }
     return true;
 }
 
@@ -2087,12 +2376,136 @@ bool selectRadioByValue(HWND hwnd, ControlBinding& binding, const std::string& v
     return handled;
 }
 
+std::string selectedRadioGroupValue(HWND hwnd, const ControlBinding& binding) {
+    HWND parent = GetParent(hwnd);
+    if (!parent) return "";
+    for (HWND child = GetWindow(parent, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        auto it = g_native.bindings.find(child);
+        if (it == g_native.bindings.end()) continue;
+        const ControlBinding& candidate = it->second;
+        if (candidate.type != "radio-group" || candidate.node_id != binding.node_id) continue;
+        if (SendMessageW(child, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+            return candidate.value_text;
+        }
+    }
+    return "";
+}
+
+bool syncRadioGroupOptions(HWND hwnd,
+                           ControlBinding& binding,
+                           const ordered_json& options,
+                           const std::string& selected_value) {
+    if (!options.is_array()) return false;
+    HWND parent = GetParent(hwnd);
+    if (!parent) return false;
+
+    std::vector<std::string> option_values;
+    std::vector<std::wstring> option_texts;
+    int option_index = 0;
+    for (const auto& option : options) {
+        if (!option.is_object()) continue;
+        const std::string option_value = choiceValue(option, "option-" + std::to_string(option_index));
+        option_values.push_back(option_value);
+        option_texts.push_back(choiceText(option, option_value));
+        ++option_index;
+    }
+
+    std::vector<HWND> radio_hwnds;
+    for (HWND child = GetWindow(parent, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        auto it = g_native.bindings.find(child);
+        if (it == g_native.bindings.end()) continue;
+        if (it->second.type == "radio-group" && it->second.node_id == binding.node_id) {
+            radio_hwnds.push_back(child);
+        }
+    }
+
+    if (radio_hwnds.size() != option_values.size()) return false;
+
+    for (size_t index = 0; index < radio_hwnds.size(); ++index) {
+        HWND radio = radio_hwnds[index];
+        auto it = g_native.bindings.find(radio);
+        if (it == g_native.bindings.end()) return false;
+        SetWindowTextW(radio, option_texts[index].c_str());
+        it->second.value_text = option_values[index];
+    }
+
+    if (!selected_value.empty()) {
+        selectRadioByValue(hwnd, binding, selected_value);
+    }
+    return true;
+}
+
 bool selectTabByValue(HWND hwnd, ControlBinding& binding, const std::string& value) {
     auto it = std::find(binding.option_values.begin(), binding.option_values.end(), value);
     if (it == binding.option_values.end()) return false;
     const int index = static_cast<int>(std::distance(binding.option_values.begin(), it));
     TabCtrl_SetCurSel(hwnd, index);
     binding.value_text = value;
+    return true;
+}
+
+bool syncTabsControl(HWND hwnd,
+                     ControlBinding& binding,
+                     const ordered_json& tabs,
+                     const std::string& selected_value) {
+    if (!tabs.is_array()) return false;
+    HWND content_host = binding.companion_hwnd;
+    if (!content_host || !IsWindow(content_host)) return false;
+
+    TabCtrl_DeleteAllItems(hwnd);
+    binding.option_values.clear();
+    binding.option_nodes.clear();
+
+    int selected_index = -1;
+    int index = 0;
+    for (const auto& tab_node : tabs) {
+        if (!tab_node.is_object()) continue;
+        const std::string value = jsonString(tab_node, "value", "tab-" + std::to_string(index));
+        const std::wstring text = utf8ToWide(jsonString(tab_node, "text", jsonString(tab_node, "label", value)));
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = const_cast<wchar_t*>(text.c_str());
+        TabCtrl_InsertItem(hwnd, index, &item);
+        binding.option_values.push_back(value);
+        binding.option_nodes.push_back(tab_node);
+        if (selected_index < 0 && value == selected_value) {
+            selected_index = index;
+        }
+        ++index;
+    }
+
+    if (selected_index < 0 && !binding.option_values.empty()) {
+        selected_index = 0;
+    }
+    if (selected_index >= 0) {
+        TabCtrl_SetCurSel(hwnd, selected_index);
+        binding.value_text = binding.option_values[static_cast<size_t>(selected_index)];
+    } else {
+        binding.value_text.clear();
+    }
+
+    g_native.suppress_events = true;
+    clearNativeChildrenOf(content_host);
+    g_native.suppress_events = false;
+
+    if (selected_index >= 0 && static_cast<size_t>(selected_index) < binding.option_nodes.size()) {
+        const ordered_json& active_tab = binding.option_nodes[static_cast<size_t>(selected_index)];
+        auto content_it = active_tab.find("content");
+        if (content_it != active_tab.end() && content_it->is_object()) {
+            RECT rc{};
+            GetClientRect(content_host, &rc);
+            const int content_width = std::max(24, static_cast<int>(rc.right - rc.left) - 16);
+            HDC hdc = GetDC(content_host);
+            if (!hdc) return false;
+            ensureFonts();
+            SelectObject(hdc, g_native.ui_font);
+            layoutNode(content_host, hdc, *content_it, 8, 8, content_width);
+            ReleaseDC(content_host, hdc);
+        }
+    }
+
+    InvalidateRect(content_host, nullptr, TRUE);
+    UpdateWindow(content_host);
     return true;
 }
 
@@ -2104,6 +2517,41 @@ bool selectTableById(HWND hwnd, ControlBinding& binding, const std::string& row_
     ListView_SetItemState(hwnd, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     ListView_EnsureVisible(hwnd, index, FALSE);
     binding.value_text = row_id;
+    return true;
+}
+
+bool syncTableColumns(HWND hwnd,
+                      ControlBinding& binding,
+                      const ordered_json& columns,
+                      const ordered_json& rows,
+                      const std::string& selected_id) {
+    if (!columns.is_array()) return false;
+
+    while (ListView_DeleteColumn(hwnd, 0)) {
+    }
+
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const int control_width = std::max(110, static_cast<int>(rc.right - rc.left));
+
+    std::vector<std::string> column_keys;
+    int column_index = 0;
+    for (const auto& column : columns) {
+        if (!column.is_object()) continue;
+        const std::string key = jsonString(column, "key", "col-" + std::to_string(column_index));
+        const std::wstring title = utf8ToWide(jsonString(column, "title", key));
+        LVCOLUMNW list_column{};
+        list_column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        list_column.pszText = const_cast<wchar_t*>(title.c_str());
+        list_column.cx = std::max(110, control_width / std::max(1, static_cast<int>(columns.size())));
+        list_column.iSubItem = column_index;
+        ListView_InsertColumn(hwnd, column_index, &list_column);
+        column_keys.push_back(key);
+        ++column_index;
+    }
+
+    binding.column_keys = std::move(column_keys);
+    repopulateTableRows(hwnd, binding, rows, selected_id);
     return true;
 }
 
@@ -2846,9 +3294,20 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
     }
 
     if (type == "select") {
+        bool handled = false;
+        std::string selected_value = binding.value_text;
         auto value_it = props.find("value");
-        if (value_it == props.end() || !value_it->is_string()) return false;
-        return selectComboByValue(control, binding, value_it->get<std::string>());
+        if (value_it != props.end() && value_it->is_string()) {
+            selected_value = value_it->get<std::string>();
+        }
+        auto options_it = props.find("options");
+        if (options_it != props.end() && options_it->is_array()) {
+            handled = syncComboOptions(control, binding, *options_it, selected_value);
+        }
+        if (value_it != props.end() && value_it->is_string()) {
+            handled = selectComboByValue(control, binding, value_it->get<std::string>()) || handled;
+        }
+        return handled;
     }
 
     if (type == "canvas") {
@@ -2876,21 +3335,64 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
     }
 
     if (type == "list-box") {
+        bool handled = false;
+        std::string selected_value = binding.value_text;
         auto value_it = props.find("value");
-        if (value_it == props.end() || !value_it->is_string()) return false;
-        return selectListBoxByValue(control, binding, value_it->get<std::string>());
+        if (value_it != props.end() && value_it->is_string()) {
+            selected_value = value_it->get<std::string>();
+        }
+        auto options_it = props.find("options");
+        if (options_it != props.end() && options_it->is_array()) {
+            handled = syncListBoxOptions(control, binding, *options_it, selected_value);
+        }
+        if (value_it != props.end() && value_it->is_string()) {
+            handled = selectListBoxByValue(control, binding, value_it->get<std::string>()) || handled;
+        }
+        return handled;
     }
 
     if (type == "radio-group") {
+        bool handled = false;
+        std::string selected_value = selectedRadioGroupValue(control, binding);
         auto value_it = props.find("value");
-        if (value_it == props.end() || !value_it->is_string()) return false;
-        return selectRadioByValue(control, binding, value_it->get<std::string>());
+        if (value_it != props.end() && value_it->is_string()) {
+            selected_value = value_it->get<std::string>();
+        }
+        auto options_it = props.find("options");
+        if (options_it != props.end() && options_it->is_array()) {
+            if (patchWouldResizeNode(control, node_id, props)) {
+                g_native.patch_resize_reject_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            handled = syncRadioGroupOptions(control, binding, *options_it, selected_value);
+        }
+        if (value_it != props.end() && value_it->is_string()) {
+            handled = selectRadioByValue(control, binding, value_it->get<std::string>()) || handled;
+        }
+        return handled;
     }
 
     if (type == "tabs") {
+        const bool affects_layout = props.contains("tabs") || props.contains("value");
+        if (affects_layout && patchWouldResizeNode(control, node_id, props)) {
+            g_native.patch_resize_reject_count.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        bool handled = false;
+        std::string new_value = binding.value_text;
         auto value_it = props.find("value");
-        if (value_it == props.end() || !value_it->is_string()) return false;
-        const std::string new_value = value_it->get<std::string>();
+        if (value_it != props.end() && value_it->is_string()) {
+            new_value = value_it->get<std::string>();
+        }
+        auto tabs_it = props.find("tabs");
+        if (tabs_it != props.end() && tabs_it->is_array()) {
+            handled = syncTabsControl(control, binding, *tabs_it, new_value);
+            if (!handled) return false;
+        }
+        if (value_it == props.end() || !value_it->is_string()) {
+            return handled;
+        }
 
         // Update the tab header selection.
         if (!selectTabByValue(control, binding, new_value)) return false;
@@ -2993,13 +3495,22 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
     if (type == "table") {
         bool handled = false;
         auto rows_it = props.find("rows");
+        auto columns_it = props.find("columns");
         std::string selected_id = binding.value_text;
         auto selected_it = props.find("selectedId");
         if (selected_it != props.end() && selected_it->is_string()) {
             selected_id = selected_it->get<std::string>();
         }
+        if (columns_it != props.end() && columns_it->is_array()) {
+            const ordered_json rows = (rows_it != props.end() && rows_it->is_array())
+                ? *rows_it
+                : ordered_json(binding.row_objects);
+            handled = syncTableColumns(control, binding, *columns_it, rows, selected_id);
+        }
         if (rows_it != props.end() && rows_it->is_array()) {
-            syncTableRows(control, binding, *rows_it, selected_id);
+            if (columns_it == props.end()) {
+                syncTableRows(control, binding, *rows_it, selected_id);
+            }
             handled = true;
         }
         if (selected_it != props.end() && selected_it->is_string()) {
@@ -3090,12 +3601,16 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         auto props_it = op.find("props");
         if (props_it == op.end() || !props_it->is_object()) return false;
         auto title_it = props_it->find("title");
-        if (title_it != props_it->end() && title_it->is_string()) {
+        if (props_it->size() == 1 && title_it != props_it->end() && title_it->is_string()) {
             const std::wstring title = utf8ToWide(title_it->get<std::string>());
             SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
+            g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
-        return false;
+
+        rebuildNativeWindow(hwnd);
+        g_native.patch_window_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     if (op_name == "set-node-props") {
@@ -3103,8 +3618,15 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         if (node_id.empty()) return false;
         auto props_it = op.find("props");
         if (props_it == op.end() || !props_it->is_object()) return false;
-        if (applyNativeNodePropsPatch(hwnd, node_id, *props_it)) return true;
-        return tryRebuildAncestorContainerForNode(node_id);
+        if (applyNativeNodePropsPatch(hwnd, node_id, *props_it)) {
+            g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (tryRebuildAncestorContainerForNode(node_id)) {
+            g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
     }
 
     if (op_name == "tree-replace-items" ||
@@ -3116,8 +3638,15 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         op_name == "tree-set-selected-id") {
         const std::string node_id = jsonString(op, "id");
         if (node_id.empty()) return false;
-        if (refreshTreeViewControl(node_id)) return true;
-        return tryRebuildAncestorContainerForNode(node_id);
+        if (refreshTreeViewControl(node_id)) {
+            g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (tryRebuildAncestorContainerForNode(node_id)) {
+            g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
     }
 
     if (op_name == "replace-children" || op_name == "append-child" || op_name == "insert-child" || op_name == "remove-child" || op_name == "move-child") {
@@ -3138,6 +3667,7 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
             node_spec = *target;
         }
         rebuildNativeContainerContents(control_it->second, node_spec);
+        g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -3607,6 +4137,32 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             registerNodeControl(canvas, binding);
         }
         return {control_width, (cursor_y - y) + control_height};
+    }
+
+    if (type == "text-grid" || type == "text-grid-pane" || type == "indexed-graphics" || type == "rgba-pane" || type == "pane") {
+        const std::wstring label = utf8ToWide(jsonString(node, "label"));
+        MeasuredSize measured = measureNode(hdc, node, max_width);
+        const int control_width = std::max(24, measured.width);
+        int cursor_y = y;
+        HWND label_hwnd = nullptr;
+        if (!label.empty()) {
+            const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, control_width);
+            label_hwnd = createChildControl(L"STATIC", label.c_str(), SS_LEFT, x, cursor_y, control_width, label_size.cy, parent, g_native.ui_font);
+            cursor_y += static_cast<int>(label_size.cy + 8);
+        }
+        const int pane_height = std::max(24, measured.height - (cursor_y - y));
+        HWND pane_host = createChildControl(L"STATIC", L"", 0, x, cursor_y, control_width, pane_height, parent, nullptr);
+        if (pane_host) {
+            attachContainerForwarding(pane_host);
+            ControlBinding binding;
+            binding.type = type;
+            binding.event_name = jsonString(node, "event");
+            binding.node_id = jsonString(node, "id");
+            binding.text = jsonString(node, "label");
+            binding.companion_hwnd = label_hwnd;
+            registerNodeControl(pane_host, binding);
+        }
+        return {control_width, (cursor_y - y) + pane_height};
     }
 
     if (type == "tabs") {
@@ -4424,11 +4980,48 @@ void rebuildNativeWindow(HWND hwnd) {
     ReleaseDC(content_host ? content_host : hwnd, hdc);
 }
 
-void postNativeWindowMessage(UINT message) {
-    std::lock_guard<std::mutex> lock(g_native.mutex);
-    if (g_native.hwnd) {
-        PostMessageW(g_native.hwnd, message, 0, 0);
+void dispatchNativeWindowMessage(UINT message) {
+    HWND hwnd = nullptr;
+    DWORD thread_id = 0;
+    bool embedded_mode = false;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        hwnd = g_native.hwnd;
+        thread_id = g_native.thread_id;
+        embedded_mode = g_native.embedded_mode;
     }
+    if (!hwnd) return;
+
+    if (embedded_mode && thread_id == GetCurrentThreadId()) {
+        SendMessageW(hwnd, message, 0, 0);
+    } else {
+        PostMessageW(hwnd, message, 0, 0);
+    }
+}
+
+bool ensureNativeWindowClassRegistered() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = nativeWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kNativeWindowClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    if (RegisterClassW(&wc) != 0) {
+        return true;
+    }
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+bool ensureNativeHostWindowAvailable() {
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        if (g_native.hwnd) return true;
+        if (g_native.embedded_mode) {
+            setNativeLastError("Embedded native UI host is not attached.");
+            return false;
+        }
+    }
+    return ensureNativeThread();
 }
 
 bool findUserAppNodeById(ordered_json& node, const std::string& id, ordered_json** found) {
@@ -4799,6 +5392,8 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             const bool patched = applyNativePatchDocument(hwnd, patch);
             g_native.suppress_events = false;
             if (!patched) {
+                g_native.patch_failed_count.fetch_add(1, std::memory_order_relaxed);
+                g_native.patch_window_rebuild_count.fetch_add(1, std::memory_order_relaxed);
                 rebuildNativeWindow(hwnd);
             } else {
                 refreshNativeScrollMetrics(hwnd);
@@ -5261,6 +5856,10 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             std::lock_guard<std::mutex> lock(g_native.mutex);
             g_native.hwnd = nullptr;
             g_native.ready = false;
+            if (g_native.embedded_mode) {
+                g_native.running = false;
+                g_native.parent_hwnd = nullptr;
+            }
         }
         return 0;
     }
@@ -5293,20 +5892,24 @@ void nativeHostThreadMain() {
 
     initCommonControlsOnce();
     ensureFonts();
-
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = nativeWndProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"WinSchemeUserAppNativeWindow";
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    RegisterClassW(&wc);
+    if (!ensureNativeWindowClassRegistered()) {
+        {
+            std::lock_guard<std::mutex> lock(g_native.mutex);
+            g_native.running = false;
+            g_native.ready = false;
+            g_native.hwnd = nullptr;
+        }
+        g_native.cv.notify_all();
+        if (actctx_cookie) DeactivateActCtx(0, actctx_cookie);
+        if (hActCtx != INVALID_HANDLE_VALUE) ReleaseActCtx(hActCtx);
+        return;
+    }
 
     const DWORD window_style = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL;
 
     HWND hwnd = CreateWindowExW(
         0,
-        wc.lpszClassName,
+        kNativeWindowClassName,
         L"WinScheme Native UI",
         window_style,
         CW_USEDEFAULT,
@@ -5323,7 +5926,7 @@ void nativeHostThreadMain() {
         }(),
         nullptr,
         nullptr,
-        wc.hInstance,
+        GetModuleHandleW(nullptr),
         nullptr);
 
     {
@@ -5384,6 +5987,63 @@ bool hostBridgeAvailable() {
     return true;
 }
 
+bool attachEmbeddedNativeHost(const WinguiNativeEmbeddedHostDesc& desc) {
+    if (!desc.parent_hwnd) {
+        setNativeLastError("Embedded native UI parent HWND is required.");
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        if (g_native.hwnd || g_native.running) {
+            setNativeLastError("Native UI host is already active.");
+            return false;
+        }
+    }
+
+    initCommonControlsOnce();
+    ensureFonts();
+    if (!ensureNativeWindowClassRegistered()) {
+        setNativeLastError("Native UI window class registration failed.");
+        return false;
+    }
+
+    const DWORD window_style = WS_CHILD | WS_VSCROLL | WS_HSCROLL |
+        WS_CLIPCHILDREN | WS_CLIPSIBLINGS | (desc.visible ? WS_VISIBLE : 0u);
+    HWND hwnd = CreateWindowExW(
+        0,
+        kNativeWindowClassName,
+        L"WinScheme Native UI Embedded",
+        window_style,
+        desc.x,
+        desc.y,
+        desc.width,
+        desc.height,
+        static_cast<HWND>(desc.parent_hwnd),
+        nullptr,
+        GetModuleHandleW(nullptr),
+        nullptr);
+    if (!hwnd) {
+        setNativeLastError("Embedded native UI host window creation failed.");
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        g_native.thread_id = GetCurrentThreadId();
+        g_native.hwnd = hwnd;
+        g_native.parent_hwnd = static_cast<HWND>(desc.parent_hwnd);
+        g_native.ready = true;
+        g_native.running = true;
+        g_native.embedded_mode = true;
+    }
+
+    if (!desc.visible) {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    return true;
+}
+
 bool executeNativePublishJson(const char* utf8) {
     if (!utf8) {
         setNativeLastError("Native UI spec JSON is required.");
@@ -5403,7 +6063,9 @@ bool executeNativePublishJson(const char* utf8) {
         std::lock_guard<std::mutex> lock(g_native.mutex);
         g_native.spec = std::move(spec);
     }
-    if (ensureNativeThread()) postNativeWindowMessage(kMsgNativeReload);
+    g_native.publish_count.fetch_add(1, std::memory_order_relaxed);
+    if (!ensureNativeHostWindowAvailable()) return false;
+    dispatchNativeWindowMessage(kMsgNativeReload);
     return true;
 }
 
@@ -5436,13 +6098,15 @@ bool executeNativePatchJson(const char* utf8) {
         g_native.spec = std::move(next_spec);
         g_native.pending_patch = patch;
     }
-    if (ensureNativeThread()) postNativeWindowMessage(kMsgNativePatch);
+    g_native.patch_request_count.fetch_add(1, std::memory_order_relaxed);
+    if (!ensureNativeHostWindowAvailable()) return false;
+    dispatchNativeWindowMessage(kMsgNativePatch);
     return true;
 }
 
 bool executeNativeHostRun() {
-    if (!ensureNativeThread()) return false;
-    postNativeWindowMessage(kMsgNativeShow);
+    if (!ensureNativeHostWindowAvailable()) return false;
+    dispatchNativeWindowMessage(kMsgNativeShow);
     return true;
 }
 
@@ -5706,6 +6370,106 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_patch_json(const char* u
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_host_run(void) {
     clearNativeLastError();
     return executeNativeHostRun() ? 1 : 0;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_begin_embedded_session(const WinguiNativeEmbeddedSessionDesc* desc) {
+    clearNativeLastError();
+    if (!desc) {
+        setNativeLastError("Embedded native UI session descriptor is required.");
+        return 0;
+    }
+
+    wingui_native_set_callbacks(&desc->callbacks);
+    if (!attachEmbeddedNativeHost(desc->host)) {
+        return 0;
+    }
+
+    if (desc->initial_ui_json_utf8 && desc->initial_ui_json_utf8[0] != '\0') {
+        if (!executeNativePublishJson(desc->initial_ui_json_utf8)) {
+            wingui_native_detach_embedded_host();
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_attach_embedded_host(const WinguiNativeEmbeddedHostDesc* desc) {
+    clearNativeLastError();
+    if (!desc) {
+        setNativeLastError("Embedded native UI host descriptor is required.");
+        return 0;
+    }
+    return attachEmbeddedNativeHost(*desc) ? 1 : 0;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_end_embedded_session(void) {
+    wingui_native_detach_embedded_host();
+    wingui_native_set_callbacks(nullptr);
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_detach_embedded_host(void) {
+    clearNativeLastError();
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        if (!g_native.embedded_mode) return;
+        hwnd = g_native.hwnd;
+    }
+    if (hwnd && IsWindow(hwnd)) {
+        DestroyWindow(hwnd);
+    }
+    std::lock_guard<std::mutex> lock(g_native.mutex);
+    g_native.hwnd = nullptr;
+    g_native.parent_hwnd = nullptr;
+    g_native.ready = false;
+    g_native.running = false;
+    g_native.embedded_mode = false;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t x, int32_t y, int32_t width, int32_t height) {
+    clearNativeLastError();
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        hwnd = g_native.hwnd;
+    }
+    if (!hwnd || !IsWindow(hwnd)) {
+        setNativeLastError("Native UI host window is not available.");
+        return 0;
+    }
+    return MoveWindow(hwnd, x, y, std::max(0, width), std::max(0, height), TRUE) ? 1 : 0;
+}
+
+extern "C" WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void) {
+    std::lock_guard<std::mutex> lock(g_native.mutex);
+    return g_native.hwnd;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
+    clearNativeLastError();
+    return tryGetNativeNodeBounds(node_id_utf8, out_bounds) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size) {
+    clearNativeLastError();
+    return copyFocusedPaneIdUtf8(buffer_utf8, buffer_size) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_patch_metrics(WinguiNativePatchMetrics* out_metrics) {
+    if (!out_metrics) {
+        setNativeLastError("Native UI patch metrics require an output buffer.");
+        return 0;
+    }
+    out_metrics->publish_count = g_native.publish_count.load(std::memory_order_relaxed);
+    out_metrics->patch_request_count = g_native.patch_request_count.load(std::memory_order_relaxed);
+    out_metrics->direct_apply_count = g_native.patch_direct_apply_count.load(std::memory_order_relaxed);
+    out_metrics->subtree_rebuild_count = g_native.patch_subtree_rebuild_count.load(std::memory_order_relaxed);
+    out_metrics->window_rebuild_count = g_native.patch_window_rebuild_count.load(std::memory_order_relaxed);
+    out_metrics->resize_reject_count = g_native.patch_resize_reject_count.load(std::memory_order_relaxed);
+    out_metrics->failed_patch_count = g_native.patch_failed_count.load(std::memory_order_relaxed);
+    clearNativeLastError();
+    return 1;
 }
 
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_open_url(const char* utf8) {

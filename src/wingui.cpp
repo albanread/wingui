@@ -15,6 +15,7 @@
 #include "wingui_internal.h"
 
 #include <windows.h>
+#include <windowsx.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
@@ -135,6 +136,7 @@ struct WinguiIndexedGraphicsRenderer {
 struct WinguiRgbaBufferResources {
     ID3D11Texture2D* texture = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
 };
 
 struct WinguiRgbaPaneRenderer {
@@ -145,6 +147,52 @@ struct WinguiRgbaPaneRenderer {
     ID3D11SamplerState* linear_sampler = nullptr;
     ID3D11RasterizerState* rasterizer = nullptr;
     std::vector<WinguiRgbaBufferResources> buffers;
+    uint32_t buffer_width = 0;
+    uint32_t buffer_height = 0;
+};
+
+struct WinguiRgbaSurface {
+    WinguiContext* context = nullptr;
+    std::vector<WinguiRgbaBufferResources> buffers;
+    uint32_t buffer_width = 0;
+    uint32_t buffer_height = 0;
+};
+
+struct WinguiRgbaBlitter {
+    WinguiContext* context = nullptr;
+    ID3D11VertexShader* vertex_shader = nullptr;
+    ID3D11PixelShader* pixel_shader = nullptr;
+    ID3D11Buffer* constant_buffer = nullptr;
+    ID3D11SamplerState* linear_sampler = nullptr;
+    ID3D11RasterizerState* rasterizer = nullptr;
+    ID3D11BlendState* blend_opaque = nullptr;
+    ID3D11BlendState* blend_alpha_over = nullptr;
+};
+
+struct WinguiRgbaBlitUniforms {
+    float dst_pos_min[2];
+    float dst_pos_max[2];
+    float src_uv_min[2];
+    float src_uv_max[2];
+    float tint[4];
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+    uint32_t pad3;
+};
+
+struct WinguiIndexedBufferResources {
+    ID3D11Texture2D* pixels_texture = nullptr;
+    ID3D11ShaderResourceView* pixels_srv = nullptr;
+    ID3D11Texture2D* line_palette_texture = nullptr;
+    ID3D11ShaderResourceView* line_palette_srv = nullptr;
+    ID3D11Texture2D* global_palette_texture = nullptr;
+    ID3D11ShaderResourceView* global_palette_srv = nullptr;
+};
+
+struct WinguiIndexedSurface {
+    WinguiContext* context = nullptr;
+    std::vector<WinguiIndexedBufferResources> buffers;
     uint32_t buffer_width = 0;
     uint32_t buffer_height = 0;
 };
@@ -651,16 +699,18 @@ HRESULT createSpriteResources(WinguiIndexedGraphicsRenderer& renderer) {
     return hr;
 }
 
-void releaseRgbaPaneBuffers(WinguiRgbaPaneRenderer& renderer) {
-    for (auto& buffer : renderer.buffers) {
+void releaseRgbaBuffers(std::vector<WinguiRgbaBufferResources>& buffers, uint32_t& buffer_width, uint32_t& buffer_height) {
+    for (auto& buffer : buffers) {
+        safeRelease(buffer.rtv);
         safeRelease(buffer.srv);
         safeRelease(buffer.texture);
     }
-    renderer.buffer_width = 0;
-    renderer.buffer_height = 0;
+    buffer_width = 0;
+    buffer_height = 0;
 }
 
-HRESULT createRgbaPaneBufferResource(WinguiRgbaPaneRenderer& renderer, WinguiRgbaBufferResources& buffer, UINT width, UINT height) {
+HRESULT createRgbaPaneBufferResource(WinguiContext* context, WinguiRgbaBufferResources& buffer, UINT width, UINT height) {
+    if (!context || !context->device) return E_POINTER;
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;
     desc.Height = height;
@@ -671,19 +721,270 @@ HRESULT createRgbaPaneBufferResource(WinguiRgbaPaneRenderer& renderer, WinguiRgb
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-    HRESULT hr = renderer.context->device->CreateTexture2D(&desc, nullptr, &buffer.texture);
+    HRESULT hr = context->device->CreateTexture2D(&desc, nullptr, &buffer.texture);
     if (FAILED(hr)) return hr;
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format = desc.Format;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srv_desc.Texture2D.MipLevels = 1;
-    hr = renderer.context->device->CreateShaderResourceView(buffer.texture, &srv_desc, &buffer.srv);
+    hr = context->device->CreateShaderResourceView(buffer.texture, &srv_desc, &buffer.srv);
     if (FAILED(hr)) {
         safeRelease(buffer.texture);
         return hr;
     }
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+    rtv_desc.Format = desc.Format;
+    rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    hr = context->device->CreateRenderTargetView(buffer.texture, &rtv_desc, &buffer.rtv);
+    if (FAILED(hr)) {
+        safeRelease(buffer.srv);
+        safeRelease(buffer.texture);
+        return hr;
+    }
     return S_OK;
+}
+
+int32_t rgbaSurfaceEnsureBuffers(WinguiContext* context,
+                                 std::vector<WinguiRgbaBufferResources>& buffers,
+                                 uint32_t& buffer_width,
+                                 uint32_t& buffer_height,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 const char* error_prefix) {
+    if (!context) {
+        setLastErrorString(error_prefix ? error_prefix : "rgba surface: invalid context");
+        return 0;
+    }
+    if (width == 0 || height == 0) {
+        setLastErrorString(error_prefix ? error_prefix : "rgba surface: invalid dimensions");
+        return 0;
+    }
+    if (buffer_width == width && buffer_height == height && !buffers.empty() && buffers[0].texture) {
+        g_last_error.clear();
+        return 1;
+    }
+
+    releaseRgbaBuffers(buffers, buffer_width, buffer_height);
+    for (auto& buffer : buffers) {
+        const HRESULT hr = createRgbaPaneBufferResource(context, buffer, width, height);
+        if (FAILED(hr)) {
+            setLastErrorHresult(error_prefix ? error_prefix : "rgba surface: texture creation failed", hr);
+            releaseRgbaBuffers(buffers, buffer_width, buffer_height);
+            return 0;
+        }
+    }
+
+    buffer_width = width;
+    buffer_height = height;
+    g_last_error.clear();
+    return 1;
+}
+
+int32_t rgbaSurfaceGetBufferInfo(const std::vector<WinguiRgbaBufferResources>& buffers,
+                                uint32_t buffer_width,
+                                uint32_t buffer_height,
+                                uint32_t* out_width,
+                                uint32_t* out_height,
+                                uint32_t* out_buffer_count,
+                                const char* invalid_message) {
+    if (buffers.empty()) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba surface: invalid arguments");
+        return 0;
+    }
+    if (out_width) *out_width = buffer_width;
+    if (out_height) *out_height = buffer_height;
+    if (out_buffer_count) *out_buffer_count = static_cast<uint32_t>(buffers.size());
+    g_last_error.clear();
+    return 1;
+}
+
+int32_t rgbaSurfaceUploadBgraRegion(WinguiContext* context,
+                                    std::vector<WinguiRgbaBufferResources>& buffers,
+                                    uint32_t buffer_width,
+                                    uint32_t buffer_height,
+                                    uint32_t buffer_index,
+                                    WinguiRectU32 destination_region,
+                                    const uint8_t* pixels,
+                                    uint32_t source_pitch,
+                                    const char* invalid_message,
+                                    const char* uninitialized_message,
+                                    const char* bounds_message) {
+    if (!context || !context->device_context || !pixels || buffer_index >= buffers.size()) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba surface upload: invalid arguments");
+        return 0;
+    }
+    if (!destination_region.width || !destination_region.height) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba surface upload: invalid region");
+        return 0;
+    }
+    if (!buffer_width || !buffer_height || !buffers[buffer_index].texture) {
+        setLastErrorString(uninitialized_message ? uninitialized_message : "rgba surface upload: buffers are not initialized");
+        return 0;
+    }
+    if (destination_region.x + destination_region.width > buffer_width ||
+        destination_region.y + destination_region.height > buffer_height) {
+        setLastErrorString(bounds_message ? bounds_message : "rgba surface upload: region out of bounds");
+        return 0;
+    }
+    const D3D11_BOX box{
+        destination_region.x,
+        destination_region.y,
+        0,
+        destination_region.x + destination_region.width,
+        destination_region.y + destination_region.height,
+        1,
+    };
+    context->device_context->UpdateSubresource(
+        buffers[buffer_index].texture,
+        0,
+        &box,
+        pixels,
+        source_pitch ? source_pitch : destination_region.width * 4u,
+        0);
+    g_last_error.clear();
+    return 1;
+}
+
+int32_t rgbaSurfaceCopyRegion(WinguiContext* context,
+                              std::vector<WinguiRgbaBufferResources>& buffers,
+                              uint32_t buffer_width,
+                              uint32_t buffer_height,
+                              uint32_t dst_buffer_index,
+                              uint32_t dst_x,
+                              uint32_t dst_y,
+                              uint32_t src_buffer_index,
+                              WinguiRectU32 source_region,
+                              const char* invalid_message,
+                              const char* uninitialized_message,
+                              const char* bounds_message) {
+    if (!context || !context->device_context || dst_buffer_index >= buffers.size() || src_buffer_index >= buffers.size()) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba surface copy: invalid arguments");
+        return 0;
+    }
+    if (!source_region.width || !source_region.height) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba surface copy: invalid region");
+        return 0;
+    }
+    if (!buffer_width || !buffer_height || !buffers[dst_buffer_index].texture || !buffers[src_buffer_index].texture) {
+        setLastErrorString(uninitialized_message ? uninitialized_message : "rgba surface copy: buffers are not initialized");
+        return 0;
+    }
+    if (source_region.x + source_region.width > buffer_width ||
+        source_region.y + source_region.height > buffer_height ||
+        dst_x + source_region.width > buffer_width ||
+        dst_y + source_region.height > buffer_height) {
+        setLastErrorString(bounds_message ? bounds_message : "rgba surface copy: region out of bounds");
+        return 0;
+    }
+    const D3D11_BOX source_box{
+        source_region.x,
+        source_region.y,
+        0,
+        source_region.x + source_region.width,
+        source_region.y + source_region.height,
+        1,
+    };
+    context->device_context->CopySubresourceRegion(
+        buffers[dst_buffer_index].texture,
+        0,
+        dst_x,
+        dst_y,
+        0,
+        buffers[src_buffer_index].texture,
+        0,
+        &source_box);
+    g_last_error.clear();
+    return 1;
+}
+
+int32_t renderRgbaBufferSet(WinguiRgbaPaneRenderer* renderer,
+                            const std::vector<WinguiRgbaBufferResources>& buffers,
+                            uint32_t buffer_width,
+                            uint32_t buffer_height,
+                            int32_t viewport_x,
+                            int32_t viewport_y,
+                            int32_t viewport_width,
+                            int32_t viewport_height,
+                            uint32_t screen_width,
+                            uint32_t screen_height,
+                            uint32_t pixel_aspect_num,
+                            uint32_t pixel_aspect_den,
+                            uint32_t buffer_index,
+                            WinguiIndexedPaneLayout* out_layout,
+                            const char* invalid_message,
+                            const char* ready_message,
+                            const char* layout_message) {
+    if (!renderer || !renderer->context || !renderer->context->device_context) {
+        setLastErrorString(invalid_message ? invalid_message : "rgba render: invalid arguments");
+        return 0;
+    }
+    if (buffer_index >= buffers.size() || !buffers[buffer_index].srv || !buffer_width || !buffer_height) {
+        setLastErrorString(ready_message ? ready_message : "rgba render: requested buffer is not ready");
+        return 0;
+    }
+
+    WinguiIndexedPaneLayout layout{};
+    if (!computeIndexedPaneLayoutInternal(
+            viewport_x,
+            viewport_y,
+            viewport_width,
+            viewport_height,
+            screen_width ? screen_width : buffer_width,
+            screen_height ? screen_height : buffer_height,
+            pixel_aspect_num,
+            pixel_aspect_den,
+            layout)) {
+        setLastErrorString(layout_message ? layout_message : "rgba render: invalid pane layout inputs");
+        return 0;
+    }
+    if (out_layout) *out_layout = layout;
+
+    WinguiGraphicsDisplayUniforms uniforms{};
+    uniforms.has_texture = 1;
+    uniforms.screen_width = screen_width ? screen_width : buffer_width;
+    uniforms.screen_height = screen_height ? screen_height : buffer_height;
+    uniforms.buffer_width = buffer_width;
+    uniforms.buffer_height = buffer_height;
+    uniforms.uv_scale_x = layout.shown_width / std::max(1.0f, static_cast<float>(viewport_width));
+    uniforms.uv_scale_y = layout.shown_height / std::max(1.0f, static_cast<float>(viewport_height));
+    uniforms.uv_offset_x = (1.0f - uniforms.uv_scale_x) * 0.5f;
+    uniforms.uv_offset_y = (1.0f - uniforms.uv_scale_y) * 0.5f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = renderer->context->device_context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult(invalid_message ? invalid_message : "rgba render: constant buffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(mapped.pData, &uniforms, sizeof(uniforms));
+    renderer->context->device_context->Unmap(renderer->constant_buffer, 0);
+
+    const D3D11_VIEWPORT viewport{ static_cast<float>(viewport_x), static_cast<float>(viewport_y), static_cast<float>(viewport_width), static_cast<float>(viewport_height), 0.0f, 1.0f };
+    const D3D11_RECT scissor{ viewport_x, viewport_y, viewport_x + viewport_width, viewport_y + viewport_height };
+    ID3D11Buffer* no_vertex_buffer = nullptr;
+    const UINT stride = 0;
+    const UINT offset = 0;
+    ID3D11ShaderResourceView* srvs[] = { buffers[buffer_index].srv };
+
+    renderer->context->device_context->OMSetRenderTargets(1, &renderer->context->render_target_view, nullptr);
+    renderer->context->device_context->RSSetState(renderer->rasterizer);
+    renderer->context->device_context->RSSetViewports(1, &viewport);
+    renderer->context->device_context->RSSetScissorRects(1, &scissor);
+    renderer->context->device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    renderer->context->device_context->IASetInputLayout(nullptr);
+    renderer->context->device_context->IASetVertexBuffers(0, 1, &no_vertex_buffer, &stride, &offset);
+    renderer->context->device_context->VSSetShader(renderer->vertex_shader, nullptr, 0);
+    renderer->context->device_context->PSSetShader(renderer->pixel_shader, nullptr, 0);
+    renderer->context->device_context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+    renderer->context->device_context->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+    renderer->context->device_context->PSSetSamplers(0, 1, &renderer->linear_sampler);
+    renderer->context->device_context->PSSetShaderResources(0, 1, srvs);
+    renderer->context->device_context->Draw(6, 0);
+
+    g_last_error.clear();
+    return 1;
 }
 
 bool buildGlyphAtlasBitmap(const WinguiGlyphAtlasDesc* desc, WinguiGlyphAtlasBitmap& out_bitmap) {
@@ -1066,6 +1367,18 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_window_get_key_state(WinguiWind
     }
     g_last_error.clear();
     return window->key_states[virtual_key].load(std::memory_order_acquire) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_window_get_keyboard_state(WinguiWindow* window, WinguiKeyboardState* out_state) {
+    if (!window || !out_state) {
+        setLastErrorString("wingui_window_get_keyboard_state: invalid arguments");
+        return 0;
+    }
+    for (uint32_t index = 0; index < 256; ++index) {
+        out_state->pressed[index] = window->key_states[index].load(std::memory_order_acquire);
+    }
+    g_last_error.clear();
+    return 1;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_window_get_mouse_state(WinguiWindow* window, WinguiMouseState* out_state) {
@@ -1661,6 +1974,335 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_compute_indexed_pane_layout(
     return 1;
 }
 
+void releaseIndexedBufferResources(WinguiIndexedBufferResources& buffer) {
+    safeRelease(buffer.global_palette_srv);
+    safeRelease(buffer.global_palette_texture);
+    safeRelease(buffer.line_palette_srv);
+    safeRelease(buffer.line_palette_texture);
+    safeRelease(buffer.pixels_srv);
+    safeRelease(buffer.pixels_texture);
+}
+
+HRESULT createIndexedSurfaceBuffer(WinguiContext* context, WinguiIndexedBufferResources& buffer, UINT width, UINT height) {
+    if (!context || !context->device) return E_POINTER;
+    auto make_default_texture = [&](UINT w, UINT h, DXGI_FORMAT fmt, ID3D11Texture2D** tex_out, ID3D11ShaderResourceView** srv_out) -> HRESULT {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = w;
+        desc.Height = h;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = fmt;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = context->device->CreateTexture2D(&desc, nullptr, tex_out);
+        if (FAILED(hr)) return hr;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = fmt;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        hr = context->device->CreateShaderResourceView(*tex_out, &srv_desc, srv_out);
+        if (FAILED(hr)) {
+            safeRelease(*tex_out);
+            return hr;
+        }
+        return S_OK;
+    };
+
+    HRESULT hr = make_default_texture(width, height, DXGI_FORMAT_R8_UINT, &buffer.pixels_texture, &buffer.pixels_srv);
+    if (FAILED(hr)) return hr;
+    hr = make_default_texture(16, height, DXGI_FORMAT_R32_UINT, &buffer.line_palette_texture, &buffer.line_palette_srv);
+    if (FAILED(hr)) {
+        releaseIndexedBufferResources(buffer);
+        return hr;
+    }
+    hr = make_default_texture(240, 1, DXGI_FORMAT_R32_UINT, &buffer.global_palette_texture, &buffer.global_palette_srv);
+    if (FAILED(hr)) {
+        releaseIndexedBufferResources(buffer);
+        return hr;
+    }
+    return S_OK;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_indexed_surface(
+    WinguiContext* context,
+    uint32_t buffer_count,
+    WinguiIndexedSurface** out_surface) {
+    if (!context || !out_surface) {
+        setLastErrorString("wingui_create_indexed_surface: invalid arguments");
+        return 0;
+    }
+    auto* surface = new (std::nothrow) WinguiIndexedSurface();
+    if (!surface) {
+        setLastErrorString("wingui_create_indexed_surface: allocation failed");
+        return 0;
+    }
+    surface->context = context;
+    surface->buffers.resize(buffer_count == 0 ? 1u : buffer_count);
+    *out_surface = surface;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_indexed_surface(WinguiIndexedSurface* surface) {
+    if (!surface) return;
+    for (auto& buffer : surface->buffers) {
+        releaseIndexedBufferResources(buffer);
+    }
+    delete surface;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_ensure_buffers(
+    WinguiIndexedSurface* surface,
+    uint32_t width,
+    uint32_t height) {
+    if (!surface || !surface->context || !width || !height) {
+        setLastErrorString("wingui_indexed_surface_ensure_buffers: invalid arguments");
+        return 0;
+    }
+    if (surface->buffer_width == width && surface->buffer_height == height &&
+        !surface->buffers.empty() && surface->buffers[0].pixels_texture) {
+        return 1;
+    }
+    for (auto& buffer : surface->buffers) {
+        releaseIndexedBufferResources(buffer);
+    }
+    surface->buffer_width = 0;
+    surface->buffer_height = 0;
+    for (auto& buffer : surface->buffers) {
+        HRESULT hr = createIndexedSurfaceBuffer(surface->context, buffer, width, height);
+        if (FAILED(hr)) {
+            for (auto& cleanup : surface->buffers) releaseIndexedBufferResources(cleanup);
+            setLastErrorHresult("wingui_indexed_surface_ensure_buffers: texture creation failed", hr);
+            return 0;
+        }
+    }
+    surface->buffer_width = width;
+    surface->buffer_height = height;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_get_buffer_info(
+    WinguiIndexedSurface* surface,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count) {
+    if (!surface) {
+        setLastErrorString("wingui_indexed_surface_get_buffer_info: invalid arguments");
+        return 0;
+    }
+    if (out_width) *out_width = surface->buffer_width;
+    if (out_height) *out_height = surface->buffer_height;
+    if (out_buffer_count) *out_buffer_count = static_cast<uint32_t>(surface->buffers.size());
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_pixels_region(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* indexed_pixels,
+    uint32_t source_pitch) {
+    if (!surface || !surface->context || !indexed_pixels || buffer_index >= surface->buffers.size()) {
+        setLastErrorString("wingui_indexed_surface_upload_pixels_region: invalid arguments");
+        return 0;
+    }
+    if (!destination_region.width || !destination_region.height) {
+        setLastErrorString("wingui_indexed_surface_upload_pixels_region: invalid region");
+        return 0;
+    }
+    if (!surface->buffer_width || !surface->buffer_height || !surface->buffers[buffer_index].pixels_texture) {
+        setLastErrorString("wingui_indexed_surface_upload_pixels_region: buffers not initialized");
+        return 0;
+    }
+    if (destination_region.x + destination_region.width > surface->buffer_width ||
+        destination_region.y + destination_region.height > surface->buffer_height) {
+        setLastErrorString("wingui_indexed_surface_upload_pixels_region: region out of bounds");
+        return 0;
+    }
+    const D3D11_BOX box{
+        destination_region.x,
+        destination_region.y,
+        0,
+        destination_region.x + destination_region.width,
+        destination_region.y + destination_region.height,
+        1,
+    };
+    surface->context->device_context->UpdateSubresource(
+        surface->buffers[buffer_index].pixels_texture,
+        0,
+        &box,
+        indexed_pixels,
+        source_pitch ? source_pitch : destination_region.width,
+        0);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_line_palettes(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t start_row,
+    uint32_t row_count,
+    const WinguiGraphicsLinePalette* palettes) {
+    if (!surface || !surface->context || !palettes || buffer_index >= surface->buffers.size()) {
+        setLastErrorString("wingui_indexed_surface_upload_line_palettes: invalid arguments");
+        return 0;
+    }
+    if (!row_count || !surface->buffer_height || !surface->buffers[buffer_index].line_palette_texture) {
+        setLastErrorString("wingui_indexed_surface_upload_line_palettes: invalid request");
+        return 0;
+    }
+    if (start_row + row_count > surface->buffer_height) {
+        setLastErrorString("wingui_indexed_surface_upload_line_palettes: row range out of bounds");
+        return 0;
+    }
+    std::vector<uint32_t> packed(static_cast<size_t>(row_count) * 16u);
+    for (uint32_t y = 0; y < row_count; ++y) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            packed[static_cast<size_t>(y) * 16u + i] = packGraphicsColour(palettes[y].colours[i]);
+        }
+    }
+    const D3D11_BOX box{ 0u, start_row, 0u, 16u, start_row + row_count, 1u };
+    surface->context->device_context->UpdateSubresource(
+        surface->buffers[buffer_index].line_palette_texture,
+        0,
+        &box,
+        packed.data(),
+        16u * sizeof(uint32_t),
+        0);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_global_palette(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t start_index,
+    uint32_t colour_count,
+    const WinguiGraphicsColour* colours) {
+    if (!surface || !surface->context || !colours || buffer_index >= surface->buffers.size()) {
+        setLastErrorString("wingui_indexed_surface_upload_global_palette: invalid arguments");
+        return 0;
+    }
+    if (!colour_count || !surface->buffers[buffer_index].global_palette_texture) {
+        setLastErrorString("wingui_indexed_surface_upload_global_palette: invalid request");
+        return 0;
+    }
+    if (start_index + colour_count > 240u) {
+        setLastErrorString("wingui_indexed_surface_upload_global_palette: range out of bounds");
+        return 0;
+    }
+    std::vector<uint32_t> packed(colour_count);
+    for (uint32_t i = 0; i < colour_count; ++i) {
+        packed[i] = packGraphicsColour(colours[i]);
+    }
+    const D3D11_BOX box{ start_index, 0u, 0u, start_index + colour_count, 1u, 1u };
+    surface->context->device_context->UpdateSubresource(
+        surface->buffers[buffer_index].global_palette_texture,
+        0,
+        &box,
+        packed.data(),
+        colour_count * sizeof(uint32_t),
+        0);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_render(
+    WinguiIndexedGraphicsRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    uint32_t screen_width,
+    uint32_t screen_height,
+    int32_t scroll_x,
+    int32_t scroll_y,
+    uint32_t pixel_aspect_num,
+    uint32_t pixel_aspect_den,
+    uint32_t buffer_index,
+    WinguiIndexedPaneLayout* out_layout) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !surface ||
+        renderer->context != surface->context) {
+        setLastErrorString("wingui_indexed_surface_render: invalid arguments");
+        return 0;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffer_width || !surface->buffer_height ||
+        !surface->buffers[buffer_index].pixels_srv ||
+        !surface->buffers[buffer_index].line_palette_srv ||
+        !surface->buffers[buffer_index].global_palette_srv) {
+        setLastErrorString("wingui_indexed_surface_render: buffer not ready");
+        return 0;
+    }
+    WinguiIndexedPaneLayout layout{};
+    if (!computeIndexedPaneLayoutInternal(
+            viewport_x, viewport_y, viewport_width, viewport_height,
+            screen_width ? screen_width : surface->buffer_width,
+            screen_height ? screen_height : surface->buffer_height,
+            pixel_aspect_num, pixel_aspect_den, layout)) {
+        setLastErrorString("wingui_indexed_surface_render: invalid pane layout inputs");
+        return 0;
+    }
+    if (out_layout) *out_layout = layout;
+
+    WinguiGraphicsDisplayUniforms uniforms{};
+    uniforms.uv_scale_x = layout.shown_width / std::max(1.0f, static_cast<float>(viewport_width));
+    uniforms.uv_scale_y = layout.shown_height / std::max(1.0f, static_cast<float>(viewport_height));
+    uniforms.uv_offset_x = (1.0f - uniforms.uv_scale_x) * 0.5f;
+    uniforms.uv_offset_y = (1.0f - uniforms.uv_scale_y) * 0.5f;
+    uniforms.screen_width = screen_width ? screen_width : surface->buffer_width;
+    uniforms.screen_height = screen_height ? screen_height : surface->buffer_height;
+    uniforms.buffer_width = surface->buffer_width;
+    uniforms.buffer_height = surface->buffer_height;
+    uniforms.scroll_x = scroll_x;
+    uniforms.scroll_y = scroll_y;
+    uniforms.has_texture = 1;
+
+    auto* ctx = renderer->context->device_context;
+    D3D11_MAPPED_SUBRESOURCE constant_map{};
+    HRESULT hr = ctx->Map(renderer->graphics_constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &constant_map);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_indexed_surface_render: cbuffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(constant_map.pData, &uniforms, sizeof(uniforms));
+    ctx->Unmap(renderer->graphics_constant_buffer, 0);
+
+    const D3D11_VIEWPORT viewport{ static_cast<float>(viewport_x), static_cast<float>(viewport_y), static_cast<float>(viewport_width), static_cast<float>(viewport_height), 0.0f, 1.0f };
+    const D3D11_RECT scissor{ viewport_x, viewport_y, viewport_x + viewport_width, viewport_y + viewport_height };
+    ID3D11Buffer* no_vertex_buffer = nullptr;
+    const UINT stride = 0;
+    const UINT offset = 0;
+    ID3D11ShaderResourceView* srvs[] = {
+        surface->buffers[buffer_index].pixels_srv,
+        surface->buffers[buffer_index].line_palette_srv,
+        surface->buffers[buffer_index].global_palette_srv,
+    };
+
+    ctx->OMSetRenderTargets(1, &renderer->context->render_target_view, nullptr);
+    ctx->RSSetState(renderer->rasterizer);
+    ctx->RSSetViewports(1, &viewport);
+    ctx->RSSetScissorRects(1, &scissor);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetVertexBuffers(0, 1, &no_vertex_buffer, &stride, &offset);
+    ctx->VSSetShader(renderer->graphics_vertex_shader, nullptr, 0);
+    ctx->PSSetShader(renderer->graphics_pixel_shader, nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, &renderer->graphics_constant_buffer);
+    ctx->PSSetConstantBuffers(0, 1, &renderer->graphics_constant_buffer);
+    ctx->PSSetSamplers(0, 1, &renderer->point_sampler);
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ctx->Draw(6, 0);
+    ID3D11ShaderResourceView* null_srvs[3] = { nullptr, nullptr, nullptr };
+    ctx->PSSetShaderResources(0, 3, null_srvs);
+    g_last_error.clear();
+    return 1;
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_render_pane(
     WinguiIndexedGraphicsRenderer* renderer,
     int32_t viewport_x,
@@ -2085,13 +2727,469 @@ failure:
 
 extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_rgba_pane_renderer(WinguiRgbaPaneRenderer* renderer) {
     if (!renderer) return;
-    releaseRgbaPaneBuffers(*renderer);
+    releaseRgbaBuffers(renderer->buffers, renderer->buffer_width, renderer->buffer_height);
     safeRelease(renderer->rasterizer);
     safeRelease(renderer->linear_sampler);
     safeRelease(renderer->constant_buffer);
     safeRelease(renderer->vertex_shader);
     safeRelease(renderer->pixel_shader);
     delete renderer;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_rgba_surface(
+    WinguiContext* context,
+    uint32_t buffer_count,
+    WinguiRgbaSurface** out_surface) {
+    if (!context || !out_surface) {
+        setLastErrorString("wingui_create_rgba_surface: invalid arguments");
+        return 0;
+    }
+    auto* surface = new (std::nothrow) WinguiRgbaSurface();
+    if (!surface) {
+        setLastErrorString("wingui_create_rgba_surface: allocation failed");
+        return 0;
+    }
+    surface->context = context;
+    surface->buffers.resize(std::max<uint32_t>(1, buffer_count ? buffer_count : 2u));
+    *out_surface = surface;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_rgba_surface(WinguiRgbaSurface* surface) {
+    if (!surface) return;
+    releaseRgbaBuffers(surface->buffers, surface->buffer_width, surface->buffer_height);
+    delete surface;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_ensure_buffers(
+    WinguiRgbaSurface* surface,
+    uint32_t width,
+    uint32_t height) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_ensure_buffers: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceEnsureBuffers(
+        surface->context,
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        width,
+        height,
+        "wingui_rgba_surface_ensure_buffers: texture creation failed");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_get_buffer_info(
+    WinguiRgbaSurface* surface,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_get_buffer_info: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceGetBufferInfo(
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        out_width,
+        out_height,
+        out_buffer_count,
+        "wingui_rgba_surface_get_buffer_info: invalid arguments");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_upload_bgra8(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const uint8_t* pixels,
+    uint32_t source_pitch) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_upload_bgra8: invalid arguments");
+        return 0;
+    }
+    WinguiRectU32 full_region{0u, 0u, surface->buffer_width, surface->buffer_height};
+    return rgbaSurfaceUploadBgraRegion(
+        surface->context,
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        buffer_index,
+        full_region,
+        pixels,
+        source_pitch,
+        "wingui_rgba_surface_upload_bgra8: invalid arguments",
+        "wingui_rgba_surface_upload_bgra8: buffers are not initialized",
+        "wingui_rgba_surface_upload_bgra8: region out of bounds");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_upload_bgra8_region(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* pixels,
+    uint32_t source_pitch) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_upload_bgra8_region: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceUploadBgraRegion(
+        surface->context,
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        buffer_index,
+        destination_region,
+        pixels,
+        source_pitch,
+        "wingui_rgba_surface_upload_bgra8_region: invalid arguments",
+        "wingui_rgba_surface_upload_bgra8_region: buffers are not initialized",
+        "wingui_rgba_surface_upload_bgra8_region: region out of bounds");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_copy_region(
+    WinguiRgbaSurface* surface,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_copy_region: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceCopyRegion(
+        surface->context,
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        dst_buffer_index,
+        dst_x,
+        dst_y,
+        src_buffer_index,
+        source_region,
+        "wingui_rgba_surface_copy_region: invalid arguments",
+        "wingui_rgba_surface_copy_region: buffers are not initialized",
+        "wingui_rgba_surface_copy_region: region out of bounds");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_copy_from_surface(
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    WinguiRgbaSurface* src_surface,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region) {
+    if (!dst_surface || !src_surface || !dst_surface->context || dst_surface->context != src_surface->context) {
+        setLastErrorString("wingui_rgba_surface_copy_from_surface: invalid arguments");
+        return 0;
+    }
+    if (dst_buffer_index >= dst_surface->buffers.size() || src_buffer_index >= src_surface->buffers.size()) {
+        setLastErrorString("wingui_rgba_surface_copy_from_surface: invalid arguments");
+        return 0;
+    }
+    if (!source_region.width || !source_region.height) {
+        setLastErrorString("wingui_rgba_surface_copy_from_surface: invalid region");
+        return 0;
+    }
+    if (!dst_surface->buffer_width || !dst_surface->buffer_height ||
+        !src_surface->buffer_width || !src_surface->buffer_height ||
+        !dst_surface->buffers[dst_buffer_index].texture ||
+        !src_surface->buffers[src_buffer_index].texture) {
+        setLastErrorString("wingui_rgba_surface_copy_from_surface: buffers are not initialized");
+        return 0;
+    }
+    if (source_region.x + source_region.width > src_surface->buffer_width ||
+        source_region.y + source_region.height > src_surface->buffer_height ||
+        dst_x + source_region.width > dst_surface->buffer_width ||
+        dst_y + source_region.height > dst_surface->buffer_height) {
+        setLastErrorString("wingui_rgba_surface_copy_from_surface: region out of bounds");
+        return 0;
+    }
+    const D3D11_BOX source_box{
+        source_region.x,
+        source_region.y,
+        0,
+        source_region.x + source_region.width,
+        source_region.y + source_region.height,
+        1,
+    };
+    dst_surface->context->device_context->CopySubresourceRegion(
+        dst_surface->buffers[dst_buffer_index].texture,
+        0,
+        dst_x,
+        dst_y,
+        0,
+        src_surface->buffers[src_buffer_index].texture,
+        0,
+        &source_box);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_rgba_blitter(WinguiRgbaBlitter* blitter) {
+    if (!blitter) return;
+    safeRelease(blitter->blend_alpha_over);
+    safeRelease(blitter->blend_opaque);
+    safeRelease(blitter->rasterizer);
+    safeRelease(blitter->linear_sampler);
+    safeRelease(blitter->constant_buffer);
+    safeRelease(blitter->pixel_shader);
+    safeRelease(blitter->vertex_shader);
+    delete blitter;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_rgba_blitter(
+    WinguiContext* context,
+    const char* shader_path_utf8,
+    WinguiRgbaBlitter** out_blitter) {
+    if (!context || !context->device || !out_blitter) {
+        setLastErrorString("wingui_create_rgba_blitter: invalid arguments");
+        return 0;
+    }
+    auto* blitter = new (std::nothrow) WinguiRgbaBlitter();
+    if (!blitter) {
+        setLastErrorString("wingui_create_rgba_blitter: allocation failed");
+        return 0;
+    }
+    blitter->context = context;
+
+    const char* shader_path = shader_path_utf8 && *shader_path_utf8 ? shader_path_utf8 : "wingui/shaders/rgba_blit.hlsl";
+    void* vs_blob_raw = nullptr;
+    void* ps_blob_raw = nullptr;
+    size_t blob_size = 0;
+    if (!wingui_compile_shader_from_file_utf8(shader_path, "rgba_blit_vertex", "vs_4_0", &vs_blob_raw, &blob_size) ||
+        !wingui_compile_shader_from_file_utf8(shader_path, "rgba_blit_fragment", "ps_4_0", &ps_blob_raw, &blob_size)) {
+        if (vs_blob_raw) wingui_release_blob(vs_blob_raw);
+        if (ps_blob_raw) wingui_release_blob(ps_blob_raw);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+    auto* vs_blob = static_cast<ID3DBlob*>(vs_blob_raw);
+    auto* ps_blob = static_cast<ID3DBlob*>(ps_blob_raw);
+    HRESULT hr = context->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &blitter->vertex_shader);
+    if (SUCCEEDED(hr)) {
+        hr = context->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &blitter->pixel_shader);
+    }
+    wingui_release_blob(ps_blob_raw);
+    wingui_release_blob(vs_blob_raw);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: shader creation failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.ByteWidth = sizeof(WinguiRgbaBlitUniforms);
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = context->device->CreateBuffer(&cb_desc, nullptr, &blitter->constant_buffer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: cbuffer creation failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    hr = context->device->CreateSamplerState(&sampler_desc, &blitter->linear_sampler);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: sampler creation failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    D3D11_RASTERIZER_DESC raster_desc{};
+    raster_desc.FillMode = D3D11_FILL_SOLID;
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.ScissorEnable = TRUE;
+    raster_desc.DepthClipEnable = TRUE;
+    hr = context->device->CreateRasterizerState(&raster_desc, &blitter->rasterizer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: rasterizer creation failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    D3D11_BLEND_DESC blend_desc{};
+    blend_desc.RenderTarget[0].BlendEnable = FALSE;
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = context->device->CreateBlendState(&blend_desc, &blitter->blend_opaque);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: opaque blend state failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    hr = context->device->CreateBlendState(&blend_desc, &blitter->blend_alpha_over);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_rgba_blitter: alpha blend state failed", hr);
+        wingui_destroy_rgba_blitter(blitter);
+        return 0;
+    }
+
+    *out_blitter = blitter;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_shader_blit(
+    WinguiRgbaBlitter* blitter,
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    WinguiRectU32 dst_rect,
+    WinguiRgbaSurface* src_surface,
+    uint32_t src_buffer_index,
+    WinguiRectU32 src_rect,
+    float tint_r,
+    float tint_g,
+    float tint_b,
+    float tint_a,
+    uint32_t blend_mode) {
+    if (!blitter || !blitter->context || !blitter->context->device_context ||
+        !dst_surface || !src_surface || dst_surface->context != src_surface->context ||
+        dst_surface->context != blitter->context) {
+        setLastErrorString("wingui_rgba_surface_shader_blit: invalid arguments");
+        return 0;
+    }
+    if (dst_buffer_index >= dst_surface->buffers.size() || src_buffer_index >= src_surface->buffers.size()) {
+        setLastErrorString("wingui_rgba_surface_shader_blit: invalid buffer index");
+        return 0;
+    }
+    if (!dst_rect.width || !dst_rect.height || !src_rect.width || !src_rect.height) {
+        setLastErrorString("wingui_rgba_surface_shader_blit: invalid rect");
+        return 0;
+    }
+    if (!dst_surface->buffer_width || !dst_surface->buffer_height ||
+        !src_surface->buffer_width || !src_surface->buffer_height ||
+        !dst_surface->buffers[dst_buffer_index].rtv ||
+        !src_surface->buffers[src_buffer_index].srv) {
+        setLastErrorString("wingui_rgba_surface_shader_blit: buffers not initialized");
+        return 0;
+    }
+    if (dst_rect.x + dst_rect.width > dst_surface->buffer_width ||
+        dst_rect.y + dst_rect.height > dst_surface->buffer_height ||
+        src_rect.x + src_rect.width > src_surface->buffer_width ||
+        src_rect.y + src_rect.height > src_surface->buffer_height) {
+        setLastErrorString("wingui_rgba_surface_shader_blit: rect out of bounds");
+        return 0;
+    }
+
+    auto* ctx = blitter->context->device_context;
+
+    WinguiRgbaBlitUniforms uniforms{};
+    const float dw = static_cast<float>(dst_surface->buffer_width);
+    const float dh = static_cast<float>(dst_surface->buffer_height);
+    uniforms.dst_pos_min[0] = (static_cast<float>(dst_rect.x) / dw) * 2.0f - 1.0f;
+    uniforms.dst_pos_max[0] = (static_cast<float>(dst_rect.x + dst_rect.width) / dw) * 2.0f - 1.0f;
+    uniforms.dst_pos_min[1] = 1.0f - (static_cast<float>(dst_rect.y) / dh) * 2.0f;
+    uniforms.dst_pos_max[1] = 1.0f - (static_cast<float>(dst_rect.y + dst_rect.height) / dh) * 2.0f;
+    const float sw = static_cast<float>(src_surface->buffer_width);
+    const float sh = static_cast<float>(src_surface->buffer_height);
+    uniforms.src_uv_min[0] = static_cast<float>(src_rect.x) / sw;
+    uniforms.src_uv_max[0] = static_cast<float>(src_rect.x + src_rect.width) / sw;
+    uniforms.src_uv_min[1] = static_cast<float>(src_rect.y) / sh;
+    uniforms.src_uv_max[1] = static_cast<float>(src_rect.y + src_rect.height) / sh;
+    uniforms.tint[0] = tint_r;
+    uniforms.tint[1] = tint_g;
+    uniforms.tint[2] = tint_b;
+    uniforms.tint[3] = tint_a;
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = ctx->Map(blitter->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_rgba_surface_shader_blit: cbuffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(mapped.pData, &uniforms, sizeof(uniforms));
+    ctx->Unmap(blitter->constant_buffer, 0);
+
+    ID3D11RenderTargetView* rtv = dst_surface->buffers[dst_buffer_index].rtv;
+    ID3D11ShaderResourceView* srv = src_surface->buffers[src_buffer_index].srv;
+    ID3D11ShaderResourceView* null_srv = nullptr;
+
+    const D3D11_VIEWPORT viewport{ 0.0f, 0.0f, dw, dh, 0.0f, 1.0f };
+    const D3D11_RECT scissor{
+        static_cast<LONG>(dst_rect.x),
+        static_cast<LONG>(dst_rect.y),
+        static_cast<LONG>(dst_rect.x + dst_rect.width),
+        static_cast<LONG>(dst_rect.y + dst_rect.height) };
+
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    ID3D11BlendState* blend_state = (blend_mode == WINGUI_RGBA_BLIT_ALPHA_OVER) ? blitter->blend_alpha_over : blitter->blend_opaque;
+    const FLOAT blend_factor[4] = { 0, 0, 0, 0 };
+    ctx->OMSetBlendState(blend_state, blend_factor, 0xffffffffu);
+    ctx->RSSetState(blitter->rasterizer);
+    ctx->RSSetViewports(1, &viewport);
+    ctx->RSSetScissorRects(1, &scissor);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(blitter->vertex_shader, nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, &blitter->constant_buffer);
+    ctx->PSSetShader(blitter->pixel_shader, nullptr, 0);
+    ctx->PSSetConstantBuffers(0, 1, &blitter->constant_buffer);
+    ctx->PSSetSamplers(0, 1, &blitter->linear_sampler);
+    ctx->PSSetShaderResources(0, 1, &srv);
+    ctx->Draw(6, 0);
+    ctx->PSSetShaderResources(0, 1, &null_srv);
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_render(
+    WinguiRgbaPaneRenderer* renderer,
+    WinguiRgbaSurface* surface,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    uint32_t screen_width,
+    uint32_t screen_height,
+    uint32_t pixel_aspect_num,
+    uint32_t pixel_aspect_den,
+    uint32_t buffer_index,
+    WinguiIndexedPaneLayout* out_layout) {
+    if (!surface) {
+        setLastErrorString("wingui_rgba_surface_render: invalid arguments");
+        return 0;
+    }
+    return renderRgbaBufferSet(
+        renderer,
+        surface->buffers,
+        surface->buffer_width,
+        surface->buffer_height,
+        viewport_x,
+        viewport_y,
+        viewport_width,
+        viewport_height,
+        screen_width,
+        screen_height,
+        pixel_aspect_num,
+        pixel_aspect_den,
+        buffer_index,
+        out_layout,
+        "wingui_rgba_surface_render: invalid arguments",
+        "wingui_rgba_surface_render: requested buffer is not ready",
+        "wingui_rgba_surface_render: invalid pane layout inputs");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_ensure_buffers(
@@ -2102,29 +3200,33 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_ensure_buffers(
         setLastErrorString("wingui_rgba_pane_ensure_buffers: invalid arguments");
         return 0;
     }
-    if (width == 0 || height == 0) {
-        setLastErrorString("wingui_rgba_pane_ensure_buffers: invalid dimensions");
+    return rgbaSurfaceEnsureBuffers(
+        renderer->context,
+        renderer->buffers,
+        renderer->buffer_width,
+        renderer->buffer_height,
+        width,
+        height,
+        "wingui_rgba_pane_ensure_buffers: texture creation failed");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_get_buffer_info(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count) {
+    if (!renderer) {
+        setLastErrorString("wingui_rgba_pane_get_buffer_info: invalid arguments");
         return 0;
     }
-    if (renderer->buffer_width == width && renderer->buffer_height == height && !renderer->buffers.empty() && renderer->buffers[0].texture) {
-        g_last_error.clear();
-        return 1;
-    }
-
-    releaseRgbaPaneBuffers(*renderer);
-    for (auto& buffer : renderer->buffers) {
-        const HRESULT hr = createRgbaPaneBufferResource(*renderer, buffer, width, height);
-        if (FAILED(hr)) {
-            setLastErrorHresult("wingui_rgba_pane_ensure_buffers: texture creation failed", hr);
-            releaseRgbaPaneBuffers(*renderer);
-            return 0;
-        }
-    }
-
-    renderer->buffer_width = width;
-    renderer->buffer_height = height;
-    g_last_error.clear();
-    return 1;
+    return rgbaSurfaceGetBufferInfo(
+        renderer->buffers,
+        renderer->buffer_width,
+        renderer->buffer_height,
+        out_width,
+        out_height,
+        out_buffer_count,
+        "wingui_rgba_pane_get_buffer_info: invalid arguments");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_upload_bgra8(
@@ -2151,6 +3253,56 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_upload_bgra8(
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_upload_bgra8_region(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* pixels,
+    uint32_t source_pitch) {
+    if (!renderer) {
+        setLastErrorString("wingui_rgba_pane_upload_bgra8_region: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceUploadBgraRegion(
+        renderer->context,
+        renderer->buffers,
+        renderer->buffer_width,
+        renderer->buffer_height,
+        buffer_index,
+        destination_region,
+        pixels,
+        source_pitch,
+        "wingui_rgba_pane_upload_bgra8_region: invalid arguments",
+        "wingui_rgba_pane_upload_bgra8_region: buffers are not initialized",
+        "wingui_rgba_pane_upload_bgra8_region: region out of bounds");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_copy_region(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region) {
+    if (!renderer) {
+        setLastErrorString("wingui_rgba_pane_copy_region: invalid arguments");
+        return 0;
+    }
+    return rgbaSurfaceCopyRegion(
+        renderer->context,
+        renderer->buffers,
+        renderer->buffer_width,
+        renderer->buffer_height,
+        dst_buffer_index,
+        dst_x,
+        dst_y,
+        src_buffer_index,
+        source_region,
+        "wingui_rgba_pane_copy_region: invalid arguments",
+        "wingui_rgba_pane_copy_region: buffers are not initialized",
+        "wingui_rgba_pane_copy_region: region out of bounds");
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_render(
     WinguiRgbaPaneRenderer* renderer,
     int32_t viewport_x,
@@ -2163,75 +3315,24 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_render(
     uint32_t pixel_aspect_den,
     uint32_t buffer_index,
     WinguiIndexedPaneLayout* out_layout) {
-    if (!renderer || !renderer->context || !renderer->context->device_context) {
-        setLastErrorString("wingui_rgba_pane_render: invalid arguments");
-        return 0;
-    }
-    if (buffer_index >= renderer->buffers.size() || !renderer->buffers[buffer_index].srv || !renderer->buffer_width || !renderer->buffer_height) {
-        setLastErrorString("wingui_rgba_pane_render: requested buffer is not ready");
-        return 0;
-    }
-
-    WinguiIndexedPaneLayout layout{};
-    if (!computeIndexedPaneLayoutInternal(
-            viewport_x,
-            viewport_y,
-            viewport_width,
-            viewport_height,
-            screen_width ? screen_width : renderer->buffer_width,
-            screen_height ? screen_height : renderer->buffer_height,
-            pixel_aspect_num,
-            pixel_aspect_den,
-            layout)) {
-        setLastErrorString("wingui_rgba_pane_render: invalid pane layout inputs");
-        return 0;
-    }
-    if (out_layout) *out_layout = layout;
-
-    WinguiGraphicsDisplayUniforms uniforms{};
-    uniforms.has_texture = 1;
-    uniforms.screen_width = screen_width ? screen_width : renderer->buffer_width;
-    uniforms.screen_height = screen_height ? screen_height : renderer->buffer_height;
-    uniforms.buffer_width = renderer->buffer_width;
-    uniforms.buffer_height = renderer->buffer_height;
-    uniforms.uv_scale_x = layout.shown_width / std::max(1.0f, static_cast<float>(viewport_width));
-    uniforms.uv_scale_y = layout.shown_height / std::max(1.0f, static_cast<float>(viewport_height));
-    uniforms.uv_offset_x = (1.0f - uniforms.uv_scale_x) * 0.5f;
-    uniforms.uv_offset_y = (1.0f - uniforms.uv_scale_y) * 0.5f;
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = renderer->context->device_context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        setLastErrorHresult("wingui_rgba_pane_render: constant buffer map failed", hr);
-        return 0;
-    }
-    std::memcpy(mapped.pData, &uniforms, sizeof(uniforms));
-    renderer->context->device_context->Unmap(renderer->constant_buffer, 0);
-
-    const D3D11_VIEWPORT viewport{ static_cast<float>(viewport_x), static_cast<float>(viewport_y), static_cast<float>(viewport_width), static_cast<float>(viewport_height), 0.0f, 1.0f };
-    const D3D11_RECT scissor{ viewport_x, viewport_y, viewport_x + viewport_width, viewport_y + viewport_height };
-    ID3D11Buffer* no_vertex_buffer = nullptr;
-    const UINT stride = 0;
-    const UINT offset = 0;
-    ID3D11ShaderResourceView* srvs[] = { renderer->buffers[buffer_index].srv };
-
-    renderer->context->device_context->OMSetRenderTargets(1, &renderer->context->render_target_view, nullptr);
-    renderer->context->device_context->RSSetState(renderer->rasterizer);
-    renderer->context->device_context->RSSetViewports(1, &viewport);
-    renderer->context->device_context->RSSetScissorRects(1, &scissor);
-    renderer->context->device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    renderer->context->device_context->IASetInputLayout(nullptr);
-    renderer->context->device_context->IASetVertexBuffers(0, 1, &no_vertex_buffer, &stride, &offset);
-    renderer->context->device_context->VSSetShader(renderer->vertex_shader, nullptr, 0);
-    renderer->context->device_context->PSSetShader(renderer->pixel_shader, nullptr, 0);
-    renderer->context->device_context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
-    renderer->context->device_context->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
-    renderer->context->device_context->PSSetSamplers(0, 1, &renderer->linear_sampler);
-    renderer->context->device_context->PSSetShaderResources(0, 1, srvs);
-    renderer->context->device_context->Draw(6, 0);
-
-    g_last_error.clear();
-    return 1;
+    return renderRgbaBufferSet(
+        renderer,
+        renderer->buffers,
+        renderer->buffer_width,
+        renderer->buffer_height,
+        viewport_x,
+        viewport_y,
+        viewport_width,
+        viewport_height,
+        screen_width,
+        screen_height,
+        pixel_aspect_num,
+        pixel_aspect_den,
+        buffer_index,
+        out_layout,
+        "wingui_rgba_pane_render: invalid arguments",
+        "wingui_rgba_pane_render: requested buffer is not ready",
+        "wingui_rgba_pane_render: invalid pane layout inputs");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_save_buffer_utf8(

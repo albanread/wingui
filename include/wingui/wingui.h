@@ -25,6 +25,14 @@ typedef struct WinguiMenu WinguiMenu;
 typedef struct WinguiTextGridRenderer WinguiTextGridRenderer;
 typedef struct WinguiIndexedGraphicsRenderer WinguiIndexedGraphicsRenderer;
 typedef struct WinguiRgbaPaneRenderer WinguiRgbaPaneRenderer;
+typedef struct WinguiRgbaSurface WinguiRgbaSurface;
+typedef struct WinguiRgbaBlitter WinguiRgbaBlitter;
+typedef struct WinguiIndexedSurface WinguiIndexedSurface;
+
+typedef enum WinguiRgbaBlitMode {
+    WINGUI_RGBA_BLIT_OPAQUE = 0,
+    WINGUI_RGBA_BLIT_ALPHA_OVER = 1,
+} WinguiRgbaBlitMode;
 
 typedef struct WinguiImageData {
     uint8_t* pixels;
@@ -67,6 +75,10 @@ typedef struct WinguiMouseState {
     uint32_t buttons;
     int32_t inside_client;
 } WinguiMouseState;
+
+typedef struct WinguiKeyboardState {
+    uint8_t pressed[256];
+} WinguiKeyboardState;
 
 enum {
     WINGUI_MOUSE_BUTTON_LEFT = 1u << 0,
@@ -245,6 +257,13 @@ typedef struct WinguiRgbaPaneRendererDesc {
     uint32_t buffer_count;
 } WinguiRgbaPaneRendererDesc;
 
+typedef struct WinguiRectU32 {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} WinguiRectU32;
+
 enum {
     WINGUI_SPRITE_FLAG_VISIBLE = 1u << 0,
     WINGUI_SPRITE_FLAG_FLIP_H = 1u << 1,
@@ -291,6 +310,7 @@ WINGUI_API void WINGUI_CALL wingui_window_set_user_data(WinguiWindow* window, vo
 WINGUI_API void* WINGUI_CALL wingui_window_user_data(WinguiWindow* window);
 WINGUI_API int32_t WINGUI_CALL wingui_window_client_size(WinguiWindow* window, int32_t* out_width, int32_t* out_height);
 WINGUI_API int32_t WINGUI_CALL wingui_window_get_key_state(WinguiWindow* window, uint32_t virtual_key);
+WINGUI_API int32_t WINGUI_CALL wingui_window_get_keyboard_state(WinguiWindow* window, WinguiKeyboardState* out_state);
 WINGUI_API int32_t WINGUI_CALL wingui_window_get_mouse_state(WinguiWindow* window, WinguiMouseState* out_state);
 
 WINGUI_API int32_t WINGUI_CALL wingui_create_menu_bar(WinguiMenu** out_menu);
@@ -344,6 +364,54 @@ WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_render_pane(
     int32_t viewport_height,
     const WinguiIndexedGraphicsFrame* frame,
     WinguiIndexedPaneLayout* out_layout);
+
+WINGUI_API int32_t WINGUI_CALL wingui_create_indexed_surface(
+    WinguiContext* context,
+    uint32_t buffer_count,
+    WinguiIndexedSurface** out_surface);
+WINGUI_API void WINGUI_CALL wingui_destroy_indexed_surface(WinguiIndexedSurface* surface);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_ensure_buffers(
+    WinguiIndexedSurface* surface,
+    uint32_t width,
+    uint32_t height);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_get_buffer_info(
+    WinguiIndexedSurface* surface,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_pixels_region(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* indexed_pixels,
+    uint32_t source_pitch);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_line_palettes(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t start_row,
+    uint32_t row_count,
+    const WinguiGraphicsLinePalette* palettes);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_upload_global_palette(
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t start_index,
+    uint32_t colour_count,
+    const WinguiGraphicsColour* colours);
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_render(
+    WinguiIndexedGraphicsRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    uint32_t screen_width,
+    uint32_t screen_height,
+    int32_t scroll_x,
+    int32_t scroll_y,
+    uint32_t pixel_aspect_num,
+    uint32_t pixel_aspect_den,
+    uint32_t buffer_index,
+    WinguiIndexedPaneLayout* out_layout);
 WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_upload_sprite_atlas_region(
     WinguiIndexedGraphicsRenderer* renderer,
     uint32_t atlas_x,
@@ -370,15 +438,104 @@ WINGUI_API int32_t WINGUI_CALL wingui_create_rgba_pane_renderer(
     const WinguiRgbaPaneRendererDesc* desc,
     WinguiRgbaPaneRenderer** out_renderer);
 WINGUI_API void WINGUI_CALL wingui_destroy_rgba_pane_renderer(WinguiRgbaPaneRenderer* renderer);
+WINGUI_API int32_t WINGUI_CALL wingui_create_rgba_surface(
+    WinguiContext* context,
+    uint32_t buffer_count,
+    WinguiRgbaSurface** out_surface);
+WINGUI_API void WINGUI_CALL wingui_destroy_rgba_surface(WinguiRgbaSurface* surface);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_ensure_buffers(
+    WinguiRgbaSurface* surface,
+    uint32_t width,
+    uint32_t height);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_get_buffer_info(
+    WinguiRgbaSurface* surface,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_upload_bgra8(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const uint8_t* pixels,
+    uint32_t source_pitch);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_upload_bgra8_region(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* pixels,
+    uint32_t source_pitch);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_copy_region(
+    WinguiRgbaSurface* surface,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_copy_from_surface(
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    WinguiRgbaSurface* src_surface,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region);
+WINGUI_API int32_t WINGUI_CALL wingui_create_rgba_blitter(
+    WinguiContext* context,
+    const char* shader_path_utf8,
+    WinguiRgbaBlitter** out_blitter);
+WINGUI_API void WINGUI_CALL wingui_destroy_rgba_blitter(WinguiRgbaBlitter* blitter);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_shader_blit(
+    WinguiRgbaBlitter* blitter,
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    WinguiRectU32 dst_rect,
+    WinguiRgbaSurface* src_surface,
+    uint32_t src_buffer_index,
+    WinguiRectU32 src_rect,
+    float tint_r,
+    float tint_g,
+    float tint_b,
+    float tint_a,
+    uint32_t blend_mode);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_render(
+    WinguiRgbaPaneRenderer* renderer,
+    WinguiRgbaSurface* surface,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    uint32_t screen_width,
+    uint32_t screen_height,
+    uint32_t pixel_aspect_num,
+    uint32_t pixel_aspect_den,
+    uint32_t buffer_index,
+    WinguiIndexedPaneLayout* out_layout);
 WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_ensure_buffers(
     WinguiRgbaPaneRenderer* renderer,
     uint32_t width,
     uint32_t height);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_get_buffer_info(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t* out_width,
+    uint32_t* out_height,
+    uint32_t* out_buffer_count);
 WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_upload_bgra8(
     WinguiRgbaPaneRenderer* renderer,
     uint32_t buffer_index,
     const uint8_t* pixels,
     uint32_t source_pitch);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_upload_bgra8_region(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t buffer_index,
+    WinguiRectU32 destination_region,
+    const uint8_t* pixels,
+    uint32_t source_pitch);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_copy_region(
+    WinguiRgbaPaneRenderer* renderer,
+    uint32_t dst_buffer_index,
+    uint32_t dst_x,
+    uint32_t dst_y,
+    uint32_t src_buffer_index,
+    WinguiRectU32 source_region);
 WINGUI_API int32_t WINGUI_CALL wingui_rgba_pane_render(
     WinguiRgbaPaneRenderer* renderer,
     int32_t viewport_x,

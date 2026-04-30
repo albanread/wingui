@@ -40,7 +40,12 @@ bool is_scalar(const Json& v) {
 // a full republish (mirrors Scheme user-app-structured-prop-patchable?).
 bool is_structured_patchable(const std::string& node_type,
                               const std::string& key) {
+    if ((node_type == "select" || node_type == "list-box" || node_type == "radio-group") && key == "options") {
+        return true;
+    }
+    if (node_type == "tabs" && key == "tabs") return true;
     if (node_type == "table" && key == "rows") return true;
+    if (node_type == "table" && key == "columns") return true;
     if (node_type == "tree-view" && (key == "items" || key == "expandedIds")) return true;
     if (node_type == "context-menu" && key == "items") return true;
     if (node_type == "canvas" && key == "commands") return true;
@@ -362,6 +367,10 @@ UiNode& UiNode::items(Json items_array) {
     return prop("items", std::move(items_array));
 }
 
+UiNode& UiNode::expanded_ids(Json expanded_ids_array) {
+    return prop("expandedIds", std::move(expanded_ids_array));
+}
+
 UiNode& UiNode::tabs(Json tabs_array) {
     return prop("tabs", std::move(tabs_array));
 }
@@ -381,7 +390,8 @@ UiNode& UiNode::children(std::vector<UiNode> child_nodes) {
 }
 
 UiNode& UiNode::body(UiNode body_node) {
-    body_ = std::move(body_node);
+    body_.clear();
+    body_.push_back(std::move(body_node));
     return *this;
 }
 
@@ -402,8 +412,8 @@ Json UiNode::to_json(const std::string& path) const {
     }
 
     // Body node.
-    if (body_) {
-        obj["body"] = body_->to_json(path + "/body");
+    if (!body_.empty()) {
+        obj["body"] = body_.front().to_json(path + "/body");
     }
 
     // Children.
@@ -516,19 +526,16 @@ ui_model_diff(const Json& old_spec, const Json& new_spec) {
 
     std::vector<UiPatchOp> ops;
 
-    // Diff window-level scalar props (title, menuBar, etc.).
+    // Diff window-level props other than body/type. Non-title structured
+    // values are still patchable because the native host can accept the
+    // patch document and perform a focused rebuild when needed.
     Json window_changed = Json::object();
     for (const auto& key : union_keys(old_spec, new_spec)) {
         if (key == "type" || key == "body") continue;
         const Json old_v = old_spec.contains(key) ? old_spec[key] : Json(nullptr);
         const Json new_v = new_spec.contains(key) ? new_spec[key] : Json(nullptr);
         if (old_v == new_v) continue;
-        if (is_scalar(old_v) && is_scalar(new_v)) {
-            window_changed[key] = new_v;
-        } else {
-            // Non-scalar window prop change falls back to full republish.
-            return std::nullopt;
-        }
+        window_changed[key] = new_v;
     }
     if (!window_changed.empty()) {
         UiPatchOp op;
@@ -694,11 +701,55 @@ UiNode ui_divider() { return UiNode("divider"); }
 UiNode ui_split_pane(std::string id_str, std::vector<UiNode> c) {
     UiNode n("split-pane"); n.id(std::move(id_str)); n.children(std::move(c)); return n;
 }
+UiNode ui_split_pane(std::string id_str, bool focused, std::vector<UiNode> c) {
+    UiNode n("split-pane");
+    n.id(std::move(id_str));
+    n.focused(focused);
+    n.children(std::move(c));
+    return n;
+}
+UiNode ui_split_pane(std::string id_str,
+                     double size,
+                     int64_t min_size,
+                     int64_t max_size,
+                     bool collapsed,
+                     bool focused,
+                     std::vector<UiNode> c) {
+    UiNode n("split-pane");
+    n.id(std::move(id_str));
+    n.size(size);
+    n.min_size(min_size);
+    if (max_size > 0) n.max_size(max_size);
+    n.collapsed(collapsed);
+    n.focused(focused);
+    n.children(std::move(c));
+    return n;
+}
 UiNode ui_split_view(std::string orientation, std::string event_name,
                      UiNode first_pane, UiNode second_pane) {
     UiNode n("split-view");
     n.orientation(std::move(orientation));
     n.event(std::move(event_name));
+    n.children({std::move(first_pane), std::move(second_pane)});
+    return n;
+}
+UiNode ui_split_view(std::string orientation,
+                     std::string event_name,
+                     UiNode first_pane,
+                     UiNode second_pane,
+                     int64_t width,
+                     int64_t height,
+                     int64_t divider_size,
+                     bool live_resize,
+                     bool disabled) {
+    UiNode n("split-view");
+    n.orientation(std::move(orientation));
+    n.event(std::move(event_name));
+    if (width > 0) n.width(width);
+    if (height > 0) n.height(height);
+    n.divider_size(divider_size);
+    n.live_resize(live_resize);
+    n.disabled(disabled);
     n.children({std::move(first_pane), std::move(second_pane)});
     return n;
 }
@@ -758,11 +809,38 @@ UiNode ui_canvas(int64_t w, int64_t h, Json cmds) {
 UiNode ui_text_grid(int64_t cols, int64_t rows, std::string e) {
     UiNode n("text-grid"); n.prop("columns", uv(cols)); n.prop("rows", uv(rows)); if(!e.empty()) n.event(std::move(e)); return n;
 }
+UiNode ui_text_grid(std::string id_str, int64_t cols, int64_t rows, std::string e, bool focused) {
+    UiNode n("text-grid");
+    n.id(std::move(id_str));
+    n.prop("columns", uv(cols));
+    n.prop("rows", uv(rows));
+    if (!e.empty()) n.event(std::move(e));
+    if (focused) n.focused(true);
+    return n;
+}
 UiNode ui_indexed_graphics(int64_t w, int64_t h, std::string e) {
     UiNode n("indexed-graphics"); n.width(w); n.height(h); if(!e.empty()) n.event(std::move(e)); return n;
 }
+UiNode ui_indexed_graphics(std::string id_str, int64_t w, int64_t h, std::string e, bool focused) {
+    UiNode n("indexed-graphics");
+    n.id(std::move(id_str));
+    n.width(w);
+    n.height(h);
+    if (!e.empty()) n.event(std::move(e));
+    if (focused) n.focused(true);
+    return n;
+}
 UiNode ui_rgba_pane(int64_t w, int64_t h, std::string e) {
     UiNode n("rgba-pane"); n.width(w); n.height(h); if(!e.empty()) n.event(std::move(e)); return n;
+}
+UiNode ui_rgba_pane(std::string id_str, int64_t w, int64_t h, std::string e, bool focused) {
+    UiNode n("rgba-pane");
+    n.id(std::move(id_str));
+    n.width(w);
+    n.height(h);
+    if (!e.empty()) n.event(std::move(e));
+    if (focused) n.focused(true);
+    return n;
 }
 
 UiNode ui_select(std::string l, std::string v, std::string e, Json opts) {
@@ -780,8 +858,35 @@ UiNode ui_table(std::string l, Json cols, Json r, std::string e) {
 UiNode ui_tree_view(std::string l, Json its, std::string e) {
     UiNode n("tree-view"); n.label(std::move(l)); n.items(std::move(its)); n.event(std::move(e)); return n;
 }
+UiNode ui_tree_view(std::string l,
+                    Json its,
+                    std::string selected_id,
+                    Json expanded_ids,
+                    std::string e,
+                    std::string toggle_e,
+                    std::string activate_e) {
+    UiNode n("tree-view");
+    n.label(std::move(l));
+    n.items(std::move(its));
+    n.selected_id(std::move(selected_id));
+    n.expanded_ids(std::move(expanded_ids));
+    n.event(std::move(e));
+    n.toggle_event(std::move(toggle_e));
+    n.activate_event(std::move(activate_e));
+    return n;
+}
 UiNode ui_tabs(std::string l, std::string v, std::string e, Json t) {
     UiNode n("tabs"); n.label(std::move(l)); n.value(std::move(v)); n.event(std::move(e)); n.tabs(std::move(t)); return n;
+}
+UiNode ui_tabs(std::string l, std::string v, std::string e, Json t, int64_t w, int64_t h) {
+    UiNode n("tabs");
+    n.label(std::move(l));
+    n.value(std::move(v));
+    n.event(std::move(e));
+    if (w > 0) n.width(w);
+    if (h > 0) n.height(h);
+    n.tabs(std::move(t));
+    return n;
 }
 UiNode ui_context_menu(Json its, UiNode content) {
     UiNode n("context-menu");
@@ -819,6 +924,12 @@ Json ui_tree_item(std::string id_str, std::string text, Json children) {
     o["id"]   = std::move(id_str);
     o["text"] = std::move(text);
     if (!children.empty()) o["children"] = std::move(children);
+    return o;
+}
+
+Json ui_tree_item(std::string id_str, std::string text, Json children, Json tag) {
+    Json o = ui_tree_item(std::move(id_str), std::move(text), std::move(children));
+    o["tag"] = std::move(tag);
     return o;
 }
 
