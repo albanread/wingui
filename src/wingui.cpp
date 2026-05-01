@@ -411,6 +411,136 @@ std::wstring fullPathWide(const std::wstring& path) {
     return result;
 }
 
+bool isAbsolutePathWide(const std::wstring& path) {
+    if (path.size() >= 2 && path[1] == L':') return true;
+    return path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\';
+}
+
+std::wstring directoryNameWide(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    return path.substr(0, slash);
+}
+
+std::wstring joinPathWide(const std::wstring& left, const std::wstring& right) {
+    if (left.empty()) return right;
+    if (right.empty()) return left;
+    const wchar_t tail = left.back();
+    if (tail == L'\\' || tail == L'/') return left + right;
+    return left + L"\\" + right;
+}
+
+std::wstring processImagePathWide() {
+    std::wstring path(MAX_PATH, L'\0');
+    DWORD length = 0;
+    while (true) {
+        length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0) return {};
+        if (length < path.size()) break;
+        path.resize(path.size() * 2, L'\0');
+    }
+    path.resize(static_cast<size_t>(length));
+    return path;
+}
+
+std::wstring currentModulePathWide() {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&currentModulePathWide),
+                            &module)) {
+        return {};
+    }
+
+    std::wstring path(MAX_PATH, L'\0');
+    DWORD length = 0;
+    while (true) {
+        length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0) return {};
+        if (length < path.size()) break;
+        path.resize(path.size() * 2, L'\0');
+    }
+    path.resize(static_cast<size_t>(length));
+    return path;
+}
+
+void appendUniquePath(std::vector<std::wstring>& paths, const std::wstring& candidate) {
+    if (candidate.empty()) return;
+    const std::wstring full = fullPathWide(candidate);
+    for (const std::wstring& existing : paths) {
+        if (_wcsicmp(existing.c_str(), full.c_str()) == 0) return;
+    }
+    paths.push_back(full);
+}
+
+std::wstring stripWinguiPrefixWide(const std::wstring& path) {
+    constexpr wchar_t kPrefixForward[] = L"wingui/";
+    constexpr wchar_t kPrefixBack[] = L"wingui\\";
+    if (path.rfind(kPrefixForward, 0) == 0) return path.substr(std::size(kPrefixForward) - 1);
+    if (path.rfind(kPrefixBack, 0) == 0) return path.substr(std::size(kPrefixBack) - 1);
+    return path;
+}
+
+std::vector<std::wstring> shaderCandidatePathsWide(const std::wstring& path) {
+    std::vector<std::wstring> candidates;
+    if (path.empty()) return candidates;
+    if (isAbsolutePathWide(path)) {
+        appendUniquePath(candidates, path);
+        return candidates;
+    }
+
+    const std::wstring stripped = stripWinguiPrefixWide(path);
+    const std::wstring exe_dir = directoryNameWide(processImagePathWide());
+    const std::wstring module_dir = directoryNameWide(currentModulePathWide());
+
+    appendUniquePath(candidates, joinPathWide(exe_dir, stripped));
+    appendUniquePath(candidates, joinPathWide(exe_dir, path));
+    appendUniquePath(candidates, joinPathWide(module_dir, stripped));
+    appendUniquePath(candidates, joinPathWide(module_dir, path));
+    appendUniquePath(candidates, path);
+    return candidates;
+}
+
+bool fileExistsWide(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring compiledShaderPathWide(const std::wstring& source_path,
+                                    const char* entry_utf8,
+                                    const char* target_utf8) {
+    if (source_path.empty() || !entry_utf8 || !*entry_utf8 || !target_utf8 || !*target_utf8) return {};
+    const std::wstring entry = utf8ToWide(entry_utf8);
+    const std::wstring target = utf8ToWide(target_utf8);
+    if (entry.empty() || target.empty()) return {};
+    const size_t dot = source_path.find_last_of(L'.');
+    const std::wstring base = dot == std::wstring::npos ? source_path : source_path.substr(0, dot);
+    return base + L"." + entry + L"." + target + L".cso";
+}
+
+bool tryLoadCompiledShaderBlob(const std::wstring& source_path,
+                               const char* entry_utf8,
+                               const char* target_utf8,
+                               ID3DBlob** out_blob,
+                               size_t* out_size) {
+    if (!out_blob || !out_size) return false;
+    *out_blob = nullptr;
+    *out_size = 0;
+
+    const std::wstring compiled_path = compiledShaderPathWide(source_path, entry_utf8, target_utf8);
+    if (compiled_path.empty()) return false;
+
+    ID3DBlob* blob = nullptr;
+    const HRESULT hr = D3DReadFileToBlob(compiled_path.c_str(), &blob);
+    if (FAILED(hr) || !blob) {
+        safeRelease(blob);
+        return false;
+    }
+
+    *out_blob = blob;
+    *out_size = blob->GetBufferSize();
+    return true;
+}
+
 const GUID& containerFormatForPath(const std::wstring& path) {
     const size_t dot = path.find_last_of(L'.');
     if (dot != std::wstring::npos) {
@@ -4608,6 +4738,26 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_compile_shader_from_file_utf8(
         return 0;
     }
 
+    const std::vector<std::wstring> candidates = shaderCandidatePathsWide(path);
+    for (const std::wstring& candidate : candidates) {
+        ID3DBlob* precompiled_blob = nullptr;
+        size_t precompiled_size = 0;
+        if (tryLoadCompiledShaderBlob(candidate, entry_utf8, target_utf8, &precompiled_blob, &precompiled_size)) {
+            *out_blob = precompiled_blob;
+            *out_size = precompiled_size;
+            g_last_error.clear();
+            return 1;
+        }
+    }
+
+    std::wstring compile_path = path;
+    for (const std::wstring& candidate : candidates) {
+        if (fileExistsWide(candidate)) {
+            compile_path = candidate;
+            break;
+        }
+    }
+
     UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
 #if defined(_DEBUG)
     flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
@@ -4616,7 +4766,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_compile_shader_from_file_utf8(
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
     HRESULT hr = D3DCompileFromFile(
-        path.c_str(),
+        compile_path.c_str(),
         nullptr,
         D3D_COMPILE_STANDARD_FILE_INCLUDE,
         entry_utf8,

@@ -325,6 +325,9 @@ UiNode ui_stack(std::vector<UiNode> children = {});
 UiNode ui_row(std::vector<UiNode> children = {});
 UiNode ui_toolbar(std::vector<UiNode> children = {});
 UiNode ui_card(std::string title, std::vector<UiNode> children = {});
+UiNode ui_scroll_view(std::vector<UiNode> children = {});
+UiNode ui_grid(int64_t columns, std::vector<UiNode> children = {});
+UiNode ui_form(std::vector<UiNode> children = {});
 UiNode ui_divider();
 
 // Splits

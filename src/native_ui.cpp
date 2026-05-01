@@ -11,6 +11,7 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <richedit.h>
 #include <wincodec.h>
@@ -45,11 +46,13 @@ constexpr UINT kMsgNativeReload = WM_APP + 101;
 constexpr UINT kMsgNativeShow = WM_APP + 102;
 constexpr UINT kMsgNativePatch = WM_APP + 103;
 constexpr wchar_t kNativeWindowClassName[] = L"WinSchemeUserAppNativeWindow";
+constexpr wchar_t kScrollViewHostClassName[] = L"WinSchemeScrollViewHost";
 constexpr UINT_PTR kContainerSubclassId = 0x57534E43; // WSNC
 constexpr UINT_PTR kTransparentPaneSubclassId = 0x5753504E; // WSPN
 constexpr UINT_PTR kCanvasSubclassId = 0x57534356;    // WSCV
 constexpr UINT_PTR kImageSubclassId = 0x5753494D;     // WSIM
 constexpr UINT_PTR kSplitViewSubclassId = 0x57535356; // WSSV
+constexpr UINT_PTR kScrollViewSubclassId = 0x57534352; // WSCR
 constexpr UINT_PTR kResizeTimerId = 1;     // debounce WM_SIZE rebuilds
 constexpr UINT kResizeDebounceMs = 150;    // ms after last WM_SIZE before rebuild fires
 constexpr int kDefaultWindowWidth = 960;
@@ -94,6 +97,8 @@ struct MeasuredSize;
 
 bool isTruthyJson(const ordered_json& value);
 std::string jsonString(const ordered_json& node, const char* key, const std::string& fallback);
+int clampScrollOffset(int pos, int client_extent, int content_extent);
+MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width);
 MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, int y, int max_width);
 MeasuredSize layoutChildrenStack(HWND parent,
                                  HDC hdc,
@@ -111,6 +116,10 @@ bool relayoutSplitViewControl(HWND container,
 bool setUserAppNodeProp(ordered_json& spec, const std::string& node_id, const char* key, const ordered_json& value);
 void rebuildNativeContainerContents(HWND container, const ordered_json& node);
 void rebuildNativeWindow(HWND hwnd);
+bool relayoutScrollViewControl(HWND container,
+                               ControlBinding& binding,
+                               const ordered_json& node,
+                               bool rebuild_contents);
 void repopulateTableRows(HWND hwnd, ControlBinding& binding, const ordered_json& rows, const std::string& selected_id);
 ordered_json buildSplitSizesPayload(const ControlBinding& binding);
 void dispatchUiEventJson(const ordered_json& event);
@@ -121,6 +130,74 @@ bool attachEmbeddedNativeHost(const WinguiNativeEmbeddedHostDesc& desc);
 bool ensureNativeThread();
 bool validateUserAppSpec(const ordered_json& spec, std::string& error);
 LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+bool ensureScrollViewHostClassRegistered();
+
+struct GridMetrics {
+    int columns = 1;
+    int rows = 0;
+    std::vector<int> column_widths;
+    std::vector<int> row_heights;
+};
+
+struct MeasuredSize {
+    int width = 0;
+    int height = 0;
+};
+
+GridMetrics measureGridChildren(HDC hdc,
+                                const std::vector<const ordered_json*>& children,
+                                int columns,
+                                int max_width,
+                                int gap) {
+    GridMetrics metrics;
+    metrics.columns = std::max(1, columns);
+    metrics.rows = children.empty() ? 0 : static_cast<int>((children.size() + static_cast<size_t>(metrics.columns) - 1) / static_cast<size_t>(metrics.columns));
+    metrics.column_widths.assign(metrics.columns, 0);
+    metrics.row_heights.assign(metrics.rows, 0);
+    const int cell_limit = std::max(72, (max_width - std::max(0, metrics.columns - 1) * gap) / metrics.columns);
+    for (size_t index = 0; index < children.size(); ++index) {
+        const int column = static_cast<int>(index % static_cast<size_t>(metrics.columns));
+        const int row = static_cast<int>(index / static_cast<size_t>(metrics.columns));
+        MeasuredSize child_size = measureNode(hdc, *children[index], cell_limit);
+        metrics.column_widths[column] = std::max(metrics.column_widths[column], child_size.width);
+        metrics.row_heights[row] = std::max(metrics.row_heights[row], child_size.height);
+    }
+    return metrics;
+}
+
+MeasuredSize layoutChildrenGrid(HWND parent,
+                                HDC hdc,
+                                const std::vector<const ordered_json*>& children,
+                                int x,
+                                int y,
+                                int max_width,
+                                int padding,
+                                int gap,
+                                int columns) {
+    GridMetrics metrics = measureGridChildren(hdc, children, columns, std::max(72, max_width - (padding * 2)), gap);
+    int cursor_y = y + padding;
+    for (int row = 0; row < metrics.rows; ++row) {
+        int cursor_x = x + padding;
+        for (int column = 0; column < metrics.columns; ++column) {
+            const size_t index = static_cast<size_t>(row * metrics.columns + column);
+            if (index >= children.size()) break;
+            layoutNode(parent, hdc, *children[index], cursor_x, cursor_y, std::max(72, metrics.column_widths[column]));
+            cursor_x += metrics.column_widths[column] + gap;
+        }
+        cursor_y += metrics.row_heights[row] + gap;
+    }
+    int total_width = padding * 2;
+    for (size_t i = 0; i < metrics.column_widths.size(); ++i) {
+        total_width += metrics.column_widths[i];
+        if (i + 1 < metrics.column_widths.size()) total_width += gap;
+    }
+    int total_height = padding * 2;
+    for (size_t i = 0; i < metrics.row_heights.size(); ++i) {
+        total_height += metrics.row_heights[i];
+        if (i + 1 < metrics.row_heights.size()) total_height += gap;
+    }
+    return {std::max(0, total_width), std::max(0, total_height)};
+}
 
 struct NativeHostState {
     std::mutex mutex;
@@ -819,11 +896,6 @@ SIZE measureSingleLineText(HDC hdc, HFONT font, const std::wstring& text) {
     return size;
 }
 
-struct MeasuredSize {
-    int width = 0;
-    int height = 0;
-};
-
 MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width);
 
 MeasuredSize measureChildrenStack(HDC hdc, const std::vector<const ordered_json*>& children, int max_width, int gap) {
@@ -956,9 +1028,9 @@ SplitLayoutState computeSplitLayoutState(const ordered_json& node,
 
 MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
     const std::string type = jsonString(node, "type");
-    if (type == "stack" || type == "toolbar") {
+    if (type == "stack" || type == "toolbar" || type == "form") {
         const int padding = jsonInt(node, "padding", 0);
-        const int gap = jsonInt(node, "gap", kDefaultGap);
+        const int gap = jsonInt(node, "gap", type == "form" ? 10 : kDefaultGap);
         MeasuredSize child = measureChildrenStack(hdc, childrenOf(node), std::max(64, max_width - (padding * 2)), gap);
         return {child.width + (padding * 2), child.height + (padding * 2)};
     }
@@ -978,6 +1050,36 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
             first = false;
         }
         return {result.width + (padding * 2), result.height + (padding * 2)};
+    }
+
+    if (type == "grid") {
+        const int padding = std::max(0, jsonInt(node, "padding", 0));
+        const int gap = std::max(0, jsonInt(node, "gap", kDefaultGap));
+        const int column_count = std::max(1, jsonInt(node, "columns", 2));
+        const GridMetrics metrics = measureGridChildren(hdc, childrenOf(node), column_count, std::max(72, max_width - (padding * 2)), gap);
+        int width = padding * 2;
+        for (size_t i = 0; i < metrics.column_widths.size(); ++i) {
+            width += metrics.column_widths[i];
+            if (i + 1 < metrics.column_widths.size()) width += gap;
+        }
+        int height = padding * 2;
+        for (size_t i = 0; i < metrics.row_heights.size(); ++i) {
+            height += metrics.row_heights[i];
+            if (i + 1 < metrics.row_heights.size()) height += gap;
+        }
+        return {width, height};
+    }
+
+    if (type == "scroll-view") {
+        const int padding = std::max(0, jsonInt(node, "padding", 0));
+        const int gap = std::max(0, jsonInt(node, "gap", kDefaultGap));
+        const int explicit_width = jsonInt(node, "width", 0);
+        const int explicit_height = jsonInt(node, "height", 0);
+        const int view_width = explicit_width > 0 ? explicit_width : std::max(160, max_width);
+        MeasuredSize child = measureChildrenStack(hdc, childrenOf(node), std::max(72, view_width - (padding * 2)), gap);
+        const int width = explicit_width > 0 ? explicit_width : std::min(max_width, std::max(160, child.width + (padding * 2)));
+        const int height = explicit_height > 0 ? explicit_height : std::clamp(child.height + (padding * 2), 120, 320);
+        return {width, height};
     }
 
     if (type == "text") {
@@ -1383,6 +1485,149 @@ bool splitViewHitDivider(const ControlBinding& binding, int x, int y) {
 }
 
 void attachSplitViewSubclass(HWND hwnd);
+void attachScrollViewSubclass(HWND hwnd);
+
+HWND findBoundAncestorOfType(HWND start, const char* wanted_type) {
+    HWND current = start;
+    while (current) {
+        auto it = g_native.bindings.find(current);
+        if (it != g_native.bindings.end() && it->second.type == wanted_type) {
+            return current;
+        }
+        current = GetParent(current);
+    }
+    return nullptr;
+}
+
+void updateScrollViewViewport(HWND container, ControlBinding& binding) {
+    if (!container || !IsWindow(container)) return;
+    const int viewport_width = std::max(1, jsonInt(binding.data, "viewportWidth", 1));
+    const int viewport_height = std::max(1, jsonInt(binding.data, "viewportHeight", 1));
+    const int content_width = std::max(1, jsonInt(binding.data, "contentWidth", viewport_width));
+    const int content_height = std::max(1, jsonInt(binding.data, "contentHeight", viewport_height));
+    const int scroll_y = clampScrollOffset(jsonInt(binding.data, "scrollY", 0), viewport_height, content_height);
+    binding.data["scrollY"] = scroll_y;
+
+    ShowScrollBar(container, SB_VERT, content_height > viewport_height);
+
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = std::max(0, content_height - 1);
+    si.nPage = static_cast<UINT>(viewport_height);
+    si.nPos = scroll_y;
+    SetScrollInfo(container, SB_VERT, &si, TRUE);
+
+    if (!binding.child_hwnds.empty() && IsWindow(binding.child_hwnds[0])) {
+        MoveWindow(binding.child_hwnds[0],
+                   0,
+                   -scroll_y,
+                   content_width,
+                   content_height,
+                   TRUE);
+    }
+}
+
+bool scrollScrollViewByDelta(HWND container, ControlBinding& binding, int delta_pixels) {
+    const int viewport_height = std::max(1, jsonInt(binding.data, "viewportHeight", 1));
+    const int content_height = std::max(1, jsonInt(binding.data, "contentHeight", viewport_height));
+    const int current = jsonInt(binding.data, "scrollY", 0);
+    const int next = clampScrollOffset(current + delta_pixels, viewport_height, content_height);
+    if (next == current) return true;
+    binding.data["scrollY"] = next;
+    updateScrollViewViewport(container, binding);
+    return true;
+}
+
+bool handleScrollViewScrollBar(HWND container, ControlBinding& binding, WPARAM wparam) {
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_ALL;
+    if (!GetScrollInfo(container, SB_VERT, &si)) return false;
+
+    int next = si.nPos;
+    switch (LOWORD(wparam)) {
+    case SB_LINEUP:
+        next -= 32;
+        break;
+    case SB_LINEDOWN:
+        next += 32;
+        break;
+    case SB_PAGEUP:
+        next -= static_cast<int>(si.nPage);
+        break;
+    case SB_PAGEDOWN:
+        next += static_cast<int>(si.nPage);
+        break;
+    case SB_THUMBPOSITION:
+    case SB_THUMBTRACK:
+        next = si.nTrackPos;
+        break;
+    case SB_TOP:
+        next = 0;
+        break;
+    case SB_BOTTOM:
+        next = si.nMax;
+        break;
+    default:
+        return false;
+    }
+
+    const int viewport_height = std::max(1, jsonInt(binding.data, "viewportHeight", 1));
+    const int content_height = std::max(1, jsonInt(binding.data, "contentHeight", viewport_height));
+    binding.data["scrollY"] = clampScrollOffset(next, viewport_height, content_height);
+    updateScrollViewViewport(container, binding);
+    return true;
+}
+
+LRESULT CALLBACK scrollViewSubclassProc(HWND hwnd,
+                                        UINT message,
+                                        WPARAM wparam,
+                                        LPARAM lparam,
+                                        UINT_PTR subclass_id,
+                                        DWORD_PTR ref_data) {
+    (void)subclass_id;
+    (void)ref_data;
+    switch (message) {
+    case WM_VSCROLL:
+        {
+            auto it = g_native.bindings.find(hwnd);
+            if (it != g_native.bindings.end() && it->second.type == "scroll-view" && handleScrollViewScrollBar(hwnd, it->second, wparam)) {
+                return 0;
+            }
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        {
+            auto it = g_native.bindings.find(hwnd);
+            if (it != g_native.bindings.end() && it->second.type == "scroll-view") {
+                const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+                UINT lines = 3;
+                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                int delta_pixels = 0;
+                if (lines == WHEEL_PAGESCROLL) {
+                    delta_pixels = (delta > 0 ? -1 : 1) * std::max(24, jsonInt(it->second.data, "viewportHeight", 1) - 48);
+                } else {
+                    const int steps = delta / WHEEL_DELTA;
+                    delta_pixels = -steps * static_cast<int>(std::max<UINT>(1, lines)) * 32;
+                }
+                scrollScrollViewByDelta(hwnd, it->second, delta_pixels);
+                return 0;
+            }
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, scrollViewSubclassProc, kScrollViewSubclassId);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void attachScrollViewSubclass(HWND hwnd) {
+    if (!hwnd) return;
+    SetWindowSubclass(hwnd, scrollViewSubclassProc, kScrollViewSubclassId, 0);
+}
 
 LRESULT CALLBACK splitViewSubclassProc(HWND hwnd,
                                        UINT message,
@@ -1671,6 +1916,78 @@ bool relayoutSplitViewControl(HWND container,
     }
 
     InvalidateRect(divider, nullptr, TRUE);
+    return true;
+}
+
+bool relayoutScrollViewControl(HWND container,
+                               ControlBinding& binding,
+                               const ordered_json& node,
+                               bool rebuild_contents) {
+    if (!container || !IsWindow(container) || !node.is_object()) return false;
+
+    RECT client{};
+    GetClientRect(container, &client);
+    const int width = std::max(24, static_cast<int>(client.right - client.left));
+    const int height = std::max(24, static_cast<int>(client.bottom - client.top));
+    const int padding = std::max(0, jsonInt(node, "padding", 0));
+    const int gap = std::max(0, jsonInt(node, "gap", kDefaultGap));
+    const int scrollbar_width = std::max(12, GetSystemMetrics(SM_CXVSCROLL));
+
+    if (binding.child_hwnds.size() != 1 || !IsWindow(binding.child_hwnds[0])) {
+        clearNativeChildrenOf(container);
+        binding.child_hwnds.clear();
+        HWND content_host = createChildControl(L"STATIC", L"", 0, 0, 0, width, height, container, nullptr);
+        if (!content_host) return false;
+        attachContainerForwarding(content_host);
+        binding.child_hwnds = {content_host};
+        rebuild_contents = true;
+    }
+
+    HDC hdc = GetDC(container);
+    if (!hdc) return false;
+    ensureFonts();
+    SelectObject(hdc, g_native.ui_font);
+
+    int content_limit = std::max(72, width - (padding * 2));
+    MeasuredSize child = measureChildrenStack(hdc, childrenOf(node), content_limit, gap);
+    const bool needs_scroll_initial = child.height + (padding * 2) > height;
+    if (needs_scroll_initial) {
+        content_limit = std::max(72, width - (padding * 2) - scrollbar_width);
+        child = measureChildrenStack(hdc, childrenOf(node), content_limit, gap);
+    }
+    ReleaseDC(container, hdc);
+
+    const bool needs_scroll = child.height + (padding * 2) > height;
+    const int viewport_width = std::max(24, width - (needs_scroll ? scrollbar_width : 0));
+    const int content_width = std::max(24, viewport_width);
+    const int content_height = std::max(height, child.height + (padding * 2));
+
+    binding.data["viewportWidth"] = viewport_width;
+    binding.data["viewportHeight"] = height;
+    binding.data["contentWidth"] = content_width;
+    binding.data["contentHeight"] = content_height;
+    binding.data["scrollY"] = clampScrollOffset(jsonInt(binding.data, "scrollY", 0), height, content_height);
+
+    HWND content_host = binding.child_hwnds[0];
+    updateScrollViewViewport(container, binding);
+
+    if (rebuild_contents) {
+        clearNativeChildrenOf(content_host);
+        HDC content_hdc = GetDC(content_host);
+        if (!content_hdc) return false;
+        ensureFonts();
+        SelectObject(content_hdc, g_native.ui_font);
+        layoutChildrenStack(content_host,
+                            content_hdc,
+                            childrenOf(node),
+                            padding,
+                            padding,
+                            std::max(24, content_width - (padding * 2)),
+                            gap);
+        ReleaseDC(content_host, content_hdc);
+    }
+
+    InvalidateRect(content_host, nullptr, TRUE);
     return true;
 }
 
@@ -2767,7 +3084,9 @@ bool findUserAppNodeById(ordered_json& node, const std::string& id, ordered_json
 void rebuildNativeContainerContents(HWND container, const ordered_json& node);
 
 bool isPatchableContainerType(const std::string& type) {
-    return type == "stack" || type == "row" || type == "toolbar" || type == "card" || type == "context-menu" || type == "split-view";
+    return type == "stack" || type == "row" || type == "toolbar" || type == "card" ||
+        type == "form" || type == "grid" || type == "scroll-view" ||
+        type == "context-menu" || type == "split-view";
 }
 
 bool findNearestPatchableAncestorNode(ordered_json& node,
@@ -3795,20 +4114,30 @@ void rebuildNativeContainerContents(HWND container, const ordered_json& node) {
     HDC hdc = GetDC(container);
     if (!hdc) return;
 
-    if (type == "stack" || type == "toolbar") {
+    if (type == "stack" || type == "toolbar" || type == "form") {
         const int padding = jsonInt(node, "padding", 0);
-        const int gap = jsonInt(node, "gap", kDefaultGap);
+        const int gap = jsonInt(node, "gap", type == "form" ? 10 : kDefaultGap);
         layoutChildrenStack(container, hdc, childrenOf(node), padding, padding, std::max(24, width - (padding * 2)), gap);
     } else if (type == "row") {
         const int padding = jsonInt(node, "padding", 0);
         const int gap = jsonInt(node, "gap", kDefaultGap);
         layoutChildrenRow(container, hdc, childrenOf(node), 0, 0, width, padding, gap);
+    } else if (type == "grid") {
+        const int padding = jsonInt(node, "padding", 0);
+        const int gap = jsonInt(node, "gap", kDefaultGap);
+        const int columns = std::max(1, jsonInt(node, "columns", 2));
+        layoutChildrenGrid(container, hdc, childrenOf(node), 0, 0, width, padding, gap, columns);
     } else if (type == "card") {
         const int padding = 12;
         std::wstring title = utf8ToWide(jsonString(node, "title"));
         int cursor_y = padding + (title.empty() ? 0 : 22);
         if (!title.empty()) cursor_y += 4;
         layoutChildrenStack(container, hdc, childrenOf(node), padding, cursor_y, std::max(24, width - (padding * 2)), 10);
+    } else if (type == "scroll-view") {
+        auto it = g_native.bindings.find(container);
+        if (it != g_native.bindings.end()) {
+            relayoutScrollViewControl(container, it->second, node, true);
+        }
     }
 
     ReleaseDC(container, hdc);
@@ -3838,9 +4167,9 @@ MeasuredSize layoutChildrenStack(HWND parent,
 MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, int y, int max_width) {
     const std::string type = jsonString(node, "type");
 
-    if (type == "stack" || type == "toolbar") {
+    if (type == "stack" || type == "toolbar" || type == "form") {
         const int padding = jsonInt(node, "padding", 0);
-        const int gap = jsonInt(node, "gap", kDefaultGap);
+        const int gap = jsonInt(node, "gap", type == "form" ? 10 : kDefaultGap);
         MeasuredSize size = measureNode(hdc, node, max_width);
         HWND container = createChildControl(L"STATIC", L"", 0, x, y, std::max(24, size.width), std::max(24, size.height), parent, nullptr);
         if (container) {
@@ -3866,6 +4195,43 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             binding.node_id = jsonString(node, "id");
             registerNodeControl(container, binding);
             layoutChildrenRow(container, hdc, childrenOf(node), 0, 0, size.width, padding, gap);
+        }
+        return size;
+    }
+
+    if (type == "grid") {
+        const int padding = jsonInt(node, "padding", 0);
+        const int gap = jsonInt(node, "gap", kDefaultGap);
+        const int columns = std::max(1, jsonInt(node, "columns", 2));
+        MeasuredSize size = measureNode(hdc, node, max_width);
+        HWND container = createChildControl(L"STATIC", L"", 0, x, y, std::max(24, size.width), std::max(24, size.height), parent, nullptr);
+        if (container) {
+            attachContainerForwarding(container);
+            ControlBinding binding;
+            binding.type = type;
+            binding.node_id = jsonString(node, "id");
+            registerNodeControl(container, binding);
+            layoutChildrenGrid(container, hdc, childrenOf(node), 0, 0, size.width, padding, gap, columns);
+        }
+        return size;
+    }
+
+    if (type == "scroll-view") {
+        MeasuredSize size = measureNode(hdc, node, max_width);
+        if (!ensureScrollViewHostClassRegistered()) {
+            return size;
+        }
+        HWND container = createChildControl(kScrollViewHostClassName, L"", WS_VSCROLL | WS_CLIPCHILDREN, x, y, std::max(24, size.width), std::max(24, size.height), parent, nullptr);
+        if (container) {
+            attachScrollViewSubclass(container);
+            ControlBinding binding;
+            binding.type = type;
+            binding.node_id = jsonString(node, "id");
+            registerNodeControl(container, binding);
+            auto it = g_native.bindings.find(container);
+            if (it != g_native.bindings.end()) {
+                relayoutScrollViewControl(container, it->second, node, true);
+            }
         }
         return size;
     }
@@ -5084,6 +5450,19 @@ bool ensureNativeWindowClassRegistered() {
     return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
+bool ensureScrollViewHostClassRegistered() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kScrollViewHostClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    if (RegisterClassW(&wc) != 0) {
+        return true;
+    }
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
 bool ensureNativeHostWindowAvailable() {
     {
         std::lock_guard<std::mutex> lock(g_native.mutex);
@@ -5680,6 +6059,25 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         if (g_native.suppress_events) return 0;
         {
             const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            POINT screen_pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+            HWND hovered = WindowFromPoint(screen_pt);
+            HWND scroll_view = findBoundAncestorOfType(hovered, "scroll-view");
+            if (scroll_view) {
+                auto it = g_native.bindings.find(scroll_view);
+                if (it != g_native.bindings.end()) {
+                    UINT lines = 3;
+                    SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                    int delta_pixels = 0;
+                    if (lines == WHEEL_PAGESCROLL) {
+                        delta_pixels = (delta > 0 ? -1 : 1) * std::max(24, jsonInt(it->second.data, "viewportHeight", 1) - 48);
+                    } else {
+                        const int steps = delta / WHEEL_DELTA;
+                        delta_pixels = -steps * static_cast<int>(std::max<UINT>(1, lines)) * 32;
+                    }
+                    scrollScrollViewByDelta(scroll_view, it->second, delta_pixels);
+                    return 0;
+                }
+            }
             UINT lines = 3;
             SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
             if (lines == WHEEL_PAGESCROLL) {
@@ -6331,8 +6729,8 @@ bool validateUserAppNode(const ordered_json& node, const std::string& path, std:
     if (type == "tree-view") {
         if (node.contains("items") && !validateTreeItems(node["items"], path + "/items", error)) return false;
         if (node.contains("expandedIds") && !node["expandedIds"].is_array()) {
-                error = "Invalid native-ui form at " + path + "/expandedIds: expected array, got " +
-                    jsonTypeName(node["expandedIds"]) + ".";
+            error = "Invalid native-ui form at " + path + "/expandedIds: expected array, got " +
+                jsonTypeName(node["expandedIds"]) + ".";
             return false;
         }
     }

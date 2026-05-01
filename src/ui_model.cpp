@@ -696,6 +696,22 @@ UiNode ui_toolbar(std::vector<UiNode> c) {
 UiNode ui_card(std::string t, std::vector<UiNode> c) {
     UiNode n("card"); n.title(std::move(t)); n.children(std::move(c)); return n;
 }
+UiNode ui_scroll_view(std::vector<UiNode> c) {
+    UiNode n("scroll-view");
+    n.children(std::move(c));
+    return n;
+}
+UiNode ui_grid(int64_t column_count, std::vector<UiNode> c) {
+    UiNode n("grid");
+    n.columns(std::max<int64_t>(1, column_count));
+    n.children(std::move(c));
+    return n;
+}
+UiNode ui_form(std::vector<UiNode> c) {
+    UiNode n("form");
+    n.children(std::move(c));
+    return n;
+}
 UiNode ui_divider() { return UiNode("divider"); }
 
 UiNode ui_split_pane(std::string id_str, std::vector<UiNode> c) {

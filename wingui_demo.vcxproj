@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-0002-0002-0002-000000000002}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>wingui_demo</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(SolutionDir)manual_build\debug\</OutDir>
+    <IntDir>$(SolutionDir)obj\wingui_demo\debug\</IntDir>
+    <TargetName>wingui_demo</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(SolutionDir)manual_build\release\</OutDir>
+    <IntDir>$(SolutionDir)obj\wingui_demo\release\</IntDir>
+    <TargetName>wingui_demo</TargetName>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)include</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_WINDOWS;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <Optimization>Disabled</Optimization>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>$(SolutionDir)manual_build\debug\wingui.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)include</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_WINDOWS;UNICODE;_UNICODE;_CRT_SECURE_NO_WARNINGS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalDependencies>$(SolutionDir)manual_build\release\wingui.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\demo.cpp" />
+    <ClCompile Include="src\ui_model.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="wingui.vcxproj">
+      <Project>{A1B2C3D4-0001-0001-0001-000000000001}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>
+if not exist "$(OutDir)shaders" mkdir "$(OutDir)shaders"
+xcopy /Y /Q "$(SolutionDir)shaders\*" "$(OutDir)shaders\"
+fxc /nologo /T vs_4_0 /E glyph_vertex    /Fo "$(OutDir)shaders\text_grid.glyph_vertex.vs_4_0.cso"    "$(OutDir)shaders\text_grid.hlsl"
+fxc /nologo /T ps_4_0 /E glyph_fragment  /Fo "$(OutDir)shaders\text_grid.glyph_fragment.ps_4_0.cso"  "$(OutDir)shaders\text_grid.hlsl"
+fxc /nologo /T vs_4_0 /E graphics_vertex   /Fo "$(OutDir)shaders\graphics.graphics_vertex.vs_4_0.cso"   "$(OutDir)shaders\graphics.hlsl"
+fxc /nologo /T ps_4_0 /E graphics_fragment /Fo "$(OutDir)shaders\graphics.graphics_fragment.ps_4_0.cso" "$(OutDir)shaders\graphics.hlsl"
+fxc /nologo /T ps_4_0 /E rgba_fragment     /Fo "$(OutDir)shaders\graphics.rgba_fragment.ps_4_0.cso"     "$(OutDir)shaders\graphics.hlsl"
+fxc /nologo /T vs_4_0 /E sprite_vertex   /Fo "$(OutDir)shaders\sprite.sprite_vertex.vs_4_0.cso"   "$(OutDir)shaders\sprite.hlsl"
+fxc /nologo /T ps_4_0 /E sprite_fragment /Fo "$(OutDir)shaders\sprite.sprite_fragment.ps_4_0.cso" "$(OutDir)shaders\sprite.hlsl"
+fxc /nologo /T vs_4_0 /E rgba_blit_vertex   /Fo "$(OutDir)shaders\rgba_blit.rgba_blit_vertex.vs_4_0.cso"   "$(OutDir)shaders\rgba_blit.hlsl"
+fxc /nologo /T ps_4_0 /E rgba_blit_fragment /Fo "$(OutDir)shaders\rgba_blit.rgba_blit_fragment.ps_4_0.cso" "$(OutDir)shaders\rgba_blit.hlsl"
+fxc /nologo /T vs_4_0 /E vector_vertex   /Fo "$(OutDir)shaders\vector.vector_vertex.vs_4_0.cso"   "$(OutDir)shaders\vector.hlsl"
+fxc /nologo /T ps_4_0 /E vector_fragment /Fo "$(OutDir)shaders\vector.vector_fragment.ps_4_0.cso" "$(OutDir)shaders\vector.hlsl"
+fxc /nologo /T cs_5_0 /E indexed_fill_cs /Fo "$(OutDir)shaders\indexed_fill.indexed_fill_cs.cs_5_0.cso" "$(OutDir)shaders\indexed_fill.hlsl"
+fxc /nologo /T cs_5_0 /E indexed_line_cs /Fo "$(OutDir)shaders\indexed_fill.indexed_line_cs.cs_5_0.cso" "$(OutDir)shaders\indexed_fill.hlsl"
+      </Command>
+      <Message>Copying and compiling shaders</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

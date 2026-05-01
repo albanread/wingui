@@ -13,6 +13,12 @@
 // diffs and sends a targeted JSON patch, not a full republish.
 
 #include "wingui/app.hpp"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
 #include <numbers>
 #include <cmath>
 #include <random>
@@ -54,7 +60,11 @@ int main() {
     std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<double> bounce_jitter{-0.18, 0.18};
 
-    wg::App{}
+    wg::App app;
+
+    SuperTerminalRunResult result{};
+
+    const int exit_code = app
         .title("Demo — bouncing ball")
         .frame_rate(16)       // ~60 fps
         .auto_present()
@@ -203,7 +213,18 @@ int main() {
                 bg);
         })
 
-        .run();
+        .run(&result);
 
-    return 0;
+    if (result.host_error_code != SUPERTERMINAL_HOST_ERROR_NONE) {
+        std::fprintf(stderr, "wingui_demo failed: [%d] %s\n",
+                     result.host_error_code,
+                     result.message_utf8[0] ? result.message_utf8 : "unknown error");
+        MessageBoxA(nullptr,
+                    result.message_utf8[0] ? result.message_utf8 : "unknown error",
+                    "wingui_demo failed",
+                    MB_ICONERROR | MB_OK);
+        return result.host_error_code;
+    }
+
+    return exit_code;
 }
