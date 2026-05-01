@@ -59,6 +59,11 @@ typedef enum SuperTerminalCommandType {
     SUPERTERMINAL_CMD_RGBA_ASSET_REGISTER_OWNED = 11,
     SUPERTERMINAL_CMD_RGBA_ASSET_BLIT_TO_PANE = 12,
     SUPERTERMINAL_CMD_INDEXED_UPLOAD_OWNED = 13,
+    SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED = 14,
+    SUPERTERMINAL_CMD_SPRITE_RENDER = 15,
+    SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED = 16,
+    SUPERTERMINAL_CMD_INDEXED_FILL_RECT = 17,
+    SUPERTERMINAL_CMD_INDEXED_DRAW_LINE = 18,
 } SuperTerminalCommandType;
 
 typedef void (WINGUI_CALL *SuperTerminalFreeFn)(void* user_data, void* buffer);
@@ -178,10 +183,16 @@ typedef struct SuperTerminalRgbaGpuCopy {
     uint32_t dst_y;
     SuperTerminalPaneId src_pane_id;
     uint32_t src_buffer_index;
+
+typedef enum SuperTerminalRgbaContentBufferMode {
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME = 0,
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT = 1,
+} SuperTerminalRgbaContentBufferMode;
     uint32_t src_x;
     uint32_t src_y;
     uint32_t region_width;
     uint32_t region_height;
+    uint32_t content_buffer_mode; /* SuperTerminalRgbaContentBufferMode */
 } SuperTerminalRgbaGpuCopy;
 
 typedef struct SuperTerminalRgbaAssetRegisterOwned {
@@ -225,6 +236,93 @@ typedef struct SuperTerminalIndexedUploadOwned {
     void*    free_user_data;
 } SuperTerminalIndexedUploadOwned;
 
+/* Unique id for a sprite registered in a pane's sprite bank.
+   Values are client-chosen; 0 is reserved/invalid. */
+typedef struct SuperTerminalSpriteId {
+    uint32_t value;
+} SuperTerminalSpriteId;
+
+/* Client-facing sprite instance: references bank id rather than atlas id. */
+typedef struct SuperTerminalSpriteInstance {
+    SuperTerminalSpriteId sprite_id;
+    float x;
+    float y;
+    float rotation;
+    float scale_x;
+    float scale_y;
+    float anchor_x;       /* 0..1 fraction of frame width  */
+    float anchor_y;       /* 0..1 fraction of frame height */
+    float alpha;
+    uint32_t flags;       /* WINGUI_SPRITE_FLAG_* */
+    uint32_t effect_type;
+    float effect_param1;
+    float effect_param2;
+    uint8_t effect_colour[4];
+    uint32_t palette_override; /* 0 = use sprite's own palette; 1-N = override */
+} SuperTerminalSpriteInstance;
+
+typedef struct SuperTerminalSpriteDefineOwned {
+    SuperTerminalPaneId pane_id;
+    SuperTerminalSpriteId sprite_id;
+    uint32_t frame_w;             /* width of one frame in pixels            */
+    uint32_t frame_h;             /* height of one frame in pixels           */
+    uint32_t frame_count;         /* frames laid out left-to-right in strip  */
+    uint32_t frames_per_tick;     /* animation speed: advance 1 frame every N ticks (0 = static) */
+    void*    pixels;              /* owned R8_UINT strip: frame_w*frame_count wide x frame_h tall */
+    void*    palette;             /* owned WinguiGraphicsLinePalette (16 colours, colour 0 transparent) */
+    SuperTerminalFreeFn free_fn;
+    void*    free_user_data;
+} SuperTerminalSpriteDefineOwned;
+
+typedef struct SuperTerminalSpriteRender {
+    SuperTerminalPaneId pane_id;
+    uint32_t target_width;        /* screen-space pixel width  (0 = use pane layout width)  */
+    uint32_t target_height;       /* screen-space pixel height (0 = use pane layout height) */
+    uint64_t sprite_tick;         /* animation clock; typically host->frame_index */
+    void*    instances;           /* owned SuperTerminalSpriteInstance array */
+    uint32_t instance_count;
+    SuperTerminalFreeFn free_fn;
+    void*    free_user_data;
+} SuperTerminalSpriteRender;
+
+typedef enum SuperTerminalRgbaContentBufferMode {
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME = 0,
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT = 1,
+} SuperTerminalRgbaContentBufferMode;
+
+typedef struct SuperTerminalVectorDrawOwned {
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;        /* RGBA surface buffer to render into */
+    uint32_t content_buffer_mode; /* SuperTerminalRgbaContentBufferMode */
+    uint32_t blend_mode;          /* WINGUI_RGBA_BLIT_OPAQUE or WINGUI_RGBA_BLIT_ALPHA_OVER */
+    int32_t  clear_before;        /* if non-zero, ClearRenderTargetView with clear_color first */
+    float    clear_color[4];      /* RGBA, used when clear_before is set */
+    void*    primitives;          /* owned WinguiVectorPrimitive[primitive_count] */
+    uint32_t primitive_count;
+    SuperTerminalFreeFn free_fn;
+    void*    free_user_data;
+} SuperTerminalVectorDrawOwned;
+
+typedef struct SuperTerminalIndexedFillRect {
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;   /* indexed surface buffer */
+    uint32_t x;              /* destination rect */
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t palette_index;  /* 0-255 */
+} SuperTerminalIndexedFillRect;
+
+typedef struct SuperTerminalIndexedDrawLine {
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;
+    int32_t  x0;
+    int32_t  y0;
+    int32_t  x1;
+    int32_t  y1;
+    uint32_t palette_index;  /* 0-255 */
+} SuperTerminalIndexedDrawLine;
+
 typedef struct SuperTerminalCommand {
     SuperTerminalCommandType type;
     uint32_t sequence;
@@ -239,6 +337,11 @@ typedef struct SuperTerminalCommand {
         SuperTerminalRgbaAssetRegisterOwned rgba_asset_register_owned;
         SuperTerminalRgbaAssetBlitToPane rgba_asset_blit_to_pane;
         SuperTerminalIndexedUploadOwned indexed_upload_owned;
+        SuperTerminalSpriteDefineOwned sprite_define_owned;
+        SuperTerminalSpriteRender sprite_render;
+        SuperTerminalVectorDrawOwned vector_draw_owned;
+        SuperTerminalIndexedFillRect indexed_fill_rect;
+        SuperTerminalIndexedDrawLine  indexed_draw_line;
     } data;
 } SuperTerminalCommand;
 
@@ -541,6 +644,84 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_asset_blit_to_pane(
 
 WINGUI_API int32_t WINGUI_CALL super_terminal_request_present(
     SuperTerminalClientContext* ctx);
+
+/* Define (or redefine) a sprite in a pane's sprite bank.
+   pixels: R8_UINT strip (frame_w*frame_count wide, frame_h tall); owned, freed after upload.
+   palette: WinguiGraphicsLinePalette (16 colours); colour index 0 is transparent; owned, freed after upload.
+   frames_per_tick: 0 means static (always frame 0). */
+WINGUI_API int32_t WINGUI_CALL super_terminal_define_sprite(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    SuperTerminalSpriteId sprite_id,
+    uint32_t frame_w,
+    uint32_t frame_h,
+    uint32_t frame_count,
+    uint32_t frames_per_tick,
+    void* pixels,
+    void* palette,
+    SuperTerminalFreeFn free_fn,
+    void* free_user_data);
+
+/* Submit a list of sprite instances for rendering on the next frame.
+   instances: owned array of SuperTerminalSpriteInstance, freed after the command is consumed.
+   sprite_tick: animation clock; pass tick->frame_index from on_frame for automatic animation.
+   target_width/height: 0 = use pane layout dimensions. */
+WINGUI_API int32_t WINGUI_CALL super_terminal_render_sprites(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint64_t sprite_tick,
+    uint32_t target_width,
+    uint32_t target_height,
+    const SuperTerminalSpriteInstance* instances,
+    uint32_t instance_count);
+
+/* Retrieve the host's text glyph atlas info. Useful for client-side text
+   layout via wingui_text_layout_with_atlas_info_utf8. */
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_glyph_atlas_info(
+    SuperTerminalClientContext* ctx,
+    WinguiGlyphAtlasInfo* out_info);
+
+/* Submit a list of GPU vector primitives (rects, lines, circles, arcs, glyphs)
+   for rendering into a buffer of an RGBA pane. The primitives array is copied
+   immediately and the copy is freed after the command is consumed.
+   blend_mode: WINGUI_RGBA_BLIT_OPAQUE replaces the destination, ALPHA_OVER composites.
+    content_buffer_mode: FRAME means the pane content follows the host's frame buffer,
+    PERSISTENT means draw into one persistent canvas buffer across frames.
+    If clear_before is non-zero the buffer is cleared to clear_color first. */
+WINGUI_API int32_t WINGUI_CALL super_terminal_vector_draw(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+     uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const WinguiVectorPrimitive* primitives,
+    uint32_t primitive_count);
+
+/* Fill a rectangle in an indexed-colour pane buffer with a single palette index.
+   Uses a compute shader; does not stall the CPU.
+   palette_index 0 = transparent in the renderer. */
+WINGUI_API int32_t WINGUI_CALL super_terminal_indexed_fill_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    uint32_t palette_index);
+
+/* Draw a 1-pixel-wide line in an indexed-colour pane buffer. */
+WINGUI_API int32_t WINGUI_CALL super_terminal_indexed_draw_line(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1,
+    uint32_t palette_index);
 
 #ifdef __cplusplus
 }

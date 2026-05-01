@@ -1,0 +1,61 @@
+# Build output
+/bin/
+/obj/
+*.obj
+*.o
+*.lo
+*.la
+*.a
+*.lib
+*.exp
+*.dll
+*.exe
+*.pdb
+*.idb
+*.ilk
+*.iobj
+*.ipdb
+
+# Visual Studio generated files
+/.vs/
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.aps
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+
+# MSBuild and test logs
+*.log
+*.tlog
+*.lastbuildstate
+*.recipe
+*.tmp
+*.temp
+
+# Crash dumps and traces
+*.dmp
+*.stackdump
+
+# Coverage and profiling output
+*.pgc
+*.pgd
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Editor and OS noise
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

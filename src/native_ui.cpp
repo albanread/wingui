@@ -46,6 +46,7 @@ constexpr UINT kMsgNativeShow = WM_APP + 102;
 constexpr UINT kMsgNativePatch = WM_APP + 103;
 constexpr wchar_t kNativeWindowClassName[] = L"WinSchemeUserAppNativeWindow";
 constexpr UINT_PTR kContainerSubclassId = 0x57534E43; // WSNC
+constexpr UINT_PTR kTransparentPaneSubclassId = 0x5753504E; // WSPN
 constexpr UINT_PTR kCanvasSubclassId = 0x57534356;    // WSCV
 constexpr UINT_PTR kImageSubclassId = 0x5753494D;     // WSIM
 constexpr UINT_PTR kSplitViewSubclassId = 0x57535356; // WSSV
@@ -204,6 +205,25 @@ bool tryGetNativeNodeBounds(const char* node_id_utf8, WinguiNativeNodeBounds* ou
     out_bounds->height = std::max(0, static_cast<int32_t>(rect.bottom - rect.top));
     out_bounds->visible = IsWindowVisible(node_hwnd) ? 1 : 0;
     return true;
+}
+
+bool tryGetNativeNodeHwnd(const char* node_id_utf8, void** out_hwnd) {
+    if (!node_id_utf8 || !out_hwnd) {
+        setNativeLastError("Native UI node HWND query requires an id and output buffer.");
+        return false;
+    }
+
+    HWND node_hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        auto it = g_native.node_controls.find(node_id_utf8);
+        if (it != g_native.node_controls.end()) {
+            node_hwnd = it->second;
+        }
+    }
+
+    *out_hwnd = (node_hwnd && IsWindow(node_hwnd)) ? node_hwnd : nullptr;
+    return *out_hwnd != nullptr;
 }
 
 bool findFocusedPaneIdInNode(const ordered_json& node, std::string& out_id) {
@@ -1127,9 +1147,9 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
                 const int height = explicit_height > 0 ? explicit_height : std::max(220, first.height + second.height + divider_size);
                 return {std::min(std::max(width, 220), std::max(220, max_width)), height};
             }
-            const int width = explicit_width > 0 ? explicit_width : std::max(320, max_width);
+            const int width = explicit_width > 0 ? explicit_width : std::max(320, first.width + second.width + divider_size);
             const int height = explicit_height > 0 ? explicit_height : std::max(220, std::max(first.height, second.height));
-            return {std::max(320, std::min(width, std::max(320, max_width))), height};
+            return {std::max(320, width), height};
         }
         return {std::max(320, std::min(max_width, 720)), explicit_height > 0 ? explicit_height : 240};
     }
@@ -1287,6 +1307,17 @@ LRESULT CALLBACK containerForwardSubclassProc(HWND hwnd,
                                               DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    auto forward_to_native_host = [&](UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+        HWND target = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_native.mutex);
+            target = g_native.hwnd;
+        }
+        if (target && target != hwnd) {
+            return SendMessageW(target, msg, wp, lp);
+        }
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    };
     switch (message) {
     case WM_COMMAND:
     case WM_HSCROLL:
@@ -1294,21 +1325,9 @@ LRESULT CALLBACK containerForwardSubclassProc(HWND hwnd,
     case WM_CONTEXTMENU:
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL:
-        {
-            HWND root = GetAncestor(hwnd, GA_ROOT);
-            if (root && root != hwnd) {
-                return SendMessageW(root, message, wparam, lparam);
-            }
-        }
-        break;
+        return forward_to_native_host(message, wparam, lparam);
     case WM_NOTIFY:
-        {
-            HWND root = GetAncestor(hwnd, GA_ROOT);
-            if (root && root != hwnd) {
-                return SendMessageW(root, message, wparam, lparam);
-            }
-        }
-        break;
+        return forward_to_native_host(message, wparam, lparam);
     case WM_NCDESTROY:
         RemoveWindowSubclass(hwnd, containerForwardSubclassProc, kContainerSubclassId);
         break;
@@ -1319,6 +1338,38 @@ LRESULT CALLBACK containerForwardSubclassProc(HWND hwnd,
 void attachContainerForwarding(HWND hwnd) {
     if (!hwnd) return;
     SetWindowSubclass(hwnd, containerForwardSubclassProc, kContainerSubclassId, 0);
+}
+
+LRESULT CALLBACK transparentPaneSubclassProc(HWND hwnd,
+                                             UINT message,
+                                             WPARAM wparam,
+                                             LPARAM lparam,
+                                             UINT_PTR subclass_id,
+                                             DWORD_PTR ref_data) {
+    (void)subclass_id;
+    (void)ref_data;
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps{};
+            BeginPaint(hwnd, &ps);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    case WM_PRINTCLIENT:
+        return 0;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, transparentPaneSubclassProc, kTransparentPaneSubclassId);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void attachTransparentPaneSubclass(HWND hwnd) {
+    if (!hwnd) return;
+    SetWindowSubclass(hwnd, transparentPaneSubclassProc, kTransparentPaneSubclassId, 0);
 }
 
 bool splitViewHitDivider(const ControlBinding& binding, int x, int y) {
@@ -3430,14 +3481,33 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
     }
 
     if (type == "slider") {
+        bool handled = false;
+
+        auto label_it = props.find("label");
+        if (label_it != props.end() && label_it->is_string()) {
+            binding.text = label_it->get<std::string>();
+            if (binding.companion_hwnd && IsWindow(binding.companion_hwnd)) {
+                const std::wstring label = utf8ToWide(binding.text);
+                if (!windowTextEquals(binding.companion_hwnd, label)) {
+                    SetWindowTextW(binding.companion_hwnd, label.c_str());
+                }
+                InvalidateRect(binding.companion_hwnd, nullptr, TRUE);
+                UpdateWindow(binding.companion_hwnd);
+            }
+            handled = true;
+        }
+
         auto value_it = props.find("value");
-        if (value_it == props.end() || !value_it->is_number()) return false;
-        const int value = value_it->is_number_integer()
-            ? value_it->get<int>()
-            : static_cast<int>(value_it->get<double>());
-        SendMessageW(control, TBM_SETPOS, TRUE, value);
-        binding.value_text = std::to_string(value);
-        return true;
+        if (value_it != props.end() && value_it->is_number()) {
+            const int value = value_it->is_number_integer()
+                ? value_it->get<int>()
+                : static_cast<int>(value_it->get<double>());
+            SendMessageW(control, TBM_SETPOS, TRUE, value);
+            binding.value_text = std::to_string(value);
+            handled = true;
+        }
+
+        return handled;
     }
 
     if (type == "progress") {
@@ -4154,6 +4224,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
         HWND pane_host = createChildControl(L"STATIC", L"", 0, x, cursor_y, control_width, pane_height, parent, nullptr);
         if (pane_host) {
             attachContainerForwarding(pane_host);
+            attachTransparentPaneSubclass(pane_host);
             ControlBinding binding;
             binding.type = type;
             binding.event_name = jsonString(node, "event");
@@ -4497,10 +4568,10 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
         const int current_value = jsonInt(node, "value", min_value);
         const int control_width = std::max(260, std::min(max_width, 420));
         int cursor_y = y;
+        HWND label_hwnd = nullptr;
         if (!label.empty()) {
-            std::wstring header = label + L"  " + utf8ToWide(std::to_string(current_value));
-            const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, header, control_width);
-            createChildControl(L"STATIC", header.c_str(), SS_LEFT, x, cursor_y, control_width, label_size.cy, parent, g_native.ui_font);
+            const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, control_width);
+            label_hwnd = createChildControl(L"STATIC", label.c_str(), SS_LEFT, x, cursor_y, control_width, label_size.cy, parent, g_native.ui_font);
             cursor_y += static_cast<int>(label_size.cy + 8);
         }
         HWND slider = createChildControl(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS | WS_TABSTOP, x, cursor_y, control_width, 32, parent, g_native.ui_font);
@@ -4516,6 +4587,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             binding.node_id = jsonString(node, "id");
             binding.text = jsonString(node, "label");
             binding.value_text = std::to_string(current_value);
+            binding.companion_hwnd = label_hwnd;
             registerNodeControl(slider, binding);
         }
         return {control_width, (cursor_y - y) + 32};
@@ -5360,6 +5432,20 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         return 0;
 
     case WM_SIZE:
+        {
+            const int width = std::max(0, static_cast<int>(LOWORD(lparam)));
+            const int height = std::max(0, static_cast<int>(HIWORD(lparam)));
+            bool size_unchanged = false;
+            {
+                std::lock_guard<std::mutex> lock(g_native.mutex);
+                size_unchanged = g_native.content_host &&
+                    width == g_native.client_width &&
+                    height == g_native.client_height;
+            }
+            if (size_unchanged) {
+                return 0;
+            }
+        }
         // Debounce: defer the rebuild until the user has stopped dragging
         // the window frame for kResizeDebounceMs milliseconds.  Without this,
         // every pixel of resize triggers a full control destroy+recreate cycle
@@ -5402,9 +5488,13 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         return 0;
 
     case kMsgNativeShow:
-        rebuildNativeWindow(hwnd);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
-        SetForegroundWindow(hwnd);
+        if (g_native.embedded_mode) {
+            ShowWindow(hwnd, SW_SHOW);
+        } else {
+            rebuildNativeWindow(hwnd);
+            ShowWindow(hwnd, SW_SHOWNORMAL);
+            SetForegroundWindow(hwnd);
+        }
         return 0;
 
     case WM_CONTEXTMENU:
@@ -6446,9 +6536,26 @@ extern "C" WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void) {
     return g_native.hwnd;
 }
 
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height) {
+    if (!out_width || !out_height) {
+        setNativeLastError("Native UI content size requires width and height outputs.");
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_native.mutex);
+    *out_width = g_native.content_width;
+    *out_height = g_native.content_height;
+    clearNativeLastError();
+    return 1;
+}
+
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
     clearNativeLastError();
     return tryGetNativeNodeBounds(node_id_utf8, out_bounds) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd) {
+    clearNativeLastError();
+    return tryGetNativeNodeHwnd(node_id_utf8, out_hwnd) ? 1 : 0;
 }
 
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size) {

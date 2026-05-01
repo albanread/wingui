@@ -184,6 +184,7 @@ struct WinguiRgbaBlitUniforms {
 struct WinguiIndexedBufferResources {
     ID3D11Texture2D* pixels_texture = nullptr;
     ID3D11ShaderResourceView* pixels_srv = nullptr;
+    ID3D11UnorderedAccessView* pixels_uav = nullptr;
     ID3D11Texture2D* line_palette_texture = nullptr;
     ID3D11ShaderResourceView* line_palette_srv = nullptr;
     ID3D11Texture2D* global_palette_texture = nullptr;
@@ -195,6 +196,72 @@ struct WinguiIndexedSurface {
     std::vector<WinguiIndexedBufferResources> buffers;
     uint32_t buffer_width = 0;
     uint32_t buffer_height = 0;
+};
+
+struct WinguiVectorInstanceGpu {
+    float bounds[4];
+    float param0[4];
+    float param1[4];
+    float color[4];
+    uint32_t shape_id;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+struct WinguiVectorUniformsGpu {
+    float surface_width;
+    float surface_height;
+    float atlas_width;
+    float atlas_height;
+};
+
+struct WinguiVectorRenderer {
+    WinguiContext* context = nullptr;
+    ID3D11VertexShader* vertex_shader = nullptr;
+    ID3D11PixelShader* pixel_shader = nullptr;
+    ID3D11InputLayout* input_layout = nullptr;
+    ID3D11Buffer* constant_buffer = nullptr;
+    ID3D11Buffer* instance_buffer = nullptr;
+    ID3D11SamplerState* linear_sampler = nullptr;
+    ID3D11RasterizerState* rasterizer = nullptr;
+    ID3D11BlendState* blend_alpha_over = nullptr;
+    ID3D11BlendState* blend_opaque = nullptr;
+    ID3D11Texture2D* glyph_atlas_texture = nullptr;
+    ID3D11ShaderResourceView* glyph_atlas_srv = nullptr;
+    WinguiGlyphAtlasInfo glyph_atlas_info{};
+    bool has_glyph_atlas = false;
+    size_t instance_capacity = 0;
+};
+
+struct WinguiIndexedFillUniforms {
+    uint32_t dst_x;
+    uint32_t dst_y;
+    uint32_t dst_w;
+    uint32_t dst_h;
+    uint32_t palette_index;
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+struct WinguiIndexedLineUniforms {
+    int32_t  x0;
+    int32_t  y0;
+    int32_t  x1;
+    int32_t  y1;
+    uint32_t palette_index;
+    uint32_t steps;   // max(|dx|,|dy|)
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+struct WinguiIndexedFillRenderer {
+    WinguiContext* context = nullptr;
+    ID3D11ComputeShader* fill_shader = nullptr;
+    ID3D11ComputeShader* line_shader = nullptr;
+    ID3D11Buffer* fill_cbuffer = nullptr;   // b0 — used by fill_shader
+    ID3D11Buffer* line_cbuffer = nullptr;   // b1 — used by line_shader
 };
 
 thread_local std::string g_last_error;
@@ -1979,6 +2046,7 @@ void releaseIndexedBufferResources(WinguiIndexedBufferResources& buffer) {
     safeRelease(buffer.global_palette_texture);
     safeRelease(buffer.line_palette_srv);
     safeRelease(buffer.line_palette_texture);
+    safeRelease(buffer.pixels_uav);
     safeRelease(buffer.pixels_srv);
     safeRelease(buffer.pixels_texture);
 }
@@ -2009,8 +2077,37 @@ HRESULT createIndexedSurfaceBuffer(WinguiContext* context, WinguiIndexedBufferRe
         return S_OK;
     };
 
-    HRESULT hr = make_default_texture(width, height, DXGI_FORMAT_R8_UINT, &buffer.pixels_texture, &buffer.pixels_srv);
-    if (FAILED(hr)) return hr;
+    // Pixels texture also needs UAV bind for compute-shader fill operations.
+    {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8_UINT;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        HRESULT hr2 = context->device->CreateTexture2D(&desc, nullptr, &buffer.pixels_texture);
+        if (FAILED(hr2)) return hr2;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = desc.Format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MipLevels = 1;
+        hr2 = context->device->CreateShaderResourceView(buffer.pixels_texture, &srv_desc, &buffer.pixels_srv);
+        if (FAILED(hr2)) { safeRelease(buffer.pixels_texture); return hr2; }
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+        uav_desc.Format = desc.Format;
+        uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        uav_desc.Texture2D.MipSlice = 0;
+        hr2 = context->device->CreateUnorderedAccessView(buffer.pixels_texture, &uav_desc, &buffer.pixels_uav);
+        if (FAILED(hr2)) {
+            safeRelease(buffer.pixels_srv);
+            safeRelease(buffer.pixels_texture);
+            return hr2;
+        }
+    }
+    HRESULT hr = S_OK;
     hr = make_default_texture(16, height, DXGI_FORMAT_R32_UINT, &buffer.line_palette_texture, &buffer.line_palette_srv);
     if (FAILED(hr)) {
         releaseIndexedBufferResources(buffer);
@@ -2520,7 +2617,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_render_sprites
         renderer->sprite_vertices.push_back(vertex);
     };
 
-    const uint32_t clamped_instances = std::min<uint32_t>(instance_count, 512u);
+    const uint32_t clamped_instances = instance_count;
     for (uint32_t i = 0; i < clamped_instances; ++i) {
         const WinguiSpriteInstance& inst = instances[i];
         if ((inst.flags & WINGUI_SPRITE_FLAG_VISIBLE) == 0) continue;
@@ -3640,6 +3737,719 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_load_image_int
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Vector renderer (GPU SDF primitives + glyph text into RGBA surfaces)
+// ---------------------------------------------------------------------------
+
+static const D3D11_INPUT_ELEMENT_DESC kWinguiVectorLayout[] = {
+    { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,                            D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    { "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+    { "TEXCOORD", 4, DXGI_FORMAT_R32_UINT,           0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+};
+
+static HRESULT ensureVectorInstanceBuffer(WinguiVectorRenderer& renderer, size_t needed_instances) {
+    if (needed_instances <= renderer.instance_capacity && renderer.instance_buffer) return S_OK;
+    size_t new_capacity = std::max<size_t>(256, renderer.instance_capacity ? renderer.instance_capacity : 256);
+    while (new_capacity < needed_instances) new_capacity *= 2;
+    safeRelease(renderer.instance_buffer);
+    D3D11_BUFFER_DESC desc{};
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    desc.ByteWidth = static_cast<UINT>(new_capacity * sizeof(WinguiVectorInstanceGpu));
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    const HRESULT hr = renderer.context->device->CreateBuffer(&desc, nullptr, &renderer.instance_buffer);
+    if (FAILED(hr)) return hr;
+    renderer.instance_capacity = new_capacity;
+    return S_OK;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_vector_renderer(
+    WinguiContext* context,
+    const char* shader_path_utf8,
+    WinguiVectorRenderer** out_renderer) {
+    if (!context || !context->device || !out_renderer) {
+        setLastErrorString("wingui_create_vector_renderer: invalid arguments");
+        return 0;
+    }
+    auto* renderer = new (std::nothrow) WinguiVectorRenderer();
+    if (!renderer) {
+        setLastErrorString("wingui_create_vector_renderer: allocation failed");
+        return 0;
+    }
+    renderer->context = context;
+
+    const char* shader_path = shader_path_utf8 && *shader_path_utf8 ? shader_path_utf8 : "shaders/vector.hlsl";
+    void* vs_blob_raw = nullptr;
+    void* ps_blob_raw = nullptr;
+    size_t blob_size = 0;
+    if (!wingui_compile_shader_from_file_utf8(shader_path, "vector_vertex", "vs_4_0", &vs_blob_raw, &blob_size) ||
+        !wingui_compile_shader_from_file_utf8(shader_path, "vector_fragment", "ps_4_0", &ps_blob_raw, &blob_size)) {
+        if (vs_blob_raw) wingui_release_blob(vs_blob_raw);
+        if (ps_blob_raw) wingui_release_blob(ps_blob_raw);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+    auto* vs_blob = static_cast<ID3DBlob*>(vs_blob_raw);
+    auto* ps_blob = static_cast<ID3DBlob*>(ps_blob_raw);
+
+    HRESULT hr = context->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, &renderer->vertex_shader);
+    if (SUCCEEDED(hr)) {
+        hr = context->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, &renderer->pixel_shader);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = context->device->CreateInputLayout(
+            kWinguiVectorLayout,
+            static_cast<UINT>(std::size(kWinguiVectorLayout)),
+            vs_blob->GetBufferPointer(),
+            vs_blob->GetBufferSize(),
+            &renderer->input_layout);
+    }
+    wingui_release_blob(ps_blob_raw);
+    wingui_release_blob(vs_blob_raw);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: shader/layout creation failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.ByteWidth = (sizeof(WinguiVectorUniformsGpu) + 15u) & ~15u;
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = context->device->CreateBuffer(&cb_desc, nullptr, &renderer->constant_buffer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: cbuffer creation failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    hr = context->device->CreateSamplerState(&sampler_desc, &renderer->linear_sampler);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: sampler creation failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    D3D11_RASTERIZER_DESC raster_desc{};
+    raster_desc.FillMode = D3D11_FILL_SOLID;
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.ScissorEnable = FALSE;
+    raster_desc.DepthClipEnable = TRUE;
+    hr = context->device->CreateRasterizerState(&raster_desc, &renderer->rasterizer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: rasterizer creation failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    D3D11_BLEND_DESC blend_desc{};
+    blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = context->device->CreateBlendState(&blend_desc, &renderer->blend_alpha_over);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: alpha blend state failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    D3D11_BLEND_DESC opaque_desc{};
+    opaque_desc.RenderTarget[0].BlendEnable = FALSE;
+    opaque_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    opaque_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    opaque_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    opaque_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    opaque_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    opaque_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    opaque_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = context->device->CreateBlendState(&opaque_desc, &renderer->blend_opaque);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_vector_renderer: opaque blend state failed", hr);
+        wingui_destroy_vector_renderer(renderer);
+        return 0;
+    }
+
+    *out_renderer = renderer;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_vector_renderer(WinguiVectorRenderer* renderer) {
+    if (!renderer) return;
+    safeRelease(renderer->glyph_atlas_srv);
+    safeRelease(renderer->glyph_atlas_texture);
+    safeRelease(renderer->blend_opaque);
+    safeRelease(renderer->blend_alpha_over);
+    safeRelease(renderer->rasterizer);
+    safeRelease(renderer->linear_sampler);
+    safeRelease(renderer->instance_buffer);
+    safeRelease(renderer->constant_buffer);
+    safeRelease(renderer->input_layout);
+    safeRelease(renderer->pixel_shader);
+    safeRelease(renderer->vertex_shader);
+    delete renderer;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_set_glyph_atlas(
+    WinguiVectorRenderer* renderer,
+    const WinguiGlyphAtlasBitmap* atlas) {
+    if (!renderer || !renderer->context || !atlas || !atlas->pixels_rgba || !atlas->width || !atlas->height) {
+        setLastErrorString("wingui_vector_renderer_set_glyph_atlas: invalid arguments");
+        return 0;
+    }
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = atlas->width;
+    desc.Height = atlas->height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = atlas->pixels_rgba;
+    init.SysMemPitch = atlas->width * 4u;
+
+    ID3D11Texture2D* texture = nullptr;
+    HRESULT hr = renderer->context->device->CreateTexture2D(&desc, &init, &texture);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_vector_renderer_set_glyph_atlas: texture creation failed", hr);
+        return 0;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = desc.Format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView* srv = nullptr;
+    hr = renderer->context->device->CreateShaderResourceView(texture, &srv_desc, &srv);
+    if (FAILED(hr)) {
+        safeRelease(texture);
+        setLastErrorHresult("wingui_vector_renderer_set_glyph_atlas: SRV creation failed", hr);
+        return 0;
+    }
+    safeRelease(renderer->glyph_atlas_srv);
+    safeRelease(renderer->glyph_atlas_texture);
+    renderer->glyph_atlas_texture = texture;
+    renderer->glyph_atlas_srv = srv;
+    renderer->glyph_atlas_info = atlas->info;
+    renderer->has_glyph_atlas = true;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_glyph_atlas_info(
+    WinguiVectorRenderer* renderer,
+    WinguiGlyphAtlasInfo* out_info) {
+    if (!renderer || !out_info) {
+        setLastErrorString("wingui_vector_renderer_glyph_atlas_info: invalid arguments");
+        return 0;
+    }
+    if (!renderer->has_glyph_atlas) {
+        setLastErrorString("wingui_vector_renderer_glyph_atlas_info: no atlas set");
+        return 0;
+    }
+    *out_info = renderer->glyph_atlas_info;
+    g_last_error.clear();
+    return 1;
+}
+
+static int decodeUtf8(const char*& cursor, const char* end, uint32_t& out_cp) {
+    if (cursor >= end) return 0;
+    const unsigned char b0 = static_cast<unsigned char>(*cursor++);
+    if (b0 < 0x80) { out_cp = b0; return 1; }
+    auto cont = [&](uint32_t& acc, int n) -> bool {
+        for (int i = 0; i < n; ++i) {
+            if (cursor >= end) return false;
+            const unsigned char b = static_cast<unsigned char>(*cursor++);
+            if ((b & 0xC0) != 0x80) return false;
+            acc = (acc << 6) | (b & 0x3F);
+        }
+        return true;
+    };
+    uint32_t acc = 0;
+    if ((b0 & 0xE0) == 0xC0) { acc = b0 & 0x1F; if (!cont(acc, 1)) return 0; }
+    else if ((b0 & 0xF0) == 0xE0) { acc = b0 & 0x0F; if (!cont(acc, 2)) return 0; }
+    else if ((b0 & 0xF8) == 0xF0) { acc = b0 & 0x07; if (!cont(acc, 3)) return 0; }
+    else return 0;
+    out_cp = acc;
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_layout_with_atlas_info_utf8(
+    const WinguiGlyphAtlasInfo* atlas_info,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    WinguiVectorPrimitive* primitives,
+    uint32_t* io_count,
+    uint32_t capacity) {
+    if (!atlas_info || !text_utf8 || !primitives || !io_count) {
+        setLastErrorString("wingui_text_layout_with_atlas_info_utf8: invalid arguments");
+        return 0;
+    }
+    const WinguiGlyphAtlasInfo& info = *atlas_info;
+    if (info.cell_width <= 0.0f || info.cell_height <= 0.0f || info.atlas_width <= 0.0f || info.atlas_height <= 0.0f || info.cols == 0) {
+        setLastErrorString("wingui_text_layout_with_atlas_info_utf8: invalid atlas info");
+        return 0;
+    }
+
+    const char* cursor = text_utf8;
+    const char* end = cursor + std::strlen(text_utf8);
+    float pen_x = origin_x;
+    float pen_y = origin_y;
+    uint32_t count = *io_count;
+
+    while (cursor < end) {
+        uint32_t cp = 0;
+        if (!decodeUtf8(cursor, end, cp)) break;
+        if (cp == '\n') {
+            pen_x = origin_x;
+            pen_y += info.cell_height;
+            continue;
+        }
+        if (cp == '\r') continue;
+        if (cp < info.first_codepoint || cp >= info.first_codepoint + info.glyph_count) {
+            pen_x += info.cell_width;
+            continue;
+        }
+        if (count >= capacity) {
+            setLastErrorString("wingui_text_layout_with_atlas_info_utf8: capacity exhausted");
+            *io_count = count;
+            return 0;
+        }
+        const uint32_t idx = cp - info.first_codepoint;
+        const uint32_t col = idx % info.cols;
+        const uint32_t row = idx / info.cols;
+        const float ax = static_cast<float>(col) * info.cell_width;
+        const float ay = static_cast<float>(row) * info.cell_height;
+        WinguiVectorPrimitive& p = primitives[count++];
+        p = {};
+        p.bounds_min_x = pen_x;
+        p.bounds_min_y = pen_y;
+        p.bounds_max_x = pen_x + info.cell_width;
+        p.bounds_max_y = pen_y + info.cell_height;
+        p.param0[0] = ax / info.atlas_width;
+        p.param0[1] = ay / info.atlas_height;
+        p.param0[2] = (ax + info.cell_width) / info.atlas_width;
+        p.param0[3] = (ay + info.cell_height) / info.atlas_height;
+        p.color[0] = color_r;
+        p.color[1] = color_g;
+        p.color[2] = color_b;
+        p.color[3] = color_a;
+        p.shape = WINGUI_VECTOR_GLYPH;
+        pen_x += info.cell_width;
+    }
+    *io_count = count;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_vector_text_layout_utf8(
+    WinguiVectorRenderer* renderer,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    WinguiVectorPrimitive* primitives,
+    uint32_t* io_count,
+    uint32_t capacity) {
+    if (!renderer) {
+        setLastErrorString("wingui_vector_text_layout_utf8: invalid arguments");
+        return 0;
+    }
+    if (!renderer->has_glyph_atlas) {
+        setLastErrorString("wingui_vector_text_layout_utf8: no glyph atlas set");
+        return 0;
+    }
+    return wingui_text_layout_with_atlas_info_utf8(
+        &renderer->glyph_atlas_info,
+        text_utf8, origin_x, origin_y,
+        color_r, color_g, color_b, color_a,
+        primitives, io_count, capacity);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_render(
+    WinguiVectorRenderer* renderer,
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    const WinguiVectorPrimitive* primitives,
+    uint32_t primitive_count,
+    uint32_t blend_mode) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !dst_surface) {
+        setLastErrorString("wingui_vector_renderer_render: invalid arguments");
+        return 0;
+    }
+    if (renderer->context != dst_surface->context) {
+        setLastErrorString("wingui_vector_renderer_render: surface belongs to a different context");
+        return 0;
+    }
+    if (dst_buffer_index >= dst_surface->buffers.size() ||
+        !dst_surface->buffers[dst_buffer_index].rtv ||
+        dst_surface->buffer_width == 0 || dst_surface->buffer_height == 0) {
+        setLastErrorString("wingui_vector_renderer_render: destination buffer not ready");
+        return 0;
+    }
+    if (primitive_count == 0) {
+        g_last_error.clear();
+        return 1;
+    }
+    if (!primitives) {
+        setLastErrorString("wingui_vector_renderer_render: null primitives");
+        return 0;
+    }
+
+    auto* ctx = renderer->context->device_context;
+
+    HRESULT hr = ensureVectorInstanceBuffer(*renderer, primitive_count);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_vector_renderer_render: instance buffer alloc failed", hr);
+        return 0;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    hr = ctx->Map(renderer->instance_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_vector_renderer_render: instance map failed", hr);
+        return 0;
+    }
+    auto* gpu = static_cast<WinguiVectorInstanceGpu*>(mapped.pData);
+    for (uint32_t i = 0; i < primitive_count; ++i) {
+        const WinguiVectorPrimitive& src = primitives[i];
+        WinguiVectorInstanceGpu& dst = gpu[i];
+        dst.bounds[0] = src.bounds_min_x;
+        dst.bounds[1] = src.bounds_min_y;
+        dst.bounds[2] = src.bounds_max_x;
+        dst.bounds[3] = src.bounds_max_y;
+        std::memcpy(dst.param0, src.param0, sizeof(dst.param0));
+        std::memcpy(dst.param1, src.param1, sizeof(dst.param1));
+        std::memcpy(dst.color, src.color, sizeof(dst.color));
+        dst.shape_id = src.shape;
+        dst.pad0 = dst.pad1 = dst.pad2 = 0;
+    }
+    ctx->Unmap(renderer->instance_buffer, 0);
+
+    WinguiVectorUniformsGpu uniforms{};
+    uniforms.surface_width = static_cast<float>(dst_surface->buffer_width);
+    uniforms.surface_height = static_cast<float>(dst_surface->buffer_height);
+    uniforms.atlas_width = renderer->has_glyph_atlas ? renderer->glyph_atlas_info.atlas_width : 1.0f;
+    uniforms.atlas_height = renderer->has_glyph_atlas ? renderer->glyph_atlas_info.atlas_height : 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE cb_mapped{};
+    hr = ctx->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &cb_mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_vector_renderer_render: cbuffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(cb_mapped.pData, &uniforms, sizeof(uniforms));
+    ctx->Unmap(renderer->constant_buffer, 0);
+
+    ID3D11RenderTargetView* rtv = dst_surface->buffers[dst_buffer_index].rtv;
+    const D3D11_VIEWPORT viewport{
+        0.0f, 0.0f,
+        static_cast<float>(dst_surface->buffer_width),
+        static_cast<float>(dst_surface->buffer_height),
+        0.0f, 1.0f
+    };
+
+    ID3D11ShaderResourceView* atlas_srv = renderer->glyph_atlas_srv;
+
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    ID3D11BlendState* blend = (blend_mode == WINGUI_RGBA_BLIT_OPAQUE) ? renderer->blend_opaque : renderer->blend_alpha_over;
+    const FLOAT blend_factor[4] = { 0, 0, 0, 0 };
+    ctx->OMSetBlendState(blend, blend_factor, 0xffffffffu);
+    ctx->RSSetState(renderer->rasterizer);
+    ctx->RSSetViewports(1, &viewport);
+    ctx->IASetInputLayout(renderer->input_layout);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const UINT stride = sizeof(WinguiVectorInstanceGpu);
+    const UINT offset = 0;
+    ctx->IASetVertexBuffers(0, 1, &renderer->instance_buffer, &stride, &offset);
+    ctx->VSSetShader(renderer->vertex_shader, nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+    ctx->PSSetShader(renderer->pixel_shader, nullptr, 0);
+    ctx->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+    ctx->PSSetSamplers(0, 1, &renderer->linear_sampler);
+    ctx->PSSetShaderResources(0, 1, &atlas_srv);
+    ctx->DrawInstanced(6, primitive_count, 0, 0);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    ctx->PSSetShaderResources(0, 1, &null_srv);
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_clear(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    if (!surface || !surface->context || !surface->context->device_context) {
+        setLastErrorString("wingui_rgba_surface_clear: invalid arguments");
+        return 0;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].rtv) {
+        setLastErrorString("wingui_rgba_surface_clear: buffer not ready");
+        return 0;
+    }
+    // Surface format is BGRA; ClearRenderTargetView expects RGBA float values
+    // and the runtime swizzles to the target's channel order.
+    const FLOAT colour[4] = { color_r, color_g, color_b, color_a };
+    surface->context->device_context->ClearRenderTargetView(surface->buffers[buffer_index].rtv, colour);
+    g_last_error.clear();
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Indexed fill renderer (compute-shader rect fill into R8_UINT surfaces)
+// ---------------------------------------------------------------------------
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_indexed_fill_renderer(
+    WinguiContext* context,
+    const char* shader_path_utf8,
+    WinguiIndexedFillRenderer** out_renderer) {
+    if (!context || !context->device || !out_renderer) {
+        setLastErrorString("wingui_create_indexed_fill_renderer: invalid arguments");
+        return 0;
+    }
+    auto* renderer = new (std::nothrow) WinguiIndexedFillRenderer();
+    if (!renderer) {
+        setLastErrorString("wingui_create_indexed_fill_renderer: allocation failed");
+        return 0;
+    }
+    renderer->context = context;
+
+    const char* path = shader_path_utf8 && *shader_path_utf8 ? shader_path_utf8 : "shaders/indexed_fill.hlsl";
+
+    // Compile fill shader (indexed_fill_cs, b0)
+    {
+        void* cs_blob_raw = nullptr;
+        size_t blob_size = 0;
+        if (!wingui_compile_shader_from_file_utf8(path, "indexed_fill_cs", "cs_5_0", &cs_blob_raw, &blob_size)) {
+            wingui_destroy_indexed_fill_renderer(renderer);
+            return 0;
+        }
+        auto* cs_blob = static_cast<ID3DBlob*>(cs_blob_raw);
+        HRESULT hr = context->device->CreateComputeShader(
+            cs_blob->GetBufferPointer(), cs_blob->GetBufferSize(), nullptr, &renderer->fill_shader);
+        wingui_release_blob(cs_blob_raw);
+        if (FAILED(hr)) {
+            setLastErrorHresult("wingui_create_indexed_fill_renderer: CreateComputeShader(fill) failed", hr);
+            wingui_destroy_indexed_fill_renderer(renderer);
+            return 0;
+        }
+    }
+
+    // Compile line shader (indexed_line_cs, b1)
+    {
+        void* cs_blob_raw = nullptr;
+        size_t blob_size = 0;
+        if (!wingui_compile_shader_from_file_utf8(path, "indexed_line_cs", "cs_5_0", &cs_blob_raw, &blob_size)) {
+            wingui_destroy_indexed_fill_renderer(renderer);
+            return 0;
+        }
+        auto* cs_blob = static_cast<ID3DBlob*>(cs_blob_raw);
+        HRESULT hr = context->device->CreateComputeShader(
+            cs_blob->GetBufferPointer(), cs_blob->GetBufferSize(), nullptr, &renderer->line_shader);
+        wingui_release_blob(cs_blob_raw);
+        if (FAILED(hr)) {
+            setLastErrorHresult("wingui_create_indexed_fill_renderer: CreateComputeShader(line) failed", hr);
+            wingui_destroy_indexed_fill_renderer(renderer);
+            return 0;
+        }
+    }
+
+    D3D11_BUFFER_DESC cb_desc{};
+    cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+    cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    cb_desc.ByteWidth = sizeof(WinguiIndexedFillUniforms);
+    HRESULT hr = context->device->CreateBuffer(&cb_desc, nullptr, &renderer->fill_cbuffer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_indexed_fill_renderer: fill cbuffer creation failed", hr);
+        wingui_destroy_indexed_fill_renderer(renderer);
+        return 0;
+    }
+    cb_desc.ByteWidth = sizeof(WinguiIndexedLineUniforms);
+    hr = context->device->CreateBuffer(&cb_desc, nullptr, &renderer->line_cbuffer);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_indexed_fill_renderer: line cbuffer creation failed", hr);
+        wingui_destroy_indexed_fill_renderer(renderer);
+        return 0;
+    }
+
+    *out_renderer = renderer;
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_indexed_fill_renderer(WinguiIndexedFillRenderer* renderer) {
+    if (!renderer) return;
+    safeRelease(renderer->line_cbuffer);
+    safeRelease(renderer->fill_cbuffer);
+    safeRelease(renderer->line_shader);
+    safeRelease(renderer->fill_shader);
+    delete renderer;
+}
+
+// Shared helper: validate surface UAV and clamp values into the surface bounds.
+// Returns false (and sets error) if the surface is not ready.
+static bool getIndexedSurfaceUav(
+    WinguiIndexedFillRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    const char* fn_name,
+    ID3D11UnorderedAccessView** out_uav) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !surface) {
+        setLastErrorString(fn_name);  // caller appended ": invalid arguments"
+        return false;
+    }
+    if (renderer->context != surface->context) {
+        setLastErrorString(fn_name);
+        return false;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].pixels_uav ||
+        surface->buffer_width == 0 || surface->buffer_height == 0) {
+        setLastErrorString(fn_name);
+        return false;
+    }
+    *out_uav = surface->buffers[buffer_index].pixels_uav;
+    return true;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_fill_rect(
+    WinguiIndexedFillRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    uint32_t palette_index) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !surface) {
+        setLastErrorString("wingui_indexed_surface_fill_rect: invalid arguments");
+        return 0;
+    }
+    if (renderer->context != surface->context) {
+        setLastErrorString("wingui_indexed_surface_fill_rect: surface belongs to a different context");
+        return 0;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].pixels_uav ||
+        surface->buffer_width == 0 || surface->buffer_height == 0) {
+        setLastErrorString("wingui_indexed_surface_fill_rect: surface buffer not ready");
+        return 0;
+    }
+    if (width == 0 || height == 0) { g_last_error.clear(); return 1; }
+    if (x >= surface->buffer_width || y >= surface->buffer_height) { g_last_error.clear(); return 1; }
+    if (x + width  > surface->buffer_width)  width  = surface->buffer_width  - x;
+    if (y + height > surface->buffer_height) height = surface->buffer_height - y;
+
+    auto* ctx = renderer->context->device_context;
+    WinguiIndexedFillUniforms uniforms{};
+    uniforms.dst_x = x;
+    uniforms.dst_y = y;
+    uniforms.dst_w = width;
+    uniforms.dst_h = height;
+    uniforms.palette_index = palette_index & 0xFFu;
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = ctx->Map(renderer->fill_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) { setLastErrorHresult("wingui_indexed_surface_fill_rect: cbuffer map failed", hr); return 0; }
+    std::memcpy(mapped.pData, &uniforms, sizeof(uniforms));
+    ctx->Unmap(renderer->fill_cbuffer, 0);
+
+    ID3D11UnorderedAccessView* uav = surface->buffers[buffer_index].pixels_uav;
+    ctx->CSSetShader(renderer->fill_shader, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &renderer->fill_cbuffer);
+    ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    ctx->Dispatch((width + 7u) / 8u, (height + 7u) / 8u, 1);
+
+    ID3D11UnorderedAccessView* null_uav = nullptr;
+    ctx->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    ctx->CSSetShader(nullptr, nullptr, 0);
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_draw_line(
+    WinguiIndexedFillRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1,
+    uint32_t palette_index) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !surface) {
+        setLastErrorString("wingui_indexed_surface_draw_line: invalid arguments");
+        return 0;
+    }
+    if (renderer->context != surface->context) {
+        setLastErrorString("wingui_indexed_surface_draw_line: surface belongs to a different context");
+        return 0;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].pixels_uav) {
+        setLastErrorString("wingui_indexed_surface_draw_line: surface buffer not ready");
+        return 0;
+    }
+
+    const uint32_t dx = static_cast<uint32_t>(std::abs(x1 - x0));
+    const uint32_t dy = static_cast<uint32_t>(std::abs(y1 - y0));
+    const uint32_t steps = dx > dy ? dx : dy;
+
+    WinguiIndexedLineUniforms uniforms{};
+    uniforms.x0 = x0;
+    uniforms.y0 = y0;
+    uniforms.x1 = x1;
+    uniforms.y1 = y1;
+    uniforms.palette_index = palette_index & 0xFFu;
+    uniforms.steps = steps;
+
+    auto* ctx = renderer->context->device_context;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = ctx->Map(renderer->line_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) { setLastErrorHresult("wingui_indexed_surface_draw_line: cbuffer map failed", hr); return 0; }
+    std::memcpy(mapped.pData, &uniforms, sizeof(uniforms));
+    ctx->Unmap(renderer->line_cbuffer, 0);
+
+    ID3D11UnorderedAccessView* uav = surface->buffers[buffer_index].pixels_uav;
+    ID3D11Buffer* cbufs[2] = { nullptr, renderer->line_cbuffer };
+    ctx->CSSetShader(renderer->line_shader, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 2, cbufs);   // b0 = null, b1 = line params
+    ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+    ctx->Dispatch((steps + 64u) / 64u, 1, 1);   // one extra group handles the steps==0 (single pixel) case
+
+    ID3D11UnorderedAccessView* null_uav = nullptr;
+    ctx->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    ctx->CSSetShader(nullptr, nullptr, 0);
+    g_last_error.clear();
+    return 1;
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiContextDesc* desc, WinguiContext** out_context) {
     if (!desc || !out_context) {
         setLastErrorString("wingui_create_context: invalid arguments");
@@ -3660,6 +4470,8 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiCont
     context->width = std::max<uint32_t>(1, desc->width);
     context->height = std::max<uint32_t>(1, desc->height);
     context->buffer_count = std::max<uint32_t>(2, desc->buffer_count);
+    const DWORD window_style = static_cast<DWORD>(GetWindowLongPtrW(context->hwnd, GWL_STYLE));
+    const bool is_child_window = (window_style & WS_CHILD) != 0;
 
     DXGI_SWAP_CHAIN_DESC swap_desc{};
     swap_desc.BufferDesc.Width = context->width;
@@ -3670,7 +4482,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiCont
     swap_desc.BufferCount = context->buffer_count;
     swap_desc.OutputWindow = context->hwnd;
     swap_desc.Windowed = TRUE;
-    swap_desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    swap_desc.SwapEffect = is_child_window ? DXGI_SWAP_EFFECT_SEQUENTIAL : DXGI_SWAP_EFFECT_DISCARD;
 
     UINT flags = 0;
 #if defined(_DEBUG)

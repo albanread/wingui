@@ -73,6 +73,47 @@ enum PaneRenderKind : uint32_t {
     PANE_RENDER_RGBA = 2,
 };
 
+/* One entry in a per-pane sprite bank. Mirrors WinguiSpriteAtlasEntry plus
+   animation metadata. atlas_entry.atlas_x/y/width/height/frame_w/h/frame_count
+   are filled in when the sprite is uploaded to the shared sprite atlas. */
+struct SpriteBankEntry {
+    uint32_t sprite_id = 0;
+    WinguiSpriteAtlasEntry atlas_entry{};
+    uint32_t frames_per_tick = 0;  /* 0 = static */
+    bool uploaded = false;
+};
+
+/* Simple shelf/row atlas packer. Tracks allocation within the
+   shared sprite atlas (sprite_atlas_size x sprite_atlas_size). */
+struct ShelfPacker {
+    uint32_t atlas_size = 0;
+    uint32_t shelf_x = 0;      /* current x in the active shelf */
+    uint32_t shelf_y = 0;      /* top-y of the active shelf     */
+    uint32_t shelf_h = 0;      /* height of the active shelf    */
+
+    void init(uint32_t size) {
+        atlas_size = size;
+        shelf_x = shelf_y = shelf_h = 0;
+    }
+
+    /* Returns false if there is no room. */
+    bool alloc(uint32_t w, uint32_t h, uint32_t& out_x, uint32_t& out_y) {
+        if (!atlas_size || !w || !h || w > atlas_size || h > atlas_size) return false;
+        if (shelf_x + w > atlas_size) {
+            /* advance to next shelf */
+            shelf_y += shelf_h;
+            shelf_x = 0;
+            shelf_h = 0;
+        }
+        if (shelf_y + h > atlas_size) return false;
+        out_x = shelf_x;
+        out_y = shelf_y;
+        shelf_x += w;
+        if (h > shelf_h) shelf_h = h;
+        return true;
+    }
+};
+
 struct RegisteredPane {
     SuperTerminalPaneId pane_id{};
     std::string node_id;
@@ -87,10 +128,18 @@ struct RegisteredPane {
     uint32_t indexed_pixel_aspect_num = 1;
     uint32_t indexed_pixel_aspect_den = 1;
     WinguiRgbaSurface* rgba_surface_handle = nullptr;
+    uint32_t rgba_content_buffer_mode = SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME;
+    uint32_t rgba_surface_buffer_count = 0;
     uint32_t rgba_screen_width = 0;
     uint32_t rgba_screen_height = 0;
     uint32_t rgba_pixel_aspect_num = 1;
     uint32_t rgba_pixel_aspect_den = 1;
+    void* rgba_hwnd = nullptr;
+    WinguiContext* rgba_context = nullptr;
+    WinguiRgbaPaneRenderer* pane_rgba_renderer = nullptr;
+    WinguiVectorRenderer* pane_vector_renderer = nullptr;
+    int32_t pane_vector_renderer_atlas_set = 0;
+    std::vector<SpriteBankEntry> sprite_bank;
 };
 
 template <typename T>
@@ -167,6 +216,11 @@ struct SuperTerminalRuntimeHost {
     WinguiTextGridRenderer* text_renderer = nullptr;
     WinguiIndexedGraphicsRenderer* indexed_renderer = nullptr;
     WinguiRgbaPaneRenderer* rgba_renderer = nullptr;
+    WinguiVectorRenderer* vector_renderer = nullptr;
+    int32_t vector_renderer_init_attempted = 0;
+    int32_t vector_renderer_atlas_set = 0;
+    WinguiIndexedFillRenderer* indexed_fill_renderer = nullptr;
+    int32_t indexed_fill_renderer_init_attempted = 0;
     WinguiGlyphAtlasBitmap atlas{};
     RingQueue<SuperTerminalCommand> command_queue;
     RingQueue<SuperTerminalEvent> event_queue;
@@ -187,6 +241,7 @@ struct SuperTerminalRuntimeHost {
     std::atomic<uint64_t> next_asset_id{1};
     std::unordered_map<uint64_t, WinguiRgbaSurface*> rgba_assets;
     std::mutex asset_mutex;
+    ShelfPacker sprite_atlas_packer;
     int32_t exit_code = 0;
     int32_t host_error_code = SUPERTERMINAL_HOST_ERROR_NONE;
     std::string message;
@@ -717,35 +772,171 @@ bool renderIndexedPane(SuperTerminalRuntimeHost* host,
         nullptr) != 0;
 }
 
+void destroyPaneRgbaPresenter(RegisteredPane& pane) {
+    if (pane.pane_vector_renderer) {
+        wingui_destroy_vector_renderer(pane.pane_vector_renderer);
+        pane.pane_vector_renderer = nullptr;
+    }
+    if (pane.pane_rgba_renderer) {
+        wingui_destroy_rgba_pane_renderer(pane.pane_rgba_renderer);
+        pane.pane_rgba_renderer = nullptr;
+    }
+    if (pane.rgba_surface_handle) {
+        wingui_destroy_rgba_surface(pane.rgba_surface_handle);
+        pane.rgba_surface_handle = nullptr;
+    }
+    if (pane.rgba_context) {
+        wingui_destroy_context(pane.rgba_context);
+        pane.rgba_context = nullptr;
+    }
+    pane.rgba_hwnd = nullptr;
+    pane.rgba_surface_buffer_count = 0;
+    pane.pane_vector_renderer_atlas_set = 0;
+}
+
+bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
+                             RegisteredPane& pane,
+                             const SuperTerminalPaneLayout& layout) {
+    if (!host || pane.node_id.empty() || layout.width <= 0 || layout.height <= 0) return false;
+
+    void* node_hwnd_raw = nullptr;
+    if (!wingui_native_try_get_node_hwnd(pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
+        return false;
+    }
+
+    const int32_t target_width = std::max(layout.width, 1);
+    const int32_t target_height = std::max(layout.height, 1);
+    const uint32_t required_surface_buffer_count =
+        pane.rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 1u : 2u;
+    if (pane.rgba_hwnd != node_hwnd_raw || !pane.rgba_context || !pane.pane_rgba_renderer ||
+        !pane.rgba_surface_handle || !pane.pane_vector_renderer ||
+        pane.rgba_surface_buffer_count != required_surface_buffer_count) {
+        destroyPaneRgbaPresenter(pane);
+
+        WinguiContextDesc context_desc{};
+        context_desc.hwnd = node_hwnd_raw;
+        context_desc.width = static_cast<uint32_t>(target_width);
+        context_desc.height = static_cast<uint32_t>(target_height);
+        context_desc.buffer_count = 2;
+        context_desc.vsync_interval = 1;
+        if (!wingui_create_context(&context_desc, &pane.rgba_context)) {
+            destroyPaneRgbaPresenter(pane);
+            return false;
+        }
+
+        WinguiRgbaPaneRendererDesc rgba_desc{};
+        rgba_desc.context = pane.rgba_context;
+        rgba_desc.shader_path_utf8 = kDefaultGraphicsShaderPath;
+        rgba_desc.buffer_count = 2;
+        if (!wingui_create_rgba_pane_renderer(&rgba_desc, &pane.pane_rgba_renderer)) {
+            destroyPaneRgbaPresenter(pane);
+            return false;
+        }
+
+        if (!wingui_create_rgba_surface(pane.rgba_context, required_surface_buffer_count, &pane.rgba_surface_handle)) {
+            destroyPaneRgbaPresenter(pane);
+            return false;
+        }
+
+        if (!wingui_create_vector_renderer(pane.rgba_context, nullptr, &pane.pane_vector_renderer)) {
+            destroyPaneRgbaPresenter(pane);
+            return false;
+        }
+        if (host->atlas.pixels_rgba && wingui_vector_renderer_set_glyph_atlas(pane.pane_vector_renderer, &host->atlas)) {
+            pane.pane_vector_renderer_atlas_set = 1;
+        }
+
+        pane.rgba_hwnd = node_hwnd_raw;
+        pane.rgba_surface_buffer_count = required_surface_buffer_count;
+    }
+
+    if (pane.pane_vector_renderer && !pane.pane_vector_renderer_atlas_set && host->atlas.pixels_rgba) {
+        if (wingui_vector_renderer_set_glyph_atlas(pane.pane_vector_renderer, &host->atlas)) {
+            pane.pane_vector_renderer_atlas_set = 1;
+        }
+    }
+
+    wingui_resize_context(pane.rgba_context, static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height));
+    pane.rgba_screen_width = static_cast<uint32_t>(target_width);
+    pane.rgba_screen_height = static_cast<uint32_t>(target_height);
+    pane.rgba_pixel_aspect_num = pane.rgba_pixel_aspect_num ? pane.rgba_pixel_aspect_num : 1u;
+    pane.rgba_pixel_aspect_den = pane.rgba_pixel_aspect_den ? pane.rgba_pixel_aspect_den : 1u;
+    return wingui_rgba_surface_ensure_buffers(
+        pane.rgba_surface_handle,
+        pane.rgba_screen_width,
+        pane.rgba_screen_height) != 0;
+}
+
+void resizeHostWindowToNativeContent(SuperTerminalRuntimeHost* host) {
+    if (!host || !host->window || !host->native_attached) return;
+
+    int32_t desired_client_width = 0;
+    int32_t desired_client_height = 0;
+    if (!wingui_native_get_content_size(&desired_client_width, &desired_client_height)) return;
+    if (desired_client_width <= 0 || desired_client_height <= 0) return;
+
+    int32_t current_client_width = 0;
+    int32_t current_client_height = 0;
+    if (!wingui_window_client_size(host->window, &current_client_width, &current_client_height)) return;
+    if (current_client_width == desired_client_width && current_client_height == desired_client_height) return;
+
+    HWND hwnd = static_cast<HWND>(wingui_window_hwnd(host->window));
+    if (!hwnd) return;
+
+    RECT target_rect{0, 0, desired_client_width, desired_client_height};
+    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    AdjustWindowRectEx(&target_rect, style, GetMenu(hwnd) != nullptr, ex_style);
+    const int window_width = (target_rect.right - target_rect.left) > 0 ? static_cast<int>(target_rect.right - target_rect.left) : 1;
+    const int window_height = (target_rect.bottom - target_rect.top) > 0 ? static_cast<int>(target_rect.bottom - target_rect.top) : 1;
+    SetWindowPos(hwnd,
+        nullptr,
+        0,
+        0,
+        window_width,
+        window_height,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 bool renderRgbaPane(SuperTerminalRuntimeHost* host,
-                    const RegisteredPane& pane,
+                    RegisteredPane& pane,
                     const SuperTerminalPaneLayout& layout,
                     uint32_t buffer_index) {
-    if (!host || !host->rgba_renderer || !pane.rgba_surface_handle) return true;
     if (layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
-    return wingui_rgba_surface_render(
-        host->rgba_renderer,
+    if (!ensurePaneRgbaPresenter(host, pane, layout)) return true;
+    const uint32_t pane_buffer_index =
+        pane.rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (buffer_index & 1u);
+    if (!wingui_begin_frame(pane.rgba_context, 0.0f, 0.0f, 0.0f, 1.0f)) return false;
+    const bool ok = wingui_rgba_surface_render(
+        pane.pane_rgba_renderer,
         pane.rgba_surface_handle,
-        layout.x,
-        layout.y,
+        0,
+        0,
         layout.width,
         layout.height,
         pane.rgba_screen_width,
         pane.rgba_screen_height,
         pane.rgba_pixel_aspect_num,
         pane.rgba_pixel_aspect_den,
-        buffer_index & 1u,
+        pane_buffer_index,
         nullptr) != 0;
+    if (!ok) return false;
+    return wingui_present(pane.rgba_context, 1) != 0;
 }
 
 bool renderSurface(SuperTerminalRuntimeHost* host) {
     if (!host || !host->context || !host->text_renderer) return false;
 
-    if (!wingui_begin_frame(host->context, 0.0f, 0.0f, 0.0f, 1.0f)) {
-        return false;
-    }
-
-    bool rendered_any = false;
+    bool parent_frame_started = false;
+    bool parent_rendered_any = false;
+    auto begin_parent_frame = [&]() -> bool {
+        if (parent_frame_started) return true;
+        if (!wingui_begin_frame(host->context, 0.0f, 0.0f, 0.0f, 1.0f)) {
+            return false;
+        }
+        parent_frame_started = true;
+        return true;
+    };
     const uint32_t display_buffer_index = host->display_buffer_index.load(std::memory_order_acquire) & 1u;
     std::vector<SuperTerminalPaneId> pane_ids;
     {
@@ -777,12 +968,13 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
                 if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
                     has_handle = pane->indexed_surface_handle != nullptr;
                     if (has_handle) {
+                        if (!begin_parent_frame()) return false;
                         ok = renderIndexedPane(host, *pane, layout, display_buffer_index);
                     }
                 }
             }
             if (!ok) return false;
-            rendered_any = rendered_any || has_handle;
+            parent_rendered_any = parent_rendered_any || has_handle;
             continue;
         }
 
@@ -799,12 +991,12 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
                 }
             }
             if (!ok) return false;
-            rendered_any = rendered_any || has_handle;
             continue;
         }
 
         TerminalSurface* surface = textGridSurfaceForPaneBuffer(host, pane_id, false, display_buffer_index);
         if (!surface) continue;
+        if (!begin_parent_frame()) return false;
         if ((surface->columns != layout.columns || surface->rows != layout.rows) && layout.columns > 0 && layout.rows > 0) {
             std::lock_guard<std::mutex> lock(host->pane_mutex);
             if (BufferedTerminalSurface* surface_set = textGridSurfaceSetForPaneLocked(host, pane_id, false)) {
@@ -815,10 +1007,11 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
         if (!renderTextGridSurface(host, surface, layout)) {
             return false;
         }
-        rendered_any = true;
+        parent_rendered_any = true;
     }
 
-    if (!rendered_any) {
+    if (!parent_rendered_any && !host->native_attached) {
+        if (!begin_parent_frame()) return false;
         SuperTerminalPaneLayout root_layout{};
         if (!resolvePaneLayout(host, SuperTerminalPaneId{}, &root_layout)) {
             return false;
@@ -834,8 +1027,14 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
         }
     }
 
-    if (!wingui_present(host->context, 1)) {
-        return false;
+    if (parent_frame_started) {
+        if (!wingui_present(host->context, 1)) {
+            return false;
+        }
+        if (HWND native_hwnd = static_cast<HWND>(wingui_native_host_hwnd())) {
+            SetWindowPos(native_hwnd, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
     }
     host->render_dirty.store(0, std::memory_order_release);
     return true;
@@ -855,15 +1054,20 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
     switch (command.type) {
         case SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH:
             if (command.data.native_ui_publish.json_utf8) {
-                wingui_native_publish_json(command.data.native_ui_publish.json_utf8);
+                if (!wingui_native_publish_json(command.data.native_ui_publish.json_utf8)) {
+                }
                 wingui_native_host_run();
+                resizeHostWindowToNativeContent(host);
                 syncActivePaneFromDeclarativeFocus(host);
+                free(const_cast<char*>(command.data.native_ui_publish.json_utf8));
             }
             break;
         case SUPERTERMINAL_CMD_NATIVE_UI_PATCH:
             if (command.data.native_ui_patch.patch_json_utf8) {
-                wingui_native_patch_json(command.data.native_ui_patch.patch_json_utf8);
+                if (!wingui_native_patch_json(command.data.native_ui_patch.patch_json_utf8)) {
+                }
                 syncActivePaneFromDeclarativeFocus(host);
+                free(const_cast<char*>(command.data.native_ui_patch.patch_json_utf8));
             }
             break;
         case SUPERTERMINAL_CMD_WINDOW_SET_TITLE:
@@ -1068,6 +1272,283 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
             free_one(owned_global);
             break;
         }
+        case SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED: {
+            const SuperTerminalSpriteDefineOwned& def = command.data.sprite_define_owned;
+            void* owned_pixels = def.pixels;
+            void* owned_palette = def.palette;
+            auto free_blobs = [&]() {
+                if (def.free_fn) {
+                    if (owned_pixels) def.free_fn(def.free_user_data, owned_pixels);
+                    if (owned_palette) def.free_fn(def.free_user_data, owned_palette);
+                } else {
+                    delete[] static_cast<uint8_t*>(owned_pixels);
+                    delete[] static_cast<uint8_t*>(owned_palette);
+                }
+            };
+            if (host->indexed_renderer && def.pane_id.value != 0 && def.sprite_id.value != 0 &&
+                owned_pixels && owned_palette && def.frame_w > 0 && def.frame_h > 0 && def.frame_count > 0) {
+                const uint32_t strip_w = def.frame_w * def.frame_count;
+                uint32_t atlas_x = 0, atlas_y = 0;
+                SpriteBankEntry* existing = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(host->pane_mutex);
+                    RegisteredPane* pane = ensureRegisteredPaneLocked(host, def.pane_id);
+                    if (pane) {
+                        for (SpriteBankEntry& e : pane->sprite_bank) {
+                            if (e.sprite_id == def.sprite_id.value) { existing = &e; break; }
+                        }
+                        if (!existing) {
+                            pane->sprite_bank.push_back(SpriteBankEntry{});
+                            existing = &pane->sprite_bank.back();
+                            existing->sprite_id = def.sprite_id.value;
+                        }
+                        /* Reuse existing atlas region if same dimensions, else allocate new. */
+                        if (!existing->uploaded ||
+                            existing->atlas_entry.frame_w != def.frame_w ||
+                            existing->atlas_entry.frame_h != def.frame_h ||
+                            existing->atlas_entry.frame_count != def.frame_count) {
+                            if (!host->sprite_atlas_packer.alloc(strip_w, def.frame_h, atlas_x, atlas_y)) {
+                                existing = nullptr; /* atlas full */
+                            } else {
+                                existing->atlas_entry.atlas_x = atlas_x;
+                                existing->atlas_entry.atlas_y = atlas_y;
+                                existing->atlas_entry.width = strip_w;
+                                existing->atlas_entry.height = def.frame_h;
+                                existing->atlas_entry.frame_w = def.frame_w;
+                                existing->atlas_entry.frame_h = def.frame_h;
+                                existing->atlas_entry.frame_count = def.frame_count;
+                                /* palette row = index into sprite_bank */
+                                existing->atlas_entry.palette_offset = static_cast<uint32_t>(
+                                    existing - pane->sprite_bank.data());
+                                existing->frames_per_tick = def.frames_per_tick;
+                                existing->uploaded = false;
+                            }
+                        } else {
+                            existing->frames_per_tick = def.frames_per_tick;
+                            atlas_x = existing->atlas_entry.atlas_x;
+                            atlas_y = existing->atlas_entry.atlas_y;
+                        }
+                    }
+                }
+                if (existing) {
+                    wingui_indexed_graphics_upload_sprite_atlas_region(
+                        host->indexed_renderer,
+                        atlas_x, atlas_y,
+                        strip_w, def.frame_h,
+                        static_cast<const uint8_t*>(owned_pixels),
+                        strip_w);
+                    WinguiGraphicsLinePalette palette_row = *static_cast<const WinguiGraphicsLinePalette*>(owned_palette);
+                    wingui_indexed_graphics_upload_sprite_palettes(
+                        host->indexed_renderer, &palette_row, 1);
+                    {
+                        std::lock_guard<std::mutex> lock(host->pane_mutex);
+                        if (RegisteredPane* pane = registeredPaneForIdLocked(host, def.pane_id, false)) {
+                            for (SpriteBankEntry& e : pane->sprite_bank) {
+                                if (e.sprite_id == def.sprite_id.value) { e.uploaded = true; break; }
+                            }
+                        }
+                    }
+                }
+            }
+            free_blobs();
+            break;
+        }
+        case SUPERTERMINAL_CMD_SPRITE_RENDER: {
+            const SuperTerminalSpriteRender& sr = command.data.sprite_render;
+            void* owned_instances = sr.instances;
+            if (host->indexed_renderer && sr.pane_id.value != 0 && owned_instances && sr.instance_count > 0) {
+                SuperTerminalPaneLayout layout{};
+                std::vector<WinguiSpriteAtlasEntry> atlas_entries;
+                std::vector<WinguiSpriteInstance> wingui_instances;
+                {
+                    std::lock_guard<std::mutex> lock(host->pane_mutex);
+                    RegisteredPane* pane = registeredPaneForIdLocked(host, sr.pane_id, false);
+                    if (pane && !pane->sprite_bank.empty()) {
+                        /* Build a contiguous atlas_entries table indexed by sprite_bank index.
+                           Build wingui instance list resolving sprite_id → atlas_entry_id. */
+                        atlas_entries.resize(pane->sprite_bank.size());
+                        for (size_t i = 0; i < pane->sprite_bank.size(); ++i) {
+                            atlas_entries[i] = pane->sprite_bank[i].atlas_entry;
+                        }
+                        const auto* src = static_cast<const SuperTerminalSpriteInstance*>(owned_instances);
+                        wingui_instances.reserve(sr.instance_count);
+                        for (uint32_t i = 0; i < sr.instance_count; ++i) {
+                            const SuperTerminalSpriteInstance& si = src[i];
+                            if (!si.sprite_id.value) continue;
+                            uint32_t bank_idx = UINT32_MAX;
+                            uint32_t frames_per_tick = 0;
+                            for (size_t j = 0; j < pane->sprite_bank.size(); ++j) {
+                                if (pane->sprite_bank[j].sprite_id == si.sprite_id.value &&
+                                    pane->sprite_bank[j].uploaded) {
+                                    bank_idx = static_cast<uint32_t>(j);
+                                    frames_per_tick = pane->sprite_bank[j].frames_per_tick;
+                                    break;
+                                }
+                            }
+                            if (bank_idx == UINT32_MAX) continue;
+                            WinguiSpriteInstance wi{};
+                            wi.x = si.x;
+                            wi.y = si.y;
+                            wi.rotation = si.rotation;
+                            wi.scale_x = si.scale_x > 0.0f ? si.scale_x : 1.0f;
+                            wi.scale_y = si.scale_y > 0.0f ? si.scale_y : 1.0f;
+                            wi.anchor_x = si.anchor_x;
+                            wi.anchor_y = si.anchor_y;
+                            wi.atlas_entry_id = bank_idx;
+                            wi.frame = (frames_per_tick > 0)
+                                ? static_cast<uint32_t>(sr.sprite_tick / frames_per_tick)
+                                : 0u;
+                            wi.flags = si.flags | WINGUI_SPRITE_FLAG_VISIBLE;
+                            wi.alpha = si.alpha > 0.0f ? si.alpha : 1.0f;
+                            wi.effect_type = si.effect_type;
+                            wi.effect_param1 = si.effect_param1;
+                            wi.effect_param2 = si.effect_param2;
+                            std::memcpy(wi.effect_colour, si.effect_colour, 4);
+                            wi.palette_override = si.palette_override;
+                            wingui_instances.push_back(wi);
+                        }
+                    }
+                    resolvePaneLayout(host, sr.pane_id, &layout);
+                }
+                if (!wingui_instances.empty() && !atlas_entries.empty()) {
+                    const uint32_t tw = sr.target_width ? sr.target_width : static_cast<uint32_t>(std::max(0, layout.width));
+                    const uint32_t th = sr.target_height ? sr.target_height : static_cast<uint32_t>(std::max(0, layout.height));
+                    WinguiIndexedPaneLayout pane_layout{};
+                    pane_layout.origin_x = static_cast<float>(layout.x);
+                    pane_layout.origin_y = static_cast<float>(layout.y);
+                    pane_layout.shown_width = static_cast<float>(layout.width);
+                    pane_layout.shown_height = static_cast<float>(layout.height);
+                    pane_layout.scale_x = tw > 0 ? static_cast<float>(layout.width) / static_cast<float>(tw) : 1.0f;
+                    pane_layout.scale_y = th > 0 ? static_cast<float>(layout.height) / static_cast<float>(th) : 1.0f;
+                    wingui_indexed_graphics_render_sprites(
+                        host->indexed_renderer,
+                        tw, th,
+                        &pane_layout,
+                        atlas_entries.data(),
+                        static_cast<uint32_t>(atlas_entries.size()),
+                        wingui_instances.data(),
+                        static_cast<uint32_t>(wingui_instances.size()));
+                    host->render_dirty.store(1, std::memory_order_release);
+                }
+            }
+            if (owned_instances) {
+                if (sr.free_fn) sr.free_fn(sr.free_user_data, owned_instances);
+                else delete[] static_cast<uint8_t*>(owned_instances);
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED: {
+            const SuperTerminalVectorDrawOwned& vd = command.data.vector_draw_owned;
+            void* owned_prims = vd.primitives;
+            auto free_prims = [&]() {
+                if (!owned_prims) return;
+                if (vd.free_fn) vd.free_fn(vd.free_user_data, owned_prims);
+                else delete[] static_cast<uint8_t*>(owned_prims);
+            };
+            if (!host->context || vd.pane_id.value == 0) { free_prims(); break; }
+
+            WinguiRgbaSurface* surface = nullptr;
+            uint32_t surface_w = 0;
+            uint32_t surface_h = 0;
+            uint32_t target_buffer_index = 0;
+            SuperTerminalPaneLayout layout{};
+            resolvePaneLayout(host, vd.pane_id, &layout);
+            WinguiVectorRenderer* vector_renderer = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                RegisteredPane* pane = ensureRegisteredPaneLocked(host, vd.pane_id);
+                if (pane) {
+                    pane->render_kind = PANE_RENDER_RGBA;
+                    pane->rgba_content_buffer_mode = vd.content_buffer_mode;
+                    if (ensurePaneRgbaPresenter(host, *pane, layout)) {
+                        surface = pane->rgba_surface_handle;
+                        surface_w = pane->rgba_screen_width;
+                        surface_h = pane->rgba_screen_height;
+                        vector_renderer = pane->pane_vector_renderer;
+                        target_buffer_index =
+                            pane->rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (vd.buffer_index & 1u);
+                    }
+                }
+            }
+            if (!surface) {
+                free_prims();
+                break;
+            }
+
+            if (surface_w == 0 || surface_h == 0) {
+                free_prims();
+                break;
+            }
+            if (!vector_renderer) { free_prims(); break; }
+
+            if (vd.clear_before) {
+                wingui_rgba_surface_clear(
+                    surface, target_buffer_index,
+                    vd.clear_color[0], vd.clear_color[1],
+                    vd.clear_color[2], vd.clear_color[3]);
+            }
+            if (vd.primitive_count > 0 && owned_prims) {
+                wingui_vector_renderer_render(
+                    vector_renderer,
+                    surface,
+                    target_buffer_index,
+                    static_cast<const WinguiVectorPrimitive*>(owned_prims),
+                    vd.primitive_count,
+                    vd.blend_mode);
+            }
+            host->render_dirty.store(1, std::memory_order_release);
+            free_prims();
+            break;
+        }
+        case SUPERTERMINAL_CMD_INDEXED_FILL_RECT: {
+            const SuperTerminalIndexedFillRect& fr = command.data.indexed_fill_rect;
+            if (!host->context || fr.pane_id.value == 0 || fr.width == 0 || fr.height == 0) break;
+
+            WinguiIndexedSurface* surface = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                RegisteredPane* pane = registeredPaneForIdLocked(host, fr.pane_id, false);
+                if (pane) surface = pane->indexed_surface_handle;
+            }
+            if (!surface) break;
+
+            /* Lazy-create the fill renderer */
+            if (!host->indexed_fill_renderer && !host->indexed_fill_renderer_init_attempted) {
+                host->indexed_fill_renderer_init_attempted = 1;
+                wingui_create_indexed_fill_renderer(host->context, nullptr, &host->indexed_fill_renderer);
+            }
+            if (!host->indexed_fill_renderer) break;
+
+            wingui_indexed_surface_fill_rect(
+                host->indexed_fill_renderer, surface,
+                fr.buffer_index, fr.x, fr.y, fr.width, fr.height, fr.palette_index);
+            host->render_dirty.store(1, std::memory_order_release);
+            break;
+        }
+        case SUPERTERMINAL_CMD_INDEXED_DRAW_LINE: {
+            const SuperTerminalIndexedDrawLine& ln = command.data.indexed_draw_line;
+            if (!host->context || ln.pane_id.value == 0) break;
+
+            WinguiIndexedSurface* surface = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                RegisteredPane* pane = registeredPaneForIdLocked(host, ln.pane_id, false);
+                if (pane) surface = pane->indexed_surface_handle;
+            }
+            if (!surface) break;
+
+            if (!host->indexed_fill_renderer && !host->indexed_fill_renderer_init_attempted) {
+                host->indexed_fill_renderer_init_attempted = 1;
+                wingui_create_indexed_fill_renderer(host->context, nullptr, &host->indexed_fill_renderer);
+            }
+            if (!host->indexed_fill_renderer) break;
+
+            wingui_indexed_surface_draw_line(
+                host->indexed_fill_renderer, surface,
+                ln.buffer_index, ln.x0, ln.y0, ln.x1, ln.y1, ln.palette_index);
+            host->render_dirty.store(1, std::memory_order_release);
+            break;
+        }
         case SUPERTERMINAL_CMD_NOP:
         default:
             break;
@@ -1120,6 +1601,10 @@ intptr_t WINGUI_CALL hostWindowProc(
                 const uint32_t height = static_cast<uint32_t>(HIWORD(lparam));
                 wingui_resize_context(host->context, width, height);
                 wingui_native_set_host_bounds(0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height));
+                if (HWND native_hwnd = static_cast<HWND>(wingui_native_host_hwnd())) {
+                    SetWindowPos(native_hwnd, HWND_TOP, 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height),
+                        SWP_SHOWWINDOW);
+                }
                 updateSurfaceForClientSize(host);
             }
             break;
@@ -1303,6 +1788,7 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
         setHostError(host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
         return false;
     }
+    host->sprite_atlas_packer.init(indexed_desc.sprite_atlas_size ? indexed_desc.sprite_atlas_size : 2048u);
 
     WinguiRgbaPaneRendererDesc rgba_desc{};
     rgba_desc.context = host->context;
@@ -1323,7 +1809,7 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
     native_desc.y = 0;
     native_desc.width = client_width;
     native_desc.height = client_height;
-    native_desc.visible = 0;
+    native_desc.visible = 1;
     if (!wingui_native_attach_embedded_host(&native_desc)) {
         setHostError(host, SUPERTERMINAL_HOST_ERROR_NATIVE_UI_ATTACH, wingui_native_last_error_utf8());
         return false;
@@ -1372,6 +1858,27 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
                 free_one(up.indexed_pixels);
                 free_one(up.line_palettes);
                 free_one(up.global_palette);
+            } else if (leftover.type == SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED) {
+                const auto& def = leftover.data.sprite_define_owned;
+                auto free_blob = [&](void* p) {
+                    if (!p) return;
+                    if (def.free_fn) def.free_fn(def.free_user_data, p);
+                    else delete[] static_cast<uint8_t*>(p);
+                };
+                free_blob(def.pixels);
+                free_blob(def.palette);
+            } else if (leftover.type == SUPERTERMINAL_CMD_SPRITE_RENDER) {
+                const auto& sr = leftover.data.sprite_render;
+                if (sr.instances) {
+                    if (sr.free_fn) sr.free_fn(sr.free_user_data, sr.instances);
+                    else delete[] static_cast<uint8_t*>(sr.instances);
+                }
+            } else if (leftover.type == SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED) {
+                const auto& vd = leftover.data.vector_draw_owned;
+                if (vd.primitives) {
+                    if (vd.free_fn) vd.free_fn(vd.free_user_data, vd.primitives);
+                    else delete[] static_cast<uint8_t*>(vd.primitives);
+                }
             }
         }
     }
@@ -1386,8 +1893,7 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
         std::lock_guard<std::mutex> lock(host->pane_mutex);
         for (RegisteredPane& pane : host->panes) {
             if (pane.rgba_surface_handle) {
-                wingui_destroy_rgba_surface(pane.rgba_surface_handle);
-                pane.rgba_surface_handle = nullptr;
+                destroyPaneRgbaPresenter(pane);
             }
             if (pane.indexed_surface_handle) {
                 wingui_destroy_indexed_surface(pane.indexed_surface_handle);
@@ -1398,6 +1904,14 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
     if (host->rgba_renderer) {
         wingui_destroy_rgba_pane_renderer(host->rgba_renderer);
         host->rgba_renderer = nullptr;
+    }
+    if (host->vector_renderer) {
+        wingui_destroy_vector_renderer(host->vector_renderer);
+        host->vector_renderer = nullptr;
+    }
+    if (host->indexed_fill_renderer) {
+        wingui_destroy_indexed_fill_renderer(host->indexed_fill_renderer);
+        host->indexed_fill_renderer = nullptr;
     }
     if (host->indexed_renderer) {
         wingui_destroy_indexed_graphics_renderer(host->indexed_renderer);
@@ -1858,10 +2372,17 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json(
         wingui_set_last_error_string_internal("super_terminal_publish_ui_json: invalid arguments");
         return 0;
     }
+    char* owned = _strdup(json_utf8);
+    if (!owned) {
+        wingui_set_last_error_string_internal("super_terminal_publish_ui_json: out of memory");
+        return 0;
+    }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH;
-    command.data.native_ui_publish.json_utf8 = json_utf8;
-    return super_terminal_enqueue(ctx, &command);
+    command.data.native_ui_publish.json_utf8 = owned;
+    const int32_t result = super_terminal_enqueue(ctx, &command);
+    if (!result) free(owned);
+    return result;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
@@ -1871,10 +2392,17 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
         wingui_set_last_error_string_internal("super_terminal_patch_ui_json: invalid arguments");
         return 0;
     }
+    char* owned = _strdup(patch_json_utf8);
+    if (!owned) {
+        wingui_set_last_error_string_internal("super_terminal_patch_ui_json: out of memory");
+        return 0;
+    }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_NATIVE_UI_PATCH;
-    command.data.native_ui_patch.patch_json_utf8 = patch_json_utf8;
-    return super_terminal_enqueue(ctx, &command);
+    command.data.native_ui_patch.patch_json_utf8 = owned;
+    const int32_t result = super_terminal_enqueue(ctx, &command);
+    if (!result) free(owned);
+    return result;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_set_title_utf8(
@@ -2112,6 +2640,221 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_request_present(
     SuperTerminalClientContext* ctx) {
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_REQUEST_PRESENT;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_define_sprite(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    SuperTerminalSpriteId sprite_id,
+    uint32_t frame_w,
+    uint32_t frame_h,
+    uint32_t frame_count,
+    uint32_t frames_per_tick,
+    void* pixels,
+    void* palette,
+    SuperTerminalFreeFn free_fn,
+    void* free_user_data) {
+    if (!ctx || !ctx->host || !pane_id.value || !sprite_id.value ||
+        !frame_w || !frame_h || !frame_count || !pixels || !palette) {
+        wingui_set_last_error_string_internal("super_terminal_define_sprite: invalid arguments");
+        return 0;
+    }
+    /* Copy pixel strip and palette into owned blobs so caller can free immediately. */
+    const size_t pixel_bytes = static_cast<size_t>(frame_w) * frame_count * frame_h;
+    uint8_t* owned_pixels = new (std::nothrow) uint8_t[pixel_bytes];
+    uint8_t* owned_palette = new (std::nothrow) uint8_t[sizeof(WinguiGraphicsLinePalette)];
+    if (!owned_pixels || !owned_palette) {
+        delete[] owned_pixels;
+        delete[] owned_palette;
+        /* Free caller's buffers via provided free_fn */
+        if (free_fn) { free_fn(free_user_data, pixels); free_fn(free_user_data, palette); }
+        else { delete[] static_cast<uint8_t*>(pixels); delete[] static_cast<uint8_t*>(palette); }
+        wingui_set_last_error_string_internal("super_terminal_define_sprite: out of memory");
+        return 0;
+    }
+    std::memcpy(owned_pixels, pixels, pixel_bytes);
+    std::memcpy(owned_palette, palette, sizeof(WinguiGraphicsLinePalette));
+    /* Free caller's original buffers now that we've copied */
+    if (free_fn) { free_fn(free_user_data, pixels); free_fn(free_user_data, palette); }
+    else { delete[] static_cast<uint8_t*>(pixels); delete[] static_cast<uint8_t*>(palette); }
+
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED;
+    SuperTerminalSpriteDefineOwned& def = command.data.sprite_define_owned;
+    def.pane_id = pane_id;
+    def.sprite_id = sprite_id;
+    def.frame_w = frame_w;
+    def.frame_h = frame_h;
+    def.frame_count = frame_count;
+    def.frames_per_tick = frames_per_tick;
+    def.pixels = owned_pixels;
+    def.palette = owned_palette;
+    def.free_fn = nullptr;
+    def.free_user_data = nullptr;
+    if (!super_terminal_enqueue(ctx, &command)) {
+        delete[] owned_pixels;
+        delete[] owned_palette;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_render_sprites(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint64_t sprite_tick,
+    uint32_t target_width,
+    uint32_t target_height,
+    const SuperTerminalSpriteInstance* instances,
+    uint32_t instance_count) {
+    if (!ctx || !ctx->host || !pane_id.value || !instances || !instance_count) {
+        wingui_set_last_error_string_internal("super_terminal_render_sprites: invalid arguments");
+        return 0;
+    }
+    const size_t bytes = static_cast<size_t>(instance_count) * sizeof(SuperTerminalSpriteInstance);
+    uint8_t* owned = new (std::nothrow) uint8_t[bytes];
+    if (!owned) {
+        wingui_set_last_error_string_internal("super_terminal_render_sprites: out of memory");
+        return 0;
+    }
+    std::memcpy(owned, instances, bytes);
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SPRITE_RENDER;
+    SuperTerminalSpriteRender& sr = command.data.sprite_render;
+    sr.pane_id = pane_id;
+    sr.sprite_tick = sprite_tick;
+    sr.target_width = target_width;
+    sr.target_height = target_height;
+    sr.instances = owned;
+    sr.instance_count = instance_count;
+    sr.free_fn = nullptr;
+    sr.free_user_data = nullptr;
+    if (!super_terminal_enqueue(ctx, &command)) {
+        delete[] owned;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_glyph_atlas_info(
+    SuperTerminalClientContext* ctx,
+    WinguiGlyphAtlasInfo* out_info) {
+    if (!ctx || !ctx->host || !out_info) {
+        wingui_set_last_error_string_internal("super_terminal_get_glyph_atlas_info: invalid arguments");
+        return 0;
+    }
+    if (!ctx->host->atlas.pixels_rgba) {
+        wingui_set_last_error_string_internal("super_terminal_get_glyph_atlas_info: atlas not built");
+        return 0;
+    }
+    *out_info = ctx->host->atlas.info;
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_vector_draw(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const WinguiVectorPrimitive* primitives,
+    uint32_t primitive_count) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_vector_draw: invalid arguments");
+        return 0;
+    }
+    if (primitive_count > 0 && !primitives) {
+        wingui_set_last_error_string_internal("super_terminal_vector_draw: null primitives");
+        return 0;
+    }
+    uint8_t* owned = nullptr;
+    if (primitive_count > 0) {
+        const size_t bytes = static_cast<size_t>(primitive_count) * sizeof(WinguiVectorPrimitive);
+        owned = new (std::nothrow) uint8_t[bytes];
+        if (!owned) {
+            wingui_set_last_error_string_internal("super_terminal_vector_draw: out of memory");
+            return 0;
+        }
+        std::memcpy(owned, primitives, bytes);
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED;
+    SuperTerminalVectorDrawOwned& vd = command.data.vector_draw_owned;
+    vd.pane_id = pane_id;
+    vd.buffer_index = buffer_index;
+    vd.content_buffer_mode = content_buffer_mode;
+    vd.blend_mode = blend_mode;
+    vd.clear_before = clear_before;
+    if (clear_color_rgba) {
+        vd.clear_color[0] = clear_color_rgba[0];
+        vd.clear_color[1] = clear_color_rgba[1];
+        vd.clear_color[2] = clear_color_rgba[2];
+        vd.clear_color[3] = clear_color_rgba[3];
+    }
+    vd.primitives = owned;
+    vd.primitive_count = primitive_count;
+    vd.free_fn = nullptr;
+    vd.free_user_data = nullptr;
+    if (!super_terminal_enqueue(ctx, &command)) {
+        delete[] owned;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_indexed_fill_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    uint32_t palette_index) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_indexed_fill_rect: invalid arguments");
+        return 0;
+    }
+    if (width == 0 || height == 0) return 1;  // nothing to draw
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_INDEXED_FILL_RECT;
+    SuperTerminalIndexedFillRect& fr = command.data.indexed_fill_rect;
+    fr.pane_id = pane_id;
+    fr.buffer_index = buffer_index;
+    fr.x = x;
+    fr.y = y;
+    fr.width = width;
+    fr.height = height;
+    fr.palette_index = palette_index;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_indexed_draw_line(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1,
+    uint32_t palette_index) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_indexed_draw_line: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_INDEXED_DRAW_LINE;
+    SuperTerminalIndexedDrawLine& ln = command.data.indexed_draw_line;
+    ln.pane_id = pane_id;
+    ln.buffer_index = buffer_index;
+    ln.x0 = x0;
+    ln.y0 = y0;
+    ln.x1 = x1;
+    ln.y1 = y1;
+    ln.palette_index = palette_index;
     return super_terminal_enqueue(ctx, &command);
 }
 

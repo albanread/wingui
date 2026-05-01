@@ -28,6 +28,8 @@ typedef struct WinguiRgbaPaneRenderer WinguiRgbaPaneRenderer;
 typedef struct WinguiRgbaSurface WinguiRgbaSurface;
 typedef struct WinguiRgbaBlitter WinguiRgbaBlitter;
 typedef struct WinguiIndexedSurface WinguiIndexedSurface;
+typedef struct WinguiVectorRenderer WinguiVectorRenderer;
+typedef struct WinguiIndexedFillRenderer WinguiIndexedFillRenderer;
 
 typedef enum WinguiRgbaBlitMode {
     WINGUI_RGBA_BLIT_OPAQUE = 0,
@@ -412,6 +414,39 @@ WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_render(
     uint32_t pixel_aspect_den,
     uint32_t buffer_index,
     WinguiIndexedPaneLayout* out_layout);
+
+/* Compute-shader fill operations into an indexed surface (palette indices, not RGBA). */
+WINGUI_API int32_t WINGUI_CALL wingui_create_indexed_fill_renderer(
+    WinguiContext* context,
+    const char* shader_path_utf8,    /* NULL → "shaders/indexed_fill.hlsl" */
+    WinguiIndexedFillRenderer** out_renderer);
+WINGUI_API void WINGUI_CALL wingui_destroy_indexed_fill_renderer(WinguiIndexedFillRenderer* renderer);
+/* Fill an axis-aligned rectangle in a surface buffer with a single palette index.
+   The surface must have been sized via wingui_indexed_surface_ensure_buffers first.
+   palette_index 0 = transparent. */
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_fill_rect(
+    WinguiIndexedFillRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height,
+    uint32_t palette_index);
+/* Draw a 1-pixel-wide line between two points using compute shader DDA.
+   Coordinates may extend outside the surface — out-of-bounds threads are harmless
+   (R8_UINT UAV writes outside texture bounds are silently discarded by D3D11).
+   palette_index 0 = transparent. */
+WINGUI_API int32_t WINGUI_CALL wingui_indexed_surface_draw_line(
+    WinguiIndexedFillRenderer* renderer,
+    WinguiIndexedSurface* surface,
+    uint32_t buffer_index,
+    int32_t x0,
+    int32_t y0,
+    int32_t x1,
+    int32_t y1,
+    uint32_t palette_index);
+
 WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_upload_sprite_atlas_region(
     WinguiIndexedGraphicsRenderer* renderer,
     uint32_t atlas_x,
@@ -584,6 +619,107 @@ WINGUI_API int32_t WINGUI_CALL wingui_indexed_graphics_load_image_into_sprite_at
     uint32_t atlas_x,
     uint32_t atlas_y,
     const char* path_utf8);
+
+/* GPU anti-aliased vector primitives + glyph text rendering into an RGBA surface. */
+typedef enum WinguiVectorShape {
+    WINGUI_VECTOR_RECT_FILLED    = 0,
+    WINGUI_VECTOR_RECT_STROKED   = 1,
+    WINGUI_VECTOR_LINE           = 2,
+    WINGUI_VECTOR_CIRCLE_FILLED  = 3,
+    WINGUI_VECTOR_CIRCLE_STROKED = 4,
+    WINGUI_VECTOR_ARC            = 5,
+    WINGUI_VECTOR_GLYPH          = 6,
+} WinguiVectorShape;
+
+typedef struct WinguiVectorPrimitive {
+    /* Axis-aligned bounding box in surface pixel space (origin top-left).
+       Must enclose the visible footprint of the shape. */
+    float bounds_min_x;
+    float bounds_min_y;
+    float bounds_max_x;
+    float bounds_max_y;
+    /* Shape-specific parameters. See WinguiVectorShape comments below. */
+    float param0[4];
+    float param1[4];
+    /* Linear RGBA in 0..1. Applied as straight alpha; coverage multiplies alpha. */
+    float color[4];
+    uint32_t shape;          /* WinguiVectorShape */
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} WinguiVectorPrimitive;
+/* Parameter encoding:
+   RECT_FILLED      param0 = (corner_radius, _, _, _)
+   RECT_STROKED     param0 = (corner_radius, half_stroke, _, _)
+   LINE             param0 = (p0x, p0y, p1x, p1y)            param1.x = half_thickness
+   CIRCLE_FILLED    param0 = (cx, cy, radius, _)
+   CIRCLE_STROKED   param0 = (cx, cy, radius, half_stroke)
+   ARC              param0 = (cx, cy, radius, half_stroke)   param1 = (rotation_rad, half_aperture_rad, _, _)
+                    The arc opens symmetrically around the +Y axis after rotation.
+   GLYPH            param0 = (uv_min_x, uv_min_y, uv_max_x, uv_max_y) */
+
+WINGUI_API int32_t WINGUI_CALL wingui_create_vector_renderer(
+    WinguiContext* context,
+    const char* shader_path_utf8,
+    WinguiVectorRenderer** out_renderer);
+WINGUI_API void WINGUI_CALL wingui_destroy_vector_renderer(WinguiVectorRenderer* renderer);
+WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_set_glyph_atlas(
+    WinguiVectorRenderer* renderer,
+    const WinguiGlyphAtlasBitmap* atlas);
+WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_glyph_atlas_info(
+    WinguiVectorRenderer* renderer,
+    WinguiGlyphAtlasInfo* out_info);
+/* Helper: append glyph primitives for a UTF-8 string to a primitive array.
+   Lays out left-to-right starting at (origin_x, origin_y) (top of the cell row).
+   The renderer's glyph atlas must have been set first.
+   On entry *io_count is the current array length; on exit it is the new length.
+   capacity is the maximum number of primitives the array can hold (including existing).
+   Returns 1 on success, 0 if the array is full or the atlas is missing. */
+WINGUI_API int32_t WINGUI_CALL wingui_vector_text_layout_utf8(
+    WinguiVectorRenderer* renderer,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    WinguiVectorPrimitive* primitives,
+    uint32_t* io_count,
+    uint32_t capacity);
+/* Stateless variant that takes the atlas info directly. Useful from threads
+   that do not have access to the GPU renderer. */
+WINGUI_API int32_t WINGUI_CALL wingui_text_layout_with_atlas_info_utf8(
+    const WinguiGlyphAtlasInfo* atlas_info,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    WinguiVectorPrimitive* primitives,
+    uint32_t* io_count,
+    uint32_t capacity);
+/* Render primitives into a buffer of an RGBA surface. The surface must have been
+   created via wingui_create_rgba_surface (its buffers carry RTVs).
+   blend_mode: WINGUI_RGBA_BLIT_OPAQUE replaces the destination, ALPHA_OVER composites. */
+WINGUI_API int32_t WINGUI_CALL wingui_vector_renderer_render(
+    WinguiVectorRenderer* renderer,
+    WinguiRgbaSurface* dst_surface,
+    uint32_t dst_buffer_index,
+    const WinguiVectorPrimitive* primitives,
+    uint32_t primitive_count,
+    uint32_t blend_mode);
+/* Fill an entire RGBA surface buffer with a solid colour. Handy companion to
+   the vector renderer for clearing before drawing. */
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_clear(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
 
 WINGUI_API int32_t WINGUI_CALL wingui_audio_init(void);
 WINGUI_API void WINGUI_CALL wingui_audio_shutdown(void);

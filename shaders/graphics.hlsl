@@ -73,8 +73,8 @@ float4 graphics_fragment(GraphicsVSOutput input) : SV_TARGET {
     const int src_y = wrap_graphics_coord((int)display_pos.y + scroll_y, buffer_height);
     const uint index = graphics_indexed_texture.Load(int3(src_x, src_y, 0)).r;
 
-    if (index <= 1) {
-        return float4(0.0, 0.0, 0.0, 1.0);
+    if (index == 0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
     }
     if (index < 16) {
         const int palette_y = min((int)display_pos.y, max((int)buffer_height - 1, 0));
