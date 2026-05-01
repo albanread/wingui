@@ -165,17 +165,79 @@ std::string state_summary(const std::string& name,
     return summary;
 }
 
+std::string reconcile_mode_text(wingui::UiModel::ReconcileMode mode) {
+    switch (mode) {
+    case wingui::UiModel::ReconcileMode::None:
+        return "none";
+    case wingui::UiModel::ReconcileMode::FullPublishInitial:
+        return "full-initial";
+    case wingui::UiModel::ReconcileMode::FullPublishDiffFallback:
+        return "full-diff-fallback";
+    case wingui::UiModel::ReconcileMode::FullPublishNoPatchTransport:
+        return "full-no-patch-transport";
+    case wingui::UiModel::ReconcileMode::Patch:
+        return "patch";
+    case wingui::UiModel::ReconcileMode::NoChange:
+        return "no-change";
+    case wingui::UiModel::ReconcileMode::PublishFailed:
+        return "publish-failed";
+    case wingui::UiModel::ReconcileMode::PatchFailed:
+        return "patch-failed";
+    }
+    return "unknown";
+}
+
+std::string patch_diagnostics_summary(const wingui::UiModel& model,
+                                      const SuperTerminalNativeUiPatchMetrics& native_metrics) {
+    char buffer[768];
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "Model mode: %s\n"
+                  "Model patch ops: %zu\n"
+                  "Model full publishes: %llu\n"
+                  "Model patch sends: %llu\n"
+                  "Model diff fallbacks: %llu\n"
+                  "Model no-change: %llu\n"
+                  "Model publish failures: %llu\n"
+                  "Model patch failures: %llu\n"
+                  "Native publish count: %llu\n"
+                  "Native patch requests: %llu\n"
+                  "Native direct apply: %llu\n"
+                  "Native subtree rebuilds: %llu\n"
+                  "Native window rebuilds: %llu\n"
+                  "Native resize rejects: %llu\n"
+                  "Native failed patches: %llu",
+                  reconcile_mode_text(model.last_reconcile_mode()).c_str(),
+                  model.last_patch_op_count(),
+                  static_cast<unsigned long long>(model.full_publish_count()),
+                  static_cast<unsigned long long>(model.patch_send_count()),
+                  static_cast<unsigned long long>(model.diff_fallback_count()),
+                  static_cast<unsigned long long>(model.no_change_count()),
+                  static_cast<unsigned long long>(model.publish_failure_count()),
+                  static_cast<unsigned long long>(model.patch_failure_count()),
+                  static_cast<unsigned long long>(native_metrics.publish_count),
+                  static_cast<unsigned long long>(native_metrics.patch_request_count),
+                  static_cast<unsigned long long>(native_metrics.direct_apply_count),
+                  static_cast<unsigned long long>(native_metrics.subtree_rebuild_count),
+                  static_cast<unsigned long long>(native_metrics.window_rebuild_count),
+                  static_cast<unsigned long long>(native_metrics.resize_reject_count),
+                  static_cast<unsigned long long>(native_metrics.failed_patch_count));
+    return buffer;
+}
+
 } // namespace
 
 int main() {
     wg::Layout layout;
     wg::App app;
     SuperTerminalRunResult result{};
+    SuperTerminalClientContext* app_ctx = nullptr;
 
     const int exit_code = app
         .title("Demo - widget galley")
         .layout(layout)
-        .on_setup([&](SuperTerminalClientContext*) {
+        .on_setup([&](SuperTerminalClientContext* ctx) {
+            app_ctx = ctx;
             layout.state().merge({
                 {"main_tab", "inputs"},
                 {"name", "Ada Lovelace"},
@@ -218,6 +280,10 @@ int main() {
                 const int clicks = layout.state().get("clicks", 0).get<int>();
                 const std::string last_event = layout.state().get("last_event", std::string()).get<std::string>();
                 const Json hits = layout.state().get("hits", Json::object());
+                SuperTerminalNativeUiPatchMetrics native_metrics{};
+                if (app_ctx) {
+                    super_terminal_get_native_ui_patch_metrics(app_ctx, &native_metrics);
+                }
 
                 int seen = 0;
                 for (const auto& tracked : kTrackedEvents) {
@@ -304,9 +370,9 @@ int main() {
                 };
 
                 Json tabs = Json::array();
-                tabs.push_back(wg::ui_tab("inputs", "Inputs", wg::ui_scroll_view(input_nodes).padding(10).gap(10)));
-                tabs.push_back(wg::ui_tab("choices", "Choices", wg::ui_scroll_view(choice_nodes).padding(10).gap(10)));
-                tabs.push_back(wg::ui_tab("data", "Data", wg::ui_scroll_view(data_nodes).padding(10).gap(10)));
+                tabs.push_back(wg::ui_tab("inputs", "Inputs", wg::ui_scroll_view(input_nodes).id("inputs-scroll").padding(10).gap(10)));
+                tabs.push_back(wg::ui_tab("choices", "Choices", wg::ui_scroll_view(choice_nodes).id("choices-scroll").padding(10).gap(10)));
+                tabs.push_back(wg::ui_tab("data", "Data", wg::ui_scroll_view(data_nodes).id("data-scroll").padding(10).gap(10)));
 
                 std::vector<wg::UiNode> summary_nodes = {
                     wg::ui_card("Coverage", {
@@ -336,6 +402,9 @@ int main() {
                                                   tree_selected,
                                                   tree_expanded)),
                     }),
+                    wg::ui_card("Patch diagnostics", {
+                        wg::ui_text(patch_diagnostics_summary(layout.model(), native_metrics)),
+                    }),
                     wg::ui_card("Event hits", build_hit_rows(hits)),
                 };
 
@@ -352,7 +421,7 @@ int main() {
                             }).gap(10).padding(12),
                         }).size(0.68),
                         wg::ui_split_pane("right", {
-                            wg::ui_scroll_view(summary_nodes).padding(10).gap(10),
+                            wg::ui_scroll_view(summary_nodes).id("summary-scroll").padding(10).gap(10),
                         }).size(0.32)
                     )
                 );

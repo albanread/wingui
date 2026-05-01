@@ -275,6 +275,17 @@ class UiModel {
 public:
     UiModel() = default;
 
+    enum class ReconcileMode {
+        None,
+        FullPublishInitial,
+        FullPublishDiffFallback,
+        FullPublishNoPatchTransport,
+        Patch,
+        NoChange,
+        PublishFailed,
+        PatchFailed,
+    };
+
     // Attach transport delegates.  Must be called before render().
     void set_publish_fn(UiModelPublishFn fn) { publish_fn_ = std::move(fn); }
     void set_patch_fn(UiModelPatchFn fn)     { patch_fn_   = std::move(fn); }
@@ -305,6 +316,15 @@ public:
     // Forget the cached spec (forces next rerender to be a full publish).
     void reset_cache() { last_spec_.reset(); }
 
+    ReconcileMode last_reconcile_mode() const { return last_reconcile_mode_; }
+    uint64_t full_publish_count() const { return full_publish_count_; }
+    uint64_t patch_send_count() const { return patch_send_count_; }
+    uint64_t diff_fallback_count() const { return diff_fallback_count_; }
+    uint64_t no_change_count() const { return no_change_count_; }
+    uint64_t publish_failure_count() const { return publish_failure_count_; }
+    uint64_t patch_failure_count() const { return patch_failure_count_; }
+    size_t last_patch_op_count() const { return last_patch_op_count_; }
+
 private:
     std::function<UiWindow()> render_fn_;
     UiModelPublishFn publish_fn_;
@@ -312,6 +332,14 @@ private:
     std::optional<Json> last_spec_;
     int event_depth_     = 0;
     bool rerender_pending_ = false;
+    ReconcileMode last_reconcile_mode_ = ReconcileMode::None;
+    uint64_t full_publish_count_ = 0;
+    uint64_t patch_send_count_ = 0;
+    uint64_t diff_fallback_count_ = 0;
+    uint64_t no_change_count_ = 0;
+    uint64_t publish_failure_count_ = 0;
+    uint64_t patch_failure_count_ = 0;
+    size_t last_patch_op_count_ = 0;
 
     bool run_reconcile();
 };

@@ -642,10 +642,18 @@ bool UiModel::run_reconcile() {
     if (!render_fn_ || !publish_fn_) return false;
 
     const Json new_spec = render_fn_().to_json();
+    last_patch_op_count_ = 0;
 
     if (!last_spec_) {
         const bool ok = publish_fn_(new_spec.dump());
-        if (ok) last_spec_ = new_spec;
+        if (ok) {
+            ++full_publish_count_;
+            last_reconcile_mode_ = ReconcileMode::FullPublishInitial;
+            last_spec_ = new_spec;
+        } else {
+            ++publish_failure_count_;
+            last_reconcile_mode_ = ReconcileMode::PublishFailed;
+        }
         return ok;
     }
 
@@ -654,11 +662,21 @@ bool UiModel::run_reconcile() {
     if (!diff) {
         // Shape diverged – full republish.
         const bool ok = publish_fn_(new_spec.dump());
-        if (ok) last_spec_ = new_spec;
+        if (ok) {
+            ++full_publish_count_;
+            ++diff_fallback_count_;
+            last_reconcile_mode_ = ReconcileMode::FullPublishDiffFallback;
+            last_spec_ = new_spec;
+        } else {
+            ++publish_failure_count_;
+            last_reconcile_mode_ = ReconcileMode::PublishFailed;
+        }
         return ok;
     }
 
     if (diff->empty()) {
+        ++no_change_count_;
+        last_reconcile_mode_ = ReconcileMode::NoChange;
         last_spec_ = new_spec;
         return true; // nothing to send
     }
@@ -666,13 +684,28 @@ bool UiModel::run_reconcile() {
     if (!patch_fn_) {
         // No patch transport – fall back to full publish.
         const bool ok = publish_fn_(new_spec.dump());
-        if (ok) last_spec_ = new_spec;
+        if (ok) {
+            ++full_publish_count_;
+            last_reconcile_mode_ = ReconcileMode::FullPublishNoPatchTransport;
+            last_spec_ = new_spec;
+        } else {
+            ++publish_failure_count_;
+            last_reconcile_mode_ = ReconcileMode::PublishFailed;
+        }
         return ok;
     }
 
+    last_patch_op_count_ = diff->size();
     const Json patch_doc = ui_patch_ops_to_json(*diff);
     const bool ok = patch_fn_(patch_doc.dump());
-    if (ok) last_spec_ = new_spec;
+    if (ok) {
+        ++patch_send_count_;
+        last_reconcile_mode_ = ReconcileMode::Patch;
+        last_spec_ = new_spec;
+    } else {
+        ++patch_failure_count_;
+        last_reconcile_mode_ = ReconcileMode::PatchFailed;
+    }
     return ok;
 }
 
@@ -953,7 +986,7 @@ Json ui_tab(std::string value, std::string text, const UiNode& content) {
     Json o = Json::object();
     o["value"]   = std::move(value);
     o["text"]    = std::move(text);
-    o["content"] = content.to_json();
+    o["content"] = content.to_json("window/tab/" + o["value"].get<std::string>() + "/content");
     return o;
 }
 

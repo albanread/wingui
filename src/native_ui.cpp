@@ -131,6 +131,10 @@ bool ensureNativeThread();
 bool validateUserAppSpec(const ordered_json& spec, std::string& error);
 LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 bool ensureScrollViewHostClassRegistered();
+RECT tabContentRect(HWND hwnd);
+RECT tabContentRectInParent(HWND hwnd);
+int tabHeaderHeightFromContentRect(const RECT& content_rect, int control_height);
+bool positionTabContentHost(HWND tab, ControlBinding& binding, int content_height);
 
 struct GridMetrics {
     int columns = 1;
@@ -211,6 +215,7 @@ struct NativeHostState {
     ordered_json spec = ordered_json::object();
     std::unordered_map<HWND, ControlBinding> bindings;
     std::unordered_map<std::string, HWND> node_controls;
+    std::unordered_map<std::string, int> preserved_scroll_y;
     std::unordered_map<int, ControlBinding> command_bindings;
     HMENU current_menu = nullptr;
     ordered_json pending_patch = nullptr;
@@ -241,6 +246,128 @@ struct NativeHostState {
     std::atomic<uint64_t> patch_resize_reject_count{0};
     std::atomic<uint64_t> patch_failed_count{0};
 } g_native;
+
+std::mutex g_native_trace_mutex;
+
+std::wstring nativeEventTracePath() {
+    wchar_t path_buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path_buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        return L"native_ui_event_trace.log";
+    }
+
+    std::wstring path(path_buffer, length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        path.resize(slash + 1);
+    } else {
+        path.clear();
+    }
+    path += L"native_ui_event_trace.log";
+    return path;
+}
+
+std::wstring nativePatchTracePath() {
+    wchar_t path_buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path_buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        return L"native_patch_trace.log";
+    }
+
+    std::wstring path(path_buffer, length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        path.resize(slash + 1);
+    } else {
+        path.clear();
+    }
+    path += L"native_patch_trace.log";
+    return path;
+}
+
+void appendNativePatchTraceLine(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_native_trace_mutex);
+    const std::wstring path = nativePatchTracePath();
+    HANDLE file = CreateFileW(path.c_str(),
+                              FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr,
+                              OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    DWORD written = 0;
+    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    WriteFile(file, "\r\n", 2, &written, nullptr);
+    CloseHandle(file);
+}
+
+void traceNativePatchEvent(const std::string& message) {
+    char buffer[1024];
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "[%llu][tid=%lu] %s",
+                  static_cast<unsigned long long>(GetTickCount64()),
+                  static_cast<unsigned long>(GetCurrentThreadId()),
+                  message.c_str());
+    appendNativePatchTraceLine(buffer);
+}
+
+size_t patchOperationCount(const ordered_json& patch) {
+    if (patch.is_array()) return patch.size();
+    auto ops_it = patch.find("ops");
+    if (patch.is_object() && ops_it != patch.end() && ops_it->is_array()) {
+        return ops_it->size();
+    }
+    return patch.is_object() ? 1u : 0u;
+}
+
+void traceNativePatchDecision(const char* decision,
+                              const std::string& op_name,
+                              const std::string& node_id = std::string(),
+                              const std::string& detail = std::string()) {
+    std::string line = std::string("decision=") + decision + " op=" + op_name;
+    if (!node_id.empty()) line += " id=" + node_id;
+    if (!detail.empty()) line += " detail=" + detail;
+    traceNativePatchEvent(line);
+}
+
+void traceNativeUiEvent(const ordered_json& event) {
+    const std::string payload = event.dump();
+    const std::string event_name = event.value("event", std::string());
+    const std::string node_id = event.value("id", std::string());
+    const std::string source = event.value("source", std::string());
+
+    char header[512];
+    std::snprintf(header,
+                  sizeof(header),
+                  "[%llu][tid=%lu] event=%s id=%s source=%s bytes=%zu payload=",
+                  static_cast<unsigned long long>(GetTickCount64()),
+                  static_cast<unsigned long>(GetCurrentThreadId()),
+                  event_name.empty() ? "<none>" : event_name.c_str(),
+                  node_id.empty() ? "<none>" : node_id.c_str(),
+                  source.empty() ? "<none>" : source.c_str(),
+                  payload.size());
+
+    appendNativePatchTraceLine(std::string(header) + payload);
+
+    std::lock_guard<std::mutex> lock(g_native_trace_mutex);
+    const std::wstring path = nativeEventTracePath();
+    HANDLE file = CreateFileW(path.c_str(),
+                              FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr,
+                              OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    const std::string line = std::string(header) + payload + "\r\n";
+    DWORD written = 0;
+    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(file);
+}
 
 void setNativeLastError(const std::string& error);
 
@@ -1499,6 +1626,33 @@ HWND findBoundAncestorOfType(HWND start, const char* wanted_type) {
     return nullptr;
 }
 
+void snapshotScrollViewStateRecursive(HWND root) {
+    if (!root || !IsWindow(root)) return;
+
+    auto it = g_native.bindings.find(root);
+    if (it != g_native.bindings.end() &&
+        it->second.type == "scroll-view" &&
+        !it->second.node_id.empty()) {
+        g_native.preserved_scroll_y[it->second.node_id] = jsonInt(it->second.data, "scrollY", 0);
+    }
+
+    HWND child = GetWindow(root, GW_CHILD);
+    while (child) {
+        snapshotScrollViewStateRecursive(child);
+        child = GetWindow(child, GW_HWNDNEXT);
+    }
+}
+
+void restorePreservedScrollViewState(ControlBinding& binding) {
+    if (binding.type != "scroll-view" || binding.node_id.empty()) return;
+
+    auto it = g_native.preserved_scroll_y.find(binding.node_id);
+    if (it == g_native.preserved_scroll_y.end()) return;
+
+    binding.data["scrollY"] = it->second;
+    g_native.preserved_scroll_y.erase(it);
+}
+
 void updateScrollViewViewport(HWND container, ControlBinding& binding) {
     if (!container || !IsWindow(container)) return;
     const int viewport_width = std::max(1, jsonInt(binding.data, "viewportWidth", 1));
@@ -2024,6 +2178,7 @@ bool refreshContainingSplitViewControl(HWND child_hwnd) {
 }
 
 void dispatchUiEventJson(const ordered_json& event) {
+    traceNativeUiEvent(event);
     const std::string payload = event.dump();
     enqueueReactiveEvent(WINGUI_NATIVE_EVENT_DISPATCH_JSON, payload);
     auto fn = g_native_callbacks.dispatch_event_json;
@@ -2551,6 +2706,7 @@ void dispatchUiEvent(const ControlBinding& binding) {
 }
 
 void clearNativeControls(HWND hwnd) {
+    snapshotScrollViewStateRecursive(hwnd);
     clearNativeChildrenOf(hwnd);
     g_native.bindings.clear();
     g_native.node_controls.clear();
@@ -2812,6 +2968,53 @@ bool selectTabByValue(HWND hwnd, ControlBinding& binding, const std::string& val
     return true;
 }
 
+RECT tabContentRect(HWND hwnd) {
+    RECT rc{};
+    if (!hwnd || !IsWindow(hwnd)) return rc;
+    GetClientRect(hwnd, &rc);
+    TabCtrl_AdjustRect(hwnd, FALSE, &rc);
+    return rc;
+}
+
+RECT tabContentRectInParent(HWND hwnd) {
+    RECT rc = tabContentRect(hwnd);
+    HWND parent = hwnd ? GetParent(hwnd) : nullptr;
+    if (!parent || !IsWindow(parent)) return rc;
+    MapWindowPoints(hwnd, parent, reinterpret_cast<LPPOINT>(&rc), 2);
+    return rc;
+}
+
+int tabHeaderHeightFromContentRect(const RECT& content_rect, int control_height) {
+    const int bottom_frame = std::max(0, control_height - static_cast<int>(content_rect.bottom));
+    return std::max(24, static_cast<int>(content_rect.top) + bottom_frame);
+}
+
+bool positionTabContentHost(HWND tab, ControlBinding& binding, int content_height) {
+    HWND content_host = binding.companion_hwnd;
+    if (!tab || !IsWindow(tab) || !content_host || !IsWindow(content_host)) return false;
+    HWND parent = GetParent(tab);
+    if (!parent || !IsWindow(parent)) return false;
+
+    RECT tab_rect{};
+    GetWindowRect(tab, &tab_rect);
+    MapWindowPoints(nullptr, parent, reinterpret_cast<LPPOINT>(&tab_rect), 2);
+
+    const int content_offset_x = jsonInt(binding.data, "contentOffsetX", 0);
+    const int content_offset_y = jsonInt(binding.data, "contentOffsetY", 0);
+    const int tab_width = std::max(24, static_cast<int>(tab_rect.right - tab_rect.left));
+    const int content_width = std::max(24, jsonInt(binding.data, "contentWidth", tab_width));
+    const int host_height = std::max(24, content_height);
+    binding.data["contentHostHeight"] = host_height;
+
+    return SetWindowPos(content_host,
+                        tab,
+                        tab_rect.left + content_offset_x,
+                        tab_rect.top + content_offset_y,
+                        content_width,
+                        host_height,
+                        SWP_NOACTIVATE) != FALSE;
+}
+
 bool syncTabsControl(HWND hwnd,
                      ControlBinding& binding,
                      const ordered_json& tabs,
@@ -2853,23 +3056,32 @@ bool syncTabsControl(HWND hwnd,
     }
 
     g_native.suppress_events = true;
+    snapshotScrollViewStateRecursive(content_host);
     clearNativeChildrenOf(content_host);
     g_native.suppress_events = false;
+
+    int content_host_height = std::max(40, jsonInt(binding.data, "contentHostHeight", 40));
 
     if (selected_index >= 0 && static_cast<size_t>(selected_index) < binding.option_nodes.size()) {
         const ordered_json& active_tab = binding.option_nodes[static_cast<size_t>(selected_index)];
         auto content_it = active_tab.find("content");
         if (content_it != active_tab.end() && content_it->is_object()) {
-            RECT rc{};
-            GetClientRect(content_host, &rc);
-            const int content_width = std::max(24, static_cast<int>(rc.right - rc.left) - 16);
             HDC hdc = GetDC(content_host);
             if (!hdc) return false;
             ensureFonts();
             SelectObject(hdc, g_native.ui_font);
+            const int content_width = std::max(24, jsonInt(binding.data, "contentWidth", 24) - 16);
+            const MeasuredSize measured = measureNode(hdc, *content_it, content_width);
+            content_host_height = std::max(40, measured.height + 16);
+            if (!positionTabContentHost(hwnd, binding, content_host_height)) {
+                ReleaseDC(content_host, hdc);
+                return false;
+            }
             layoutNode(content_host, hdc, *content_it, 8, 8, content_width);
             ReleaseDC(content_host, hdc);
         }
+    } else if (!positionTabContentHost(hwnd, binding, content_host_height)) {
+        return false;
     }
 
     InvalidateRect(content_host, nullptr, TRUE);
@@ -3122,7 +3334,7 @@ bool findNearestPatchableAncestorNode(ordered_json& node,
     return false;
 }
 
-bool tryRebuildAncestorContainerForNode(const std::string& node_id) {
+bool tryRebuildAncestorContainerForNode(const std::string& node_id, std::string* rebuilt_ancestor_id = nullptr) {
     if (node_id.empty()) return false;
 
     std::string ancestor_id;
@@ -3142,6 +3354,7 @@ bool tryRebuildAncestorContainerForNode(const std::string& node_id) {
 
     auto control_it = g_native.node_controls.find(ancestor_id);
     if (control_it == g_native.node_controls.end()) return false;
+    if (rebuilt_ancestor_id) *rebuilt_ancestor_id = ancestor_id;
     rebuildNativeContainerContents(control_it->second, ancestor_spec);
     return true;
 }
@@ -3781,18 +3994,23 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
         // Suppress events while recreating content controls so that
         // programmatic EN_CHANGE / BN_CLICKED notifications don't fire.
         g_native.suppress_events = true;
+        snapshotScrollViewStateRecursive(content_host);
         clearNativeChildrenOf(content_host);
         g_native.suppress_events = false;
 
         auto content_it = tab_node.find("content");
         if (content_it != tab_node.end() && content_it->is_object()) {
-            RECT rc{};
-            GetClientRect(content_host, &rc);
-            const int content_width = rc.right - rc.left;
             HDC hdc = GetDC(content_host);
+            if (!hdc) return false;
             ensureFonts();
             SelectObject(hdc, g_native.ui_font);
-            layoutNode(content_host, hdc, *content_it, 8, 8, std::max(24, content_width - 16));
+            const int content_width = std::max(24, jsonInt(binding.data, "contentWidth", 24) - 16);
+            const MeasuredSize measured = measureNode(hdc, *content_it, content_width);
+            if (!positionTabContentHost(control, binding, std::max(40, measured.height + 16))) {
+                ReleaseDC(content_host, hdc);
+                return false;
+            }
+            layoutNode(content_host, hdc, *content_it, 8, 8, content_width);
             ReleaseDC(content_host, hdc);
         }
         InvalidateRect(content_host, nullptr, TRUE);
@@ -3994,11 +4212,13 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
             const std::wstring title = utf8ToWide(title_it->get<std::string>());
             SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
             g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
+            traceNativePatchDecision("direct", op_name, std::string(), "title-only");
             return true;
         }
 
         rebuildNativeWindow(hwnd);
         g_native.patch_window_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+        traceNativePatchDecision("window-rebuild", op_name);
         return true;
     }
 
@@ -4009,12 +4229,16 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         if (props_it == op.end() || !props_it->is_object()) return false;
         if (applyNativeNodePropsPatch(hwnd, node_id, *props_it)) {
             g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
+            traceNativePatchDecision("direct", op_name, node_id);
             return true;
         }
-        if (tryRebuildAncestorContainerForNode(node_id)) {
+        std::string rebuilt_ancestor_id;
+        if (tryRebuildAncestorContainerForNode(node_id, &rebuilt_ancestor_id)) {
             g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+            traceNativePatchDecision("subtree-rebuild", op_name, node_id, rebuilt_ancestor_id);
             return true;
         }
+        traceNativePatchDecision("failed", op_name, node_id);
         return false;
     }
 
@@ -4029,12 +4253,16 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         if (node_id.empty()) return false;
         if (refreshTreeViewControl(node_id)) {
             g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
+            traceNativePatchDecision("direct", op_name, node_id);
             return true;
         }
-        if (tryRebuildAncestorContainerForNode(node_id)) {
+        std::string rebuilt_ancestor_id;
+        if (tryRebuildAncestorContainerForNode(node_id, &rebuilt_ancestor_id)) {
             g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+            traceNativePatchDecision("subtree-rebuild", op_name, node_id, rebuilt_ancestor_id);
             return true;
         }
+        traceNativePatchDecision("failed", op_name, node_id);
         return false;
     }
 
@@ -4057,9 +4285,11 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
         }
         rebuildNativeContainerContents(control_it->second, node_spec);
         g_native.patch_subtree_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+        traceNativePatchDecision("subtree-rebuild", op_name, node_id, node_id);
         return true;
     }
 
+    traceNativePatchDecision("unsupported", op_name);
     return false;
 }
 
@@ -4105,6 +4335,7 @@ MeasuredSize layoutChildrenRow(HWND parent,
 }
 
 void rebuildNativeContainerContents(HWND container, const ordered_json& node) {
+    snapshotScrollViewStateRecursive(container);
     clearNativeChildrenOf(container);
     ensureFonts();
     RECT client{};
@@ -4227,6 +4458,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             ControlBinding binding;
             binding.type = type;
             binding.node_id = jsonString(node, "id");
+            restorePreservedScrollViewState(binding);
             registerNodeControl(container, binding);
             auto it = g_native.bindings.find(container);
             if (it != g_native.bindings.end()) {
@@ -4612,7 +4844,8 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             cursor_y += static_cast<int>(label_size.cy + 8);
         }
 
-        HWND tab = createChildControl(WC_TABCONTROLW, L"", WS_TABSTOP, x, cursor_y, control_width, 220, parent, g_native.ui_font);
+        constexpr int kProvisionalTabHeight = 220;
+        HWND tab = createChildControl(WC_TABCONTROLW, L"", WS_TABSTOP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, x, cursor_y, control_width, kProvisionalTabHeight, parent, g_native.ui_font);
         int selected_index = 0;
         std::string selected_value = jsonString(node, "value");
         ControlBinding binding;
@@ -4647,7 +4880,6 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
         // Storing it as companion_hwnd lets the patch path clear and
         // re-layout only the content area on a value change, without
         // rebuilding the ancestor container.
-        int content_y = cursor_y + 34;
         const ordered_json* active_content = nullptr;
         if (!binding.option_nodes.empty()) {
             const ordered_json& active_tab = binding.option_nodes[static_cast<size_t>(std::clamp(selected_index, 0, static_cast<int>(binding.option_nodes.size()) - 1))];
@@ -4659,21 +4891,47 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
         const MeasuredSize pre_size = active_content ? measureNode(hdc, *active_content, control_width - 16) : MeasuredSize{};
         const int content_host_height = pre_size.height > 0 ? pre_size.height + 16 : 40;
 
-        HWND content_host = createChildControl(L"STATIC", L"", 0,
-            x, content_y, control_width, content_host_height, parent, nullptr);
+        const int tab_header_height = 28;
+        const int content_offset_x = 0;
+        const int content_offset_y = tab_header_height + 4;
+        const int content_width = control_width;
+
+        if (tab) {
+            SetWindowPos(tab, nullptr, x, cursor_y, control_width, tab_header_height, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        const int content_x = x + content_offset_x;
+        const int content_y = cursor_y + content_offset_y;
+
+        HWND content_host = createChildControl(L"STATIC", L"", WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+            content_x, content_y, content_width, content_host_height, parent, nullptr);
         if (content_host) attachContainerForwarding(content_host);
         binding.companion_hwnd = content_host;
+        binding.data["contentOffsetX"] = content_offset_x;
+        binding.data["contentOffsetY"] = content_offset_y;
+        binding.data["contentWidth"] = content_width;
+        binding.data["contentHostHeight"] = content_host_height;
         registerNodeControl(tab, binding);
 
+        if (content_host && tab) {
+            SetWindowPos(content_host,
+                         tab,
+                         content_x,
+                         content_y,
+                         content_width,
+                         content_host_height,
+                         SWP_NOACTIVATE);
+        }
+
         if (active_content && content_host) {
-            MeasuredSize content = layoutNode(content_host, hdc, *active_content, 8, 8, control_width - 16);
-            return {control_width, (content_y - y) + content.height + 16};
+            MeasuredSize content = layoutNode(content_host, hdc, *active_content, 8, 8, std::max(24, content_width - 16));
+            return {control_width, (cursor_y - y) + content_offset_y + std::max(content_host_height, content.height + 16)};
         }
 
         if (content_host) {
-            createChildControl(L"STATIC", L"No tab content", SS_LEFT, 8, 8, control_width - 16, 24, content_host, g_native.ui_font);
+            createChildControl(L"STATIC", L"No tab content", SS_LEFT, 8, 8, std::max(24, content_width - 16), 24, content_host, g_native.ui_font);
         }
-        return {control_width, (content_y - y) + 40};
+        return {control_width, (cursor_y - y) + content_offset_y + std::max(content_host_height, 40)};
     }
 
     if (type == "context-menu") {
@@ -5842,6 +6100,7 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         break;
 
     case kMsgNativeReload:
+        traceNativePatchEvent("reload-window");
         rebuildNativeWindow(hwnd);
         return 0;
 
@@ -5854,13 +6113,16 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
                 g_native.pending_patch = nullptr;
             }
             g_native.suppress_events = true;
+            traceNativePatchEvent(std::string("patch-dispatch ops=") + std::to_string(patchOperationCount(patch)));
             const bool patched = applyNativePatchDocument(hwnd, patch);
             g_native.suppress_events = false;
             if (!patched) {
                 g_native.patch_failed_count.fetch_add(1, std::memory_order_relaxed);
                 g_native.patch_window_rebuild_count.fetch_add(1, std::memory_order_relaxed);
+                traceNativePatchEvent("patch-document failed -> window rebuild");
                 rebuildNativeWindow(hwnd);
             } else {
+                traceNativePatchEvent("patch-document applied");
                 refreshNativeScrollMetrics(hwnd);
             }
         }
@@ -6552,6 +6814,7 @@ bool executeNativePublishJson(const char* utf8) {
         g_native.spec = std::move(spec);
     }
     g_native.publish_count.fetch_add(1, std::memory_order_relaxed);
+    traceNativePatchEvent(std::string("publish bytes=") + std::to_string(std::strlen(utf8)));
     if (!ensureNativeHostWindowAvailable()) return false;
     dispatchNativeWindowMessage(kMsgNativeReload);
     return true;
@@ -6587,6 +6850,8 @@ bool executeNativePatchJson(const char* utf8) {
         g_native.pending_patch = patch;
     }
     g_native.patch_request_count.fetch_add(1, std::memory_order_relaxed);
+    traceNativePatchEvent(std::string("patch-request bytes=") + std::to_string(std::strlen(utf8)) +
+                          " ops=" + std::to_string(patchOperationCount(patch)));
     if (!ensureNativeHostWindowAvailable()) return false;
     dispatchNativeWindowMessage(kMsgNativePatch);
     return true;
