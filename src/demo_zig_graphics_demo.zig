@@ -2,19 +2,26 @@ const std = @import("std");
 const wingui = @import("zig/wingui.zig");
 const c = wingui.raw;
 
-const demo_title = "Wingui Zig Starfield";
+const demo_title = "Wingui Zig Graphics Demo";
 const demo_title_z: [*:0]const u8 = demo_title;
 const canvas_width: f32 = 960;
 const canvas_height: f32 = 560;
 const star_count = 110;
+const boid_count = 36;
 const diagonal_scale: f32 = 0.70710677;
 const star_primitives_per_star = 4;
 const background_primitive_count = 20;
-const total_star_primitives = background_primitive_count + (star_count * star_primitives_per_star);
+const plasma_columns = 28;
+const plasma_rows = 16;
+const plasma_cell_count = plasma_columns * plasma_rows;
+const primitive_capacity = 768;
 
 const DrawMode = enum {
     starfield_2d,
     starfield_3d,
+    plasma,
+    boids,
+    lissajous,
 };
 
 const Star = struct {
@@ -26,6 +33,14 @@ const Star = struct {
     prev_depth: f32 = 0,
     kind: u8 = 0,
     phase: u32 = 0,
+};
+
+const Boid = struct {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    phase: f32 = 0,
 };
 
 const DemoState = struct {
@@ -41,11 +56,17 @@ const DemoState = struct {
     warp_active: bool = false,
     prev_space_down: bool = false,
     prev_escape_down: bool = false,
+    plasma_phase: f32 = 0,
+    plasma_shift_x: f32 = 0,
+    plasma_shift_y: f32 = 0,
+    boid_phase: f32 = 0,
+    lissajous_phase: f32 = 0,
     canvas_w: f32 = canvas_width,
     canvas_h: f32 = canvas_height,
     spec_buffer: [8192]u8 = [_]u8{0} ** 8192,
-    primitives: [total_star_primitives]wingui.VectorPrimitive = undefined,
+    primitives: [primitive_capacity]wingui.VectorPrimitive = undefined,
     stars: [star_count]Star = undefined,
+    boids: [boid_count]Boid = undefined,
 
     fn init() DemoState {
         var state = DemoState{
@@ -111,6 +132,55 @@ const DemoState = struct {
             .starfield_3d => {
                 self.respawnStar3d(star);
             },
+            .plasma, .boids, .lissajous => {
+                star.* = .{
+                    .x = 0,
+                    .y = 0,
+                    .depth = 0,
+                    .prev_x = 0,
+                    .prev_y = 0,
+                    .prev_depth = 0,
+                    .kind = 0,
+                    .phase = 0,
+                };
+            },
+        }
+    }
+
+    fn resetBoid(self: *DemoState, boid: *Boid) void {
+        const angle = self.randomUnit() * std.math.tau;
+        const speed = 28.0 + self.randomUnit() * 40.0;
+        boid.* = .{
+            .x = self.randomRange(self.canvas_w),
+            .y = self.randomRange(self.canvas_h),
+            .vx = @cos(angle) * speed,
+            .vy = @sin(angle) * speed,
+            .phase = self.randomUnit() * std.math.tau,
+        };
+    }
+
+    fn resetBoids(self: *DemoState) void {
+        for (&self.boids) |*boid| {
+            self.resetBoid(boid);
+        }
+    }
+
+    fn resetModeState(self: *DemoState) void {
+        self.warp_active = false;
+        switch (self.draw_mode) {
+            .starfield_2d, .starfield_3d => self.resetStars(),
+            .plasma => {
+                self.plasma_phase = 0;
+                self.plasma_shift_x = 0;
+                self.plasma_shift_y = 0;
+            },
+            .boids => {
+                self.boid_phase = 0;
+                self.resetBoids();
+            },
+            .lissajous => {
+                self.lissajous_phase = 0;
+            },
         }
     }
 
@@ -130,7 +200,13 @@ const DemoState = struct {
         self.warp_active = false;
         self.prev_space_down = false;
         self.prev_escape_down = false;
+        self.plasma_phase = 0;
+        self.plasma_shift_x = 0;
+        self.plasma_shift_y = 0;
+        self.boid_phase = 0;
+        self.lissajous_phase = 0;
         self.resetStars();
+        self.resetBoids();
     }
 
     fn headingLabel(self: *const DemoState) []const u8 {
@@ -141,6 +217,27 @@ const DemoState = struct {
         return switch (self.draw_mode) {
             .starfield_2d => "2D starfield",
             .starfield_3d => "3D rush",
+            .plasma => "Plasma",
+            .boids => "Boids",
+            .lissajous => "Lissajous",
+        };
+    }
+
+    fn detailCount(self: *const DemoState) u32 {
+        return switch (self.draw_mode) {
+            .starfield_2d, .starfield_3d => star_count,
+            .plasma => plasma_cell_count,
+            .boids => boid_count,
+            .lissajous => 220,
+        };
+    }
+
+    fn detailLabel(self: *const DemoState) []const u8 {
+        return switch (self.draw_mode) {
+            .starfield_2d, .starfield_3d => "Stars",
+            .plasma => "Cells",
+            .boids => "Boids",
+            .lissajous => "Curves",
         };
     }
 
@@ -158,7 +255,7 @@ const DemoState = struct {
             return false;
         }
         self.draw_mode = draw_mode;
-        self.resetStars();
+        self.resetModeState();
         return true;
     }
 
@@ -182,23 +279,26 @@ const DemoState = struct {
     fn buildSpec(self: *DemoState) ![:0]u8 {
         var heading_buffer: [64]u8 = undefined;
         var speed_buffer: [32]u8 = undefined;
-        var stars_buffer: [32]u8 = undefined;
+        var detail_buffer: [32]u8 = undefined;
         var draw_mode_buffer: [48]u8 = undefined;
         const mode_text = if (self.paused) "Paused" else "Cruising";
-        const controls_text = if (self.draw_mode == .starfield_3d)
-            "Arrows steer  Space warps  Esc exits"
-        else
-            "Arrows steer  Space pauses  Esc exits";
+        const controls_text = switch (self.draw_mode) {
+            .starfield_3d => "Arrows steer  Space warps  Esc exits",
+            .plasma => "Arrows drift  Space pauses  Esc exits",
+            .boids => "Arrows attract  Space pauses  Esc exits",
+            .lissajous => "Arrows skew  Space pauses  Esc exits",
+            .starfield_2d => "Arrows steer  Space pauses  Esc exits",
+        };
         const heading_text = try std.fmt.bufPrint(&heading_buffer, "Heading {s}", .{self.headingLabel()});
         const speed_units: u32 = @intFromFloat(self.speed);
         const speed_text = try std.fmt.bufPrint(&speed_buffer, "Speed {}", .{speed_units});
-        const stars_text = try std.fmt.bufPrint(&stars_buffer, "Stars {}", .{star_count});
+        const detail_text = try std.fmt.bufPrint(&detail_buffer, "{s} {}", .{ self.detailLabel(), self.detailCount() });
         const draw_mode_text = try std.fmt.bufPrint(&draw_mode_buffer, "Mode {s}", .{self.drawModeLabel()});
         const pause_text = if (self.paused) "Resume" else "Pause";
 
         return wingui.stringifyJsonToBufferZ(&self.spec_buffer, .{
             .type = "window",
-            .id = "zig_starfield_window",
+            .id = "zig_graphics_demo_window",
             .title = demo_title,
             .menuBar = .{
                 .menus = .{
@@ -215,6 +315,9 @@ const DemoState = struct {
                         .items = .{
                             .{ .id = "starfield_draw_2d", .text = "2D starfield", .checked = self.draw_mode == .starfield_2d },
                             .{ .id = "starfield_draw_3d", .text = "3D starfield", .checked = self.draw_mode == .starfield_3d },
+                            .{ .id = "starfield_draw_plasma", .text = "Plasma", .checked = self.draw_mode == .plasma },
+                            .{ .id = "starfield_draw_boids", .text = "Boids", .checked = self.draw_mode == .boids },
+                            .{ .id = "starfield_draw_lissajous", .text = "Lissajous", .checked = self.draw_mode == .lissajous },
                         },
                     },
                 },
@@ -235,17 +338,17 @@ const DemoState = struct {
                     .{ .text = draw_mode_text, .width = 120 },
                     .{ .text = heading_text, .width = 120 },
                     .{ .text = speed_text, .width = 90 },
-                    .{ .text = stars_text, .width = 90 },
+                    .{ .text = detail_text, .width = 90 },
                     .{ .text = controls_text, .width = 260 },
                 },
             },
             .body = .{
                 .type = "stack",
-                .id = "zig_starfield_body",
+                .id = "zig_graphics_demo_body",
                 .gap = 10,
                 .children = .{
-                    .{ .type = "heading", .id = "zig_starfield_heading", .text = "Zig Starfield" },
-                    .{ .type = "text", .id = "zig_starfield_intro", .text = "This sample combines declarative chrome with a frame-driven RGBA pane. The 3D mode uses classic pseudo-3D projection with steering, comet streaks, warp, and a small cockpit HUD." },
+                    .{ .type = "heading", .id = "zig_graphics_demo_heading", .text = "Zig Graphics Demo" },
+                    .{ .type = "text", .id = "zig_graphics_demo_intro", .text = "This sample combines declarative chrome with a frame-driven RGBA pane. It includes 2D and 3D starfields, plasma, boids, and a Lissajous vector trace." },
                     .{ .type = "rgba-pane", .id = "star_canvas", .width = 960, .height = 560, .focused = true },
                 },
             },
@@ -256,6 +359,9 @@ const DemoState = struct {
         switch (self.draw_mode) {
             .starfield_2d => self.advance2d(delta_ms),
             .starfield_3d => self.advance3d(delta_ms),
+            .plasma => self.advancePlasma(delta_ms),
+            .boids => self.advanceBoids(delta_ms),
+            .lissajous => self.advanceLissajous(delta_ms),
         }
     }
 
@@ -332,10 +438,111 @@ const DemoState = struct {
         }
     }
 
+    fn advancePlasma(self: *DemoState, delta_ms: u64) void {
+        const dt_ms = if (delta_ms == 0) 16 else delta_ms;
+        const dt = @as(f32, @floatFromInt(dt_ms)) / 1000.0;
+        const speed_scale = self.speed / 180.0;
+        self.plasma_phase += dt * (1.0 + speed_scale * 1.3);
+        self.plasma_shift_x += @as(f32, @floatFromInt(self.dir_x)) * dt * 0.9;
+        self.plasma_shift_y += @as(f32, @floatFromInt(self.dir_y)) * dt * 0.9;
+    }
+
+    fn advanceBoids(self: *DemoState, delta_ms: u64) void {
+        const dt_ms = if (delta_ms == 0) 16 else delta_ms;
+        const dt = @as(f32, @floatFromInt(dt_ms)) / 1000.0;
+        const speed_scale = self.speed / 180.0;
+        const target_x = self.canvas_w * 0.5 + @as(f32, @floatFromInt(self.dir_x)) * self.canvas_w * 0.18;
+        const target_y = self.canvas_h * 0.5 + @as(f32, @floatFromInt(self.dir_y)) * self.canvas_h * 0.18;
+        var next_velocity: [boid_count][2]f32 = undefined;
+
+        self.boid_phase += dt * 0.9;
+
+        for (self.boids, 0..) |boid, index| {
+            var neighbor_count: f32 = 0;
+            var average_x: f32 = 0;
+            var average_y: f32 = 0;
+            var average_vx: f32 = 0;
+            var average_vy: f32 = 0;
+            var separation_x: f32 = 0;
+            var separation_y: f32 = 0;
+
+            for (self.boids, 0..) |other, other_index| {
+                if (index == other_index) continue;
+                const dx = other.x - boid.x;
+                const dy = other.y - boid.y;
+                const distance_sq = dx * dx + dy * dy;
+                if (distance_sq < 6400.0) {
+                    neighbor_count += 1;
+                    average_x += other.x;
+                    average_y += other.y;
+                    average_vx += other.vx;
+                    average_vy += other.vy;
+                    if (distance_sq < 900.0 and distance_sq > 0.001) {
+                        separation_x -= dx / distance_sq;
+                        separation_y -= dy / distance_sq;
+                    }
+                }
+            }
+
+            var vx = boid.vx;
+            var vy = boid.vy;
+            if (neighbor_count > 0) {
+                const inv = 1.0 / neighbor_count;
+                vx += (average_x * inv - boid.x) * 0.18;
+                vy += (average_y * inv - boid.y) * 0.18;
+                vx += (average_vx * inv - boid.vx) * 0.08;
+                vy += (average_vy * inv - boid.vy) * 0.08;
+                vx += separation_x * 2200.0;
+                vy += separation_y * 2200.0;
+            }
+
+            vx += (target_x - boid.x) * 0.08;
+            vy += (target_y - boid.y) * 0.08;
+
+            const min_speed = 24.0 + speed_scale * 18.0;
+            const max_speed = 70.0 + speed_scale * 54.0;
+            const velocity_len = @sqrt(vx * vx + vy * vy);
+            if (velocity_len > max_speed) {
+                const scale = max_speed / velocity_len;
+                vx *= scale;
+                vy *= scale;
+            } else if (velocity_len < min_speed and velocity_len > 0.0001) {
+                const scale = min_speed / velocity_len;
+                vx *= scale;
+                vy *= scale;
+            }
+
+            next_velocity[index] = .{ vx, vy };
+        }
+
+        for (&self.boids, 0..) |*boid, index| {
+            boid.vx = next_velocity[index][0];
+            boid.vy = next_velocity[index][1];
+            boid.x += boid.vx * dt;
+            boid.y += boid.vy * dt;
+            boid.phase += dt * 2.4;
+
+            if (boid.x < -24.0) boid.x = self.canvas_w + 24.0;
+            if (boid.x > self.canvas_w + 24.0) boid.x = -24.0;
+            if (boid.y < -24.0) boid.y = self.canvas_h + 24.0;
+            if (boid.y > self.canvas_h + 24.0) boid.y = -24.0;
+        }
+    }
+
+    fn advanceLissajous(self: *DemoState, delta_ms: u64) void {
+        const dt_ms = if (delta_ms == 0) 16 else delta_ms;
+        const dt = @as(f32, @floatFromInt(dt_ms)) / 1000.0;
+        const speed_scale = self.speed / 180.0;
+        self.lissajous_phase += dt * (0.75 + speed_scale * 0.55);
+    }
+
     fn drawStarfield(self: *DemoState, frame: wingui.FrameView, pane: wingui.PaneRef) !void {
         switch (self.draw_mode) {
             .starfield_2d => try self.drawStarfield2d(frame, pane),
             .starfield_3d => try self.drawStarfield3d(frame, pane),
+            .plasma => try self.drawPlasma(frame, pane),
+            .boids => try self.drawBoids(frame, pane),
+            .lissajous => try self.drawLissajous(frame, pane),
         }
     }
 
@@ -368,30 +575,9 @@ const DemoState = struct {
         );
         primitive_count += 1;
 
-        var dir_x: f32 = @floatFromInt(self.dir_x);
-        var dir_y: f32 = @floatFromInt(self.dir_y);
-        if (dir_x != 0 and dir_y != 0) {
-            dir_x *= diagonal_scale;
-            dir_y *= diagonal_scale;
-        }
-
         for (self.stars) |star| {
             const radius = 0.8 + star.depth * 2.2;
             const brightness = 0.35 + star.depth * 0.65;
-            const tail = 2.0 + star.depth * (self.speed * 0.03);
-
-            self.primitives[primitive_count] = makeLine(
-                star.x + dir_x * tail,
-                star.y + dir_y * tail,
-                star.x,
-                star.y,
-                0.55,
-                brightness,
-                brightness,
-                1.0,
-                0.18 + star.depth * 0.20,
-            );
-            primitive_count += 1;
 
             self.primitives[primitive_count] = makeFilledCircle(
                 star.x,
@@ -437,7 +623,6 @@ const DemoState = struct {
         const mode = wingui.RgbaContentBufferMode.frame;
         const frame_f: f32 = @floatFromInt(frame.index());
         const center_x = self.canvas_w * 0.5;
-        const center_y = self.canvas_h * 0.5;
         const warp_glow: f32 = if (self.warp_active) 1.0 else 0.0;
         const nebula_x = self.canvas_w * 0.19 + @sin(frame_f * 0.013) * self.canvas_w * 0.14;
         const nebula_y = self.canvas_h * 0.25 + @cos(frame_f * 0.017) * self.canvas_h * 0.07;
@@ -523,16 +708,10 @@ const DemoState = struct {
         for (self.stars) |star| {
             const current = projectStar3d(self.canvas_w, self.canvas_h, star.x, star.y, star.depth);
             if (current.x >= 20.0 and current.x < self.canvas_w - 20.0 and current.y >= 24.0 and current.y < self.canvas_h - 24.0) {
-                const dx = (current.x - center_x) / 48.0;
-                const dy = (current.y - center_y) / 48.0;
                 const colour = bodyColour(star.kind, star.depth, star.phase, frame.index());
                 const body_rgb = paletteRgb(colour);
 
                 if (star.kind == 1) {
-                    const tail_x = current.x - dx * (22.0 + self.speed * 0.03 + warp_glow * 16.0);
-                    const tail_y = current.y - dy * (22.0 + self.speed * 0.03 + warp_glow * 16.0);
-                    self.primitives[primitive_count] = makeLine(tail_x, tail_y, current.x, current.y, 1.3 + warp_glow * 0.8, 0.86, 0.90, 1.0, 0.70);
-                    primitive_count += 1;
                     self.primitives[primitive_count] = makeLine(current.x - 3.0, current.y, current.x + 3.0, current.y, 0.8, body_rgb[0], body_rgb[1], body_rgb[2], 0.98);
                     primitive_count += 1;
                     self.primitives[primitive_count] = makeLine(current.x, current.y - 3.0, current.x, current.y + 3.0, 0.8, body_rgb[0], body_rgb[1], body_rgb[2], 0.98);
@@ -581,6 +760,189 @@ const DemoState = struct {
             0.85,
             0.9,
             1.0,
+            0.95,
+        );
+    }
+
+    fn drawPlasma(self: *DemoState, frame: wingui.FrameView, pane: wingui.PaneRef) !void {
+        const clear = [4]f32{ 0.018, 0.010, 0.034, 1.0 };
+        const mode = wingui.RgbaContentBufferMode.frame;
+        const cell_w = self.canvas_w / @as(f32, @floatFromInt(plasma_columns));
+        const cell_h = self.canvas_h / @as(f32, @floatFromInt(plasma_rows));
+        const shift_x = self.plasma_shift_x;
+        const shift_y = self.plasma_shift_y;
+
+        var primitive_count: usize = 0;
+        self.primitives[primitive_count] = makeFilledRect(0, 0, self.canvas_w, self.canvas_h, clear[0], clear[1], clear[2], clear[3]);
+        primitive_count += 1;
+
+        for (0..plasma_rows) |row| {
+            for (0..plasma_columns) |column| {
+                const x = @as(f32, @floatFromInt(column)) / @as(f32, @floatFromInt(plasma_columns));
+                const y = @as(f32, @floatFromInt(row)) / @as(f32, @floatFromInt(plasma_rows));
+                const wave = @sin((x + shift_x) * 10.0 + self.plasma_phase) +
+                    @sin((y + shift_y) * 11.0 - self.plasma_phase * 0.9) +
+                    @sin((x + y) * 8.0 + self.plasma_phase * 0.6) +
+                    @sin(@sqrt((x - 0.5) * (x - 0.5) + (y - 0.5) * (y - 0.5)) * 16.0 - self.plasma_phase * 1.3);
+                const normal = wave * 0.125 + 0.5;
+                const r = clampf(0.12 + normal * 1.05, 0, 1);
+                const g = clampf(0.04 + @sin(normal * 3.1416) * 0.78, 0, 1);
+                const b = clampf(0.22 + (1.0 - normal) * 0.92, 0, 1);
+                const x0 = @as(f32, @floatFromInt(column)) * cell_w;
+                const y0 = @as(f32, @floatFromInt(row)) * cell_h;
+                self.primitives[primitive_count] = makeFilledRect(x0, y0, x0 + cell_w + 1.0, y0 + cell_h + 1.0, r, g, b, 0.98);
+                primitive_count += 1;
+            }
+        }
+
+        try frame.vectorDraw(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.replace,
+            1,
+            &clear,
+            self.primitives[0..primitive_count],
+        );
+
+        var overlay_buffer: [112]u8 = undefined;
+        const overlay_text = try std.fmt.bufPrint(&overlay_buffer, "Plasma  drift {s}  speed {}", .{ self.headingLabel(), @as(u32, @intFromFloat(self.speed)) });
+        try frame.drawText(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.alpha_over,
+            0,
+            &clear,
+            overlay_text,
+            12,
+            12,
+            0.96,
+            0.96,
+            1.0,
+            0.94,
+        );
+    }
+
+    fn drawBoids(self: *DemoState, frame: wingui.FrameView, pane: wingui.PaneRef) !void {
+        const clear = [4]f32{ 0.010, 0.018, 0.026, 1.0 };
+        const mode = wingui.RgbaContentBufferMode.frame;
+        const target_x = self.canvas_w * 0.5 + @as(f32, @floatFromInt(self.dir_x)) * self.canvas_w * 0.18;
+        const target_y = self.canvas_h * 0.5 + @as(f32, @floatFromInt(self.dir_y)) * self.canvas_h * 0.18;
+
+        var primitive_count: usize = 0;
+        self.primitives[primitive_count] = makeFilledRect(0, 0, self.canvas_w, self.canvas_h, clear[0], clear[1], clear[2], clear[3]);
+        primitive_count += 1;
+        self.primitives[primitive_count] = makeFilledCircle(target_x, target_y, 20.0, 0.18, 0.66, 0.90, 0.16);
+        primitive_count += 1;
+        self.primitives[primitive_count] = makeFilledCircle(target_x, target_y, 8.0, 0.90, 0.98, 1.0, 0.18);
+        primitive_count += 1;
+
+        for (self.boids) |boid| {
+            const velocity_len = @sqrt(boid.vx * boid.vx + boid.vy * boid.vy);
+            const forward_x = if (velocity_len > 0.001) boid.vx / velocity_len else 1.0;
+            const forward_y = if (velocity_len > 0.001) boid.vy / velocity_len else 0.0;
+            const side_x = -forward_y;
+            const side_y = forward_x;
+            const tail_x = boid.x - forward_x * 12.0;
+            const tail_y = boid.y - forward_y * 12.0;
+            const wing_span = 3.2 + 0.8 * @sin(boid.phase);
+            const r = 0.35 + 0.15 * @sin(boid.phase + 1.2);
+            const g = 0.76 + 0.20 * @sin(boid.phase + 2.1);
+            const b = 0.66 + 0.24 * @sin(boid.phase + 4.2);
+
+            self.primitives[primitive_count] = makeLine(tail_x, tail_y, boid.x, boid.y, 0.8, r, g, b, 0.76);
+            primitive_count += 1;
+            self.primitives[primitive_count] = makeLine(boid.x - side_x * wing_span, boid.y - side_y * wing_span, boid.x + side_x * wing_span, boid.y + side_y * wing_span, 0.6, r * 0.8, g, b, 0.70);
+            primitive_count += 1;
+            self.primitives[primitive_count] = makeFilledCircle(boid.x, boid.y, 2.2, r + 0.24, g, b, 0.92);
+            primitive_count += 1;
+        }
+
+        try frame.vectorDraw(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.replace,
+            1,
+            &clear,
+            self.primitives[0..primitive_count],
+        );
+
+        var overlay_buffer: [112]u8 = undefined;
+        const overlay_text = try std.fmt.bufPrint(&overlay_buffer, "Boids  flock {}  attract {s}", .{ boid_count, self.headingLabel() });
+        try frame.drawText(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.alpha_over,
+            0,
+            &clear,
+            overlay_text,
+            12,
+            12,
+            0.88,
+            0.96,
+            0.98,
+            0.95,
+        );
+    }
+
+    fn drawLissajous(self: *DemoState, frame: wingui.FrameView, pane: wingui.PaneRef) !void {
+        const clear = [4]f32{ 0.018, 0.012, 0.022, 1.0 };
+        const mode = wingui.RgbaContentBufferMode.frame;
+        const center_x = self.canvas_w * 0.5;
+        const center_y = self.canvas_h * 0.5;
+        const amp_x = self.canvas_w * 0.33;
+        const amp_y = self.canvas_h * 0.28;
+        const freq_x = 3.0 + @as(f32, @floatFromInt(self.dir_x + 1));
+        const freq_y = 2.0 + @as(f32, @floatFromInt(self.dir_y + 2));
+        const segment_count: usize = 220;
+        const phase = self.lissajous_phase;
+
+        var primitive_count: usize = 0;
+        self.primitives[primitive_count] = makeFilledRect(0, 0, self.canvas_w, self.canvas_h, clear[0], clear[1], clear[2], clear[3]);
+        primitive_count += 1;
+        self.primitives[primitive_count] = makeLine(center_x - amp_x, center_y, center_x + amp_x, center_y, 0.4, 0.28, 0.20, 0.42, 0.24);
+        primitive_count += 1;
+        self.primitives[primitive_count] = makeLine(center_x, center_y - amp_y, center_x, center_y + amp_y, 0.4, 0.28, 0.20, 0.42, 0.24);
+        primitive_count += 1;
+
+        var prev_x = center_x + @sin(phase) * amp_x;
+        var prev_y = center_y + @sin(phase * 0.5) * amp_y;
+        for (1..(segment_count + 1)) |segment| {
+            const t = @as(f32, @floatFromInt(segment)) / @as(f32, @floatFromInt(segment_count)) * std.math.tau;
+            const x = center_x + @sin(t * freq_x + phase) * amp_x;
+            const y = center_y + @sin(t * freq_y + phase * 1.37 + 0.6) * amp_y;
+            const glow = @as(f32, @floatFromInt(segment)) / @as(f32, @floatFromInt(segment_count));
+            self.primitives[primitive_count] = makeLine(prev_x, prev_y, x, y, 0.85, 0.46 + glow * 0.34, 0.24 + glow * 0.50, 0.90 + glow * 0.10, 0.84);
+            primitive_count += 1;
+            prev_x = x;
+            prev_y = y;
+        }
+
+        self.primitives[primitive_count] = makeFilledCircle(prev_x, prev_y, 4.0, 1.0, 0.92, 0.60, 0.88);
+        primitive_count += 1;
+
+        try frame.vectorDraw(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.replace,
+            1,
+            &clear,
+            self.primitives[0..primitive_count],
+        );
+
+        var overlay_buffer: [112]u8 = undefined;
+        const overlay_text = try std.fmt.bufPrint(&overlay_buffer, "Lissajous  ratio {d:.0}:{d:.0}  phase {d:.1}", .{ freq_x, freq_y, phase });
+        try frame.drawText(
+            pane,
+            mode,
+            wingui.RgbaBlendMode.alpha_over,
+            0,
+            &clear,
+            overlay_text,
+            12,
+            12,
+            0.96,
+            0.90,
+            0.94,
             0.95,
         );
     }
@@ -653,6 +1015,24 @@ fn onDraw2d(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
 
 fn onDraw3d(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
     if (state.setDrawMode(.starfield_3d)) {
+        state.republish() catch {};
+    }
+}
+
+fn onDrawPlasma(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
+    if (state.setDrawMode(.plasma)) {
+        state.republish() catch {};
+    }
+}
+
+fn onDrawBoids(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
+    if (state.setDrawMode(.boids)) {
+        state.republish() catch {};
+    }
+}
+
+fn onDrawLissajous(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
+    if (state.setDrawMode(.lissajous)) {
         state.republish() catch {};
     }
 }
@@ -731,6 +1111,15 @@ pub fn main() u8 {
         return failWithMessage(demo_title_z);
     };
     runtime.bindEvent("starfield_draw_3d", &state, onDraw3d) catch {
+        return failWithMessage(demo_title_z);
+    };
+    runtime.bindEvent("starfield_draw_plasma", &state, onDrawPlasma) catch {
+        return failWithMessage(demo_title_z);
+    };
+    runtime.bindEvent("starfield_draw_boids", &state, onDrawBoids) catch {
+        return failWithMessage(demo_title_z);
+    };
+    runtime.bindEvent("starfield_draw_lissajous", &state, onDrawLissajous) catch {
         return failWithMessage(demo_title_z);
     };
     runtime.bindEvent("starfield_exit", &state, onExit) catch {

@@ -12,10 +12,10 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $repoRoot
 
 $outputDir = Join-Path $repoRoot 'manual_build\out'
-$exePath = Join-Path $outputDir 'wingui_demo_zig_starfield.exe'
-$repoExePath = Join-Path $repoRoot 'demo_zig_starfield.exe'
-$repoPdbPath = Join-Path $repoRoot 'demo_zig_starfield.pdb'
-$outPdbPath = Join-Path $outputDir 'wingui_demo_zig_starfield.pdb'
+$exePath = Join-Path $outputDir 'wingui_demo_zig_graphics_demo.exe'
+$repoExePath = Join-Path $repoRoot 'demo_zig_graphics_demo.exe'
+$repoPdbPath = Join-Path $repoRoot 'demo_zig_graphics_demo.pdb'
+$outPdbPath = Join-Path $outputDir 'wingui_demo_zig_graphics_demo.pdb'
 
 if (-not (Test-Path -LiteralPath (Join-Path $outputDir 'wingui.lib') -PathType Leaf)) {
     throw "manual_build\out\wingui.lib was not found. Build any packaged Wingui demo first, for example: powershell -NoProfile -ExecutionPolicy Bypass -File .\build_demo_impl.ps1 demo_c_spec_bind.c Release"
@@ -27,7 +27,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $outputDir 'shaders') -PathType Cont
 
 $zigArgs = @(
     'build-exe',
-    'src/demo_zig_starfield.zig',
+    'src/demo_zig_graphics_demo.zig',
     'app_manifest.rc',
     '-I', 'include',
     '-L', $outputDir,
@@ -43,7 +43,7 @@ Remove-Item -LiteralPath $repoPdbPath -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $exePath -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $outPdbPath -ErrorAction SilentlyContinue
 
-Write-Host '==> Building wingui_demo_zig_starfield.exe'
+Write-Host '==> Building wingui_demo_zig_graphics_demo.exe'
 Write-Host ('zig ' + ($zigArgs -join ' '))
 & zig @zigArgs
 if ($LASTEXITCODE -ne 0) {

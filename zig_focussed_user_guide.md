@@ -8,9 +8,9 @@ The relevant files are:
 
 - `src/zig/wingui.zig`: the Zig wrapper
 - `src/demo_zig_spec_bind.zig`: the main Zig runtime sample
-- `src/demo_zig_starfield.zig`: a Zig graphics and keyboard-input sample
+- `src/demo_zig_graphics_demo.zig`: a Zig graphics and keyboard-input sample
 - `build_zig_spec_bind.ps1`: the current Windows build script for the Zig sample
-- `build_zig_starfield.ps1`: the Windows build script for the Zig starfield sample
+- `build_zig_graphics_demo.ps1`: the Windows build script for the Zig graphics demo sample
 - `include/wingui/spec_bind.h`: the underlying runtime C ABI
 - `include/wingui/spec_builder.h`: the underlying authoring-side C ABI
 
@@ -341,7 +341,7 @@ fn onFrame(state: *MyState, runtime: *wingui.Runtime, frame: wingui.FrameView) v
 
 Use declarative events for commands and state toggles. Use frame key polling for continuous motion.
 
-## Starfield sample
+## Graphics demo sample
 
 The repository now includes a Zig sample focused on exactly that split:
 
@@ -350,7 +350,7 @@ The repository now includes a Zig sample focused on exactly that split:
 - an RGBA pane driven by `setFrameHandler(...)`
 - arrow-key steering via `frame.keyDown(...)`
 
-See `src/demo_zig_starfield.zig`.
+See `src/demo_zig_graphics_demo.zig`.
 
 It is a good reference when you want:
 
@@ -383,19 +383,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zig_spec_bind.ps1 Re
 
 If the packaged Wingui outputs do not exist yet, first build any packaged Wingui demo so that `wingui.lib`, `wingui.dll`, and the shader assets are present in `manual_build\out`.
 
-To build the starfield sample:
+To build the graphics demo sample:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zig_starfield.ps1 Release
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zig_graphics_demo.ps1 Release
 ```
 
 To build and run it in one step:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zig_starfield.ps1 Release -Run
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_zig_graphics_demo.ps1 Release -Run
 ```
 
-That writes the final executable to `manual_build\out\wingui_demo_zig_starfield.exe`.
+That writes the final executable to `manual_build\out\wingui_demo_zig_graphics_demo.exe`.
 
 ## Practical guidance for Zig users
 
