@@ -171,11 +171,13 @@ private:
 class UiWindow {
 public:
     explicit UiWindow(std::string title, UiNode body_node);
+    explicit UiWindow(Json window_spec);
 
     UiWindow& title(std::string t)   { title_ = std::move(t); return *this; }
     UiWindow& prop(const std::string& key, UiValue value);
     UiWindow& focused_pane_id(std::string id) { return prop("focusedPaneId", uv(std::move(id))); }
     UiWindow& menu_bar(Json menu_json);
+    UiWindow& command_bar(Json command_json);
     UiWindow& status_bar(Json status_json);
 
     Json to_json() const;
@@ -187,6 +189,7 @@ private:
     std::string title_;
     UiNode body_;
     Json extra_props_ = Json::object();
+    std::optional<Json> raw_spec_;
 };
 
 // ---------------------------------------------------------------------------
@@ -458,12 +461,18 @@ Json ui_menu_separator();
 Json ui_menu_submenu(std::string text, Json items);
 Json ui_menu(std::string text, Json items);
 Json ui_menu_bar(Json menus);
+Json ui_command_item(std::string id, std::string text);
+Json ui_command_item_checked(std::string id, std::string text, bool checked);
+Json ui_command_item_disabled(std::string id, std::string text, bool disabled = true);
+Json ui_command_separator();
+Json ui_command_bar(Json items);
 Json ui_status_part(std::string text);
 Json ui_status_part(std::string text, int64_t width);
 Json ui_status_bar(Json parts);
 
 // Window
 UiWindow ui_window(std::string title, UiNode body);
+UiWindow ui_window(Json window_spec);
 
 // ---------------------------------------------------------------------------
 // Event parsing helpers

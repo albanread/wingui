@@ -138,8 +138,11 @@ int tabHeaderHeightFromContentRect(const RECT& content_rect, int control_height)
 bool positionTabContentHost(HWND tab, ControlBinding& binding, int content_height);
 ordered_json* findWindowStatusBarSpec(ordered_json& spec);
 void applyStatusBarParts(HWND status_bar, const ordered_json& spec, int client_width);
+ordered_json* findWindowCommandBarSpec(ordered_json& spec);
+void applyCommandBarItems(HWND command_bar, const ordered_json& spec);
 ordered_json snapshotSpec();
 void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec);
+void installNativeCommandBarIfPresent(HWND hwnd, ordered_json& spec);
 void refreshNativeViewport(HWND hwnd);
 void updateNativeRootScrollbars(HWND hwnd);
 
@@ -215,6 +218,7 @@ struct NativeHostState {
     std::condition_variable cv;
     DWORD thread_id = 0;
     HWND hwnd = nullptr;
+    HWND command_bar_hwnd = nullptr;
     HWND viewport_host = nullptr;
     HWND content_host = nullptr;
     HWND status_bar_hwnd = nullptr;
@@ -225,6 +229,8 @@ struct NativeHostState {
     std::unordered_map<HWND, ControlBinding> bindings;
     std::unordered_map<std::string, HWND> node_controls;
     std::unordered_map<std::string, int> preserved_scroll_y;
+    std::unordered_map<int, ControlBinding> menu_command_bindings;
+    std::unordered_map<int, ControlBinding> command_bar_bindings;
     std::unordered_map<int, ControlBinding> command_bindings;
     HMENU current_menu = nullptr;
     ordered_json pending_patch = nullptr;
@@ -237,6 +243,7 @@ struct NativeHostState {
     int raw_client_height = 0;
     int client_width = 0;
     int client_height = 0;
+    int command_bar_height = 0;
     int status_bar_height = 0;
     int content_width = 0;
     int content_height = 0;
@@ -3215,7 +3222,10 @@ void clearNativeControls(HWND hwnd) {
     clearNativeChildrenOf(hwnd);
     g_native.bindings.clear();
     g_native.node_controls.clear();
+    g_native.menu_command_bindings.clear();
+    g_native.command_bar_bindings.clear();
     g_native.command_bindings.clear();
+    g_native.command_bar_hwnd = nullptr;
     g_native.viewport_host = nullptr;
     g_native.content_host = nullptr;
     g_native.status_bar_hwnd = nullptr;
@@ -3223,6 +3233,7 @@ void clearNativeControls(HWND hwnd) {
     g_native.raw_client_height = 0;
     g_native.client_width = 0;
     g_native.client_height = 0;
+    g_native.command_bar_height = 0;
     g_native.status_bar_height = 0;
     g_native.content_width = 0;
     g_native.content_height = 0;
@@ -3233,7 +3244,8 @@ void clearNativeControls(HWND hwnd) {
 void clearNativeMenu(HWND hwnd) {
     HMENU old_menu = g_native.current_menu;
     g_native.current_menu = nullptr;
-    g_native.command_bindings.clear();
+    g_native.menu_command_bindings.clear();
+    g_native.command_bindings = g_native.command_bar_bindings;
     HWND menu_owner = (g_native.embedded_mode && g_native.parent_hwnd && IsWindow(g_native.parent_hwnd))
         ? g_native.parent_hwnd
         : hwnd;
@@ -4756,6 +4768,17 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
                 handled_directly = true;
                 continue;
             }
+            if (it.key() == "commandBar") {
+                if (!it.value().is_object() || !g_native.command_bar_hwnd || !IsWindow(g_native.command_bar_hwnd)) {
+                    handled_directly = false;
+                    break;
+                }
+                applyCommandBarItems(g_native.command_bar_hwnd, it.value());
+                refreshNativeViewport(hwnd);
+                updateNativeRootScrollbars(hwnd);
+                handled_directly = true;
+                continue;
+            }
             if (it.key() == "statusBar") {
                 if (!it.value().is_object() || !g_native.status_bar_hwnd || !IsWindow(g_native.status_bar_hwnd)) {
                     handled_directly = false;
@@ -6067,6 +6090,22 @@ ordered_json* findWindowStatusBarSpec(ordered_json& spec) {
     return nullptr;
 }
 
+ordered_json* findWindowCommandBarSpec(ordered_json& spec) {
+    if (!spec.is_object()) return nullptr;
+    auto command_it = spec.find("commandBar");
+    if (command_it != spec.end() && command_it->is_object()) {
+        return &(*command_it);
+    }
+    return nullptr;
+}
+
+void rebuildCombinedCommandBindings() {
+    g_native.command_bindings = g_native.menu_command_bindings;
+    for (const auto& [command_id, binding] : g_native.command_bar_bindings) {
+        g_native.command_bindings[command_id] = binding;
+    }
+}
+
 void removeMenuBarNode(ordered_json& body) {
     if (!body.is_object()) return;
     if (jsonString(body, "type") == "menu-bar") {
@@ -6172,21 +6211,43 @@ int layoutNativeStatusBar(HWND hwnd) {
     return status_height;
 }
 
+int layoutNativeCommandBar(HWND hwnd) {
+    if (!g_native.command_bar_hwnd || !IsWindow(g_native.command_bar_hwnd)) {
+        g_native.command_bar_height = 0;
+        return 0;
+    }
+
+    SendMessageW(g_native.command_bar_hwnd, TB_AUTOSIZE, 0, 0);
+    RECT command_rect{};
+    GetWindowRect(g_native.command_bar_hwnd, &command_rect);
+    const int command_height = std::max(0, static_cast<int>(command_rect.bottom - command_rect.top));
+    SetWindowPos(g_native.command_bar_hwnd,
+                 HWND_TOP,
+                 0,
+                 0,
+                 std::max(1, g_native.raw_client_width),
+                 std::max(1, command_height),
+                 SWP_NOACTIVATE);
+    g_native.command_bar_height = command_height;
+    return command_height;
+}
+
 void refreshNativeViewport(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
     g_native.raw_client_width = std::max(1, static_cast<int>(client.right - client.left));
     g_native.raw_client_height = std::max(1, static_cast<int>(client.bottom - client.top));
 
+    const int command_height = layoutNativeCommandBar(hwnd);
     const int status_height = layoutNativeStatusBar(hwnd);
     g_native.client_width = g_native.raw_client_width;
-    g_native.client_height = std::max(1, g_native.raw_client_height - status_height);
+    g_native.client_height = std::max(1, g_native.raw_client_height - command_height - status_height);
 
     if (g_native.viewport_host && IsWindow(g_native.viewport_host)) {
         SetWindowPos(g_native.viewport_host,
                      nullptr,
                      0,
-                     0,
+                     command_height,
                      std::max(1, g_native.client_width),
                      std::max(1, g_native.client_height),
                      SWP_NOZORDER | SWP_NOACTIVATE);
@@ -6239,6 +6300,71 @@ void dispatchCommandBindingEvent(const ControlBinding& binding) {
     if (!binding.text.empty()) event["text"] = binding.text;
     if (!binding.value_text.empty()) event["value"] = binding.value_text;
     dispatchUiEventJson(event);
+}
+
+void applyCommandBarItems(HWND command_bar, const ordered_json& spec) {
+    if (!command_bar || !IsWindow(command_bar)) return;
+
+    SendMessageW(command_bar, TB_BUTTONSTRUCTSIZE, static_cast<WPARAM>(sizeof(TBBUTTON)), 0);
+    SendMessageW(command_bar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_MIXEDBUTTONS);
+    SendMessageW(command_bar, TB_SETMAXTEXTROWS, 1, 0);
+    while (SendMessageW(command_bar, TB_BUTTONCOUNT, 0, 0) > 0) {
+        SendMessageW(command_bar, TB_DELETEBUTTON, 0, 0);
+    }
+
+    std::unordered_map<int, ControlBinding> command_bar_bindings;
+    const ordered_json* items = jsonArrayChild(spec, "items");
+    if (items && !items->empty()) {
+        std::vector<TBBUTTON> buttons;
+        std::vector<std::wstring> button_texts;
+        buttons.reserve(items->size());
+        button_texts.reserve(items->size());
+
+        for (const auto& item : *items) {
+            if (!item.is_object()) continue;
+
+            TBBUTTON button{};
+            if (item.contains("separator") && isTruthyJson(item["separator"])) {
+                button.fsStyle = BTNS_SEP;
+                button.iBitmap = 8;
+                buttons.push_back(button);
+                continue;
+            }
+
+            button_texts.push_back(utf8ToWide(jsonString(item, "text", jsonString(item, "label", "Command"))));
+            const std::wstring& text = button_texts.back();
+            const bool disabled = item.contains("disabled") && isTruthyJson(item["disabled"]);
+            const bool checked = item.contains("checked") && isTruthyJson(item["checked"]);
+            const int command_id = g_native.next_control_id++;
+
+            button.idCommand = command_id;
+            button.fsState = static_cast<BYTE>((disabled ? 0 : TBSTATE_ENABLED) | (checked ? TBSTATE_CHECKED : 0));
+            button.fsStyle = static_cast<BYTE>((checked ? BTNS_CHECK : BTNS_BUTTON) | BTNS_AUTOSIZE | BTNS_SHOWTEXT);
+            button.iBitmap = I_IMAGENONE;
+            button.iString = reinterpret_cast<INT_PTR>(text.c_str());
+            buttons.push_back(button);
+
+            ControlBinding binding;
+            binding.type = "command-bar-item";
+            binding.node_id = jsonString(item, "id");
+            binding.event_name = jsonString(item, "event", binding.node_id);
+            binding.text = jsonString(item, "text", jsonString(item, "label", "Command"));
+            binding.value_text = jsonString(item, "value");
+            command_bar_bindings[command_id] = std::move(binding);
+        }
+
+        if (!buttons.empty()) {
+            SendMessageW(command_bar,
+                         TB_ADDBUTTONSW,
+                         static_cast<WPARAM>(buttons.size()),
+                         reinterpret_cast<LPARAM>(buttons.data()));
+        }
+    }
+
+    g_native.command_bar_bindings = std::move(command_bar_bindings);
+    rebuildCombinedCommandBindings();
+    SendMessageW(command_bar, TB_AUTOSIZE, 0, 0);
+    InvalidateRect(command_bar, nullptr, TRUE);
 }
 
 bool buildMenuBar(const ordered_json& menu_bar, MenuBuildResult& result) {
@@ -6386,8 +6512,9 @@ void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec) {
 
     HMENU old_menu = g_native.current_menu;
     g_native.current_menu = new_menu;
-    g_native.command_bindings = std::move(new_command_bindings);
+    g_native.menu_command_bindings = std::move(new_command_bindings);
     g_native.next_control_id = next_control_id;
+    rebuildCombinedCommandBindings();
     const HWND menu_owner = nativeMenuOwnerWindow(hwnd);
     SetMenu(menu_owner, new_menu);
     if (old_menu) {
@@ -6406,6 +6533,34 @@ void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec) {
                          SWP_SHOWWINDOW);
         }
     }
+}
+
+void installNativeCommandBarIfPresent(HWND hwnd, ordered_json& spec) {
+    g_native.command_bar_hwnd = nullptr;
+    g_native.command_bar_height = 0;
+
+    ordered_json* command_bar_spec = findWindowCommandBarSpec(spec);
+    if (!command_bar_spec) {
+        g_native.command_bar_bindings.clear();
+        rebuildCombinedCommandBindings();
+        return;
+    }
+
+    DWORD style = CCS_TOP | CCS_NOPARENTALIGN | CCS_NORESIZE | TBSTYLE_FLAT | TBSTYLE_LIST | TBSTYLE_TOOLTIPS;
+    HWND command_bar = createChildControl(TOOLBARCLASSNAMEW,
+                                          L"",
+                                          style,
+                                          0,
+                                          0,
+                                          std::max(1, g_native.raw_client_width),
+                                          30,
+                                          hwnd,
+                                          g_native.ui_font);
+    if (!command_bar) return;
+
+    g_native.command_bar_hwnd = command_bar;
+    applyCommandBarItems(command_bar, *command_bar_spec);
+    layoutNativeCommandBar(hwnd);
 }
 
 void installNativeStatusBarIfPresent(HWND hwnd, ordered_json& spec) {
@@ -6445,6 +6600,8 @@ void rebuildNativeWindow(HWND hwnd) {
     SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
     installNativeMenuIfPresent(hwnd, spec);
     refreshNativeViewport(hwnd);
+    installNativeCommandBarIfPresent(hwnd, spec);
+    refreshNativeViewport(hwnd);
     installNativeStatusBarIfPresent(hwnd, spec);
     refreshNativeViewport(hwnd);
 
@@ -6454,7 +6611,7 @@ void rebuildNativeWindow(HWND hwnd) {
                                             L"",
                                             0,
                                             0,
-                                            0,
+                                            g_native.command_bar_height,
                                             std::max(1, g_native.client_width),
                                             std::max(1, g_native.client_height),
                                             hwnd,
@@ -7023,7 +7180,7 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
 
     case WM_COMMAND:
         if (g_native.suppress_events) return 0;
-        if (lparam == 0) {
+        if (lparam == 0 || reinterpret_cast<HWND>(lparam) == g_native.command_bar_hwnd) {
             const int command_id = LOWORD(wparam);
             auto command_it = g_native.command_bindings.find(command_id);
             if (command_it != g_native.command_bindings.end()) {

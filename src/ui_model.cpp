@@ -755,6 +755,13 @@ Json UiNode::to_json(const std::string& path) const {
 UiWindow::UiWindow(std::string title, UiNode body_node)
     : title_(std::move(title)), body_(std::move(body_node)) {}
 
+UiWindow::UiWindow(Json window_spec)
+    : title_(window_spec.contains("title") && window_spec["title"].is_string()
+        ? window_spec["title"].get<std::string>()
+        : std::string()),
+      body_(UiNode("stack")),
+      raw_spec_(std::move(window_spec)) {}
+
 UiWindow& UiWindow::prop(const std::string& key, UiValue value) {
     extra_props_[key] = ui_value_to_json(value);
     return *this;
@@ -765,12 +772,20 @@ UiWindow& UiWindow::menu_bar(Json menu_json) {
     return *this;
 }
 
+UiWindow& UiWindow::command_bar(Json command_json) {
+    extra_props_["commandBar"] = std::move(command_json);
+    return *this;
+}
+
 UiWindow& UiWindow::status_bar(Json status_json) {
     extra_props_["statusBar"] = std::move(status_json);
     return *this;
 }
 
 Json UiWindow::to_json() const {
+    if (raw_spec_) {
+        return *raw_spec_;
+    }
     Json obj = Json::object();
     obj["type"]  = "window";
     obj["title"] = title_;
@@ -1039,6 +1054,10 @@ bool UiModel::run_reconcile() {
 
 UiWindow ui_window(std::string title, UiNode body) {
     return UiWindow(std::move(title), std::move(body));
+}
+
+UiWindow ui_window(Json window_spec) {
+    return UiWindow(std::move(window_spec));
 }
 
 UiNode ui_stack(std::vector<UiNode> c) {
@@ -1375,6 +1394,37 @@ Json ui_menu(std::string text, Json items) {
 Json ui_menu_bar(Json menus) {
     Json o = Json::object();
     o["menus"] = std::move(menus);
+    return o;
+}
+
+Json ui_command_item(std::string id_str, std::string text) {
+    Json o = Json::object();
+    o["id"] = std::move(id_str);
+    o["text"] = std::move(text);
+    return o;
+}
+
+Json ui_command_item_checked(std::string id_str, std::string text, bool checked) {
+    Json o = ui_command_item(std::move(id_str), std::move(text));
+    o["checked"] = checked;
+    return o;
+}
+
+Json ui_command_item_disabled(std::string id_str, std::string text, bool disabled) {
+    Json o = ui_command_item(std::move(id_str), std::move(text));
+    o["disabled"] = disabled;
+    return o;
+}
+
+Json ui_command_separator() {
+    Json o = Json::object();
+    o["separator"] = true;
+    return o;
+}
+
+Json ui_command_bar(Json items) {
+    Json o = Json::object();
+    o["items"] = std::move(items);
     return o;
 }
 

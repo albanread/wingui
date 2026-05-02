@@ -8,6 +8,8 @@
 
 #include <array>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,7 +19,7 @@ namespace {
 using Json = wingui::Json;
 using EventLabel = std::pair<const char*, const char*>;
 
-constexpr std::array<EventLabel, 24> kTrackedEvents{{
+constexpr std::array<EventLabel, 26> kTrackedEvents{{
     {"name", "Input"},
     {"age", "Number input"},
     {"meeting_date", "Date picker"},
@@ -42,7 +44,55 @@ constexpr std::array<EventLabel, 24> kTrackedEvents{{
     {"menu_about", "Menu about"},
     {"menu_toggle_enabled", "Menu toggle enabled"},
     {"menu_toggle_turbo", "Menu toggle turbo"},
+    {"menu_layout_save", "Menu layout save"},
+    {"menu_layout_load", "Menu layout load"},
 }};
+
+std::filesystem::path executable_directory() {
+    wchar_t path_buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path_buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        return std::filesystem::current_path();
+    }
+    return std::filesystem::path(path_buffer).parent_path();
+}
+
+std::filesystem::path saved_layout_path() {
+    return executable_directory() / "widget_gallery_layout.json";
+}
+
+bool save_json_file(const std::filesystem::path& path, const Json& value, std::string& error) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        error = "Could not open file for writing.";
+        return false;
+    }
+    file << value.dump(2);
+    if (!file.good()) {
+        error = "Failed while writing JSON.";
+        return false;
+    }
+    return true;
+}
+
+bool load_json_file(const std::filesystem::path& path, Json& value, std::string& error) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        error = "Could not open file for reading.";
+        return false;
+    }
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    value = Json::parse(text, nullptr, false);
+    if (value.is_discarded()) {
+        error = "File did not contain valid JSON.";
+        return false;
+    }
+    if (!value.is_object() || value.value("type", std::string()) != "window" || !value.contains("body") || !value["body"].is_object()) {
+        error = "JSON is not a valid window layout spec.";
+        return false;
+    }
+    return true;
+}
 
 void seed_demo_state(wingui::UiState& state) {
     state.merge({
@@ -270,8 +320,9 @@ int main() {
     wg::App app;
     SuperTerminalRunResult result{};
     SuperTerminalClientContext* app_ctx = nullptr;
+    std::optional<Json> loaded_layout_spec;
 
-    auto render_window = [&]() {
+    auto build_default_window = [&]() {
         const std::string name = layout.state().get("name", std::string("Ada Lovelace")).get<std::string>();
         const double age = layout.state().get("age", 37.0).get<double>();
         const std::string meeting_date = layout.state().get("meeting_date", std::string("2026-05-01")).get<std::string>();
@@ -431,11 +482,25 @@ int main() {
                 }).gap(16),
             }).gap(12).padding(12)
         )
+            .command_bar(wg::ui_command_bar(Json::array({
+                wg::ui_command_item("menu_reset_demo", "Reset demo"),
+                wg::ui_command_item("menu_seed_notes", "Seed notes"),
+                wg::ui_command_item_disabled("menu_clear_notes", "Clear notes", !has_notes),
+                wg::ui_command_separator(),
+                wg::ui_command_item_checked("menu_toggle_enabled", "Enabled", enabled),
+                wg::ui_command_item_checked("menu_toggle_turbo", "Turbo", turbo),
+                wg::ui_command_separator(),
+                wg::ui_command_item_disabled("menu_reset_coverage", "Reset coverage", !has_coverage),
+            })))
             .menu_bar(wg::ui_menu_bar(Json::array({
                 wg::ui_menu("File", Json::array({
                     wg::ui_menu_item("menu_reset_demo", "Reset demo"),
                     wg::ui_menu_separator(),
                     wg::ui_menu_item("menu_exit", "Exit"),
+                })),
+                wg::ui_menu("Layout", Json::array({
+                    wg::ui_menu_item("menu_layout_save", "Save layout"),
+                    wg::ui_menu_item("menu_layout_load", "Load layout"),
                 })),
                 wg::ui_menu("Content", Json::array({
                     wg::ui_menu_item("menu_seed_notes", "Seed sample notes"),
@@ -473,6 +538,13 @@ int main() {
                 wg::ui_status_part(total_text, 90),
                 wg::ui_status_part(click_text, 80),
             })));
+    };
+
+    auto render_window = [&]() {
+        if (loaded_layout_spec) {
+            return wg::ui_window(*loaded_layout_spec);
+        }
+        return build_default_window();
     };
 
     const int exit_code = app
@@ -520,8 +592,27 @@ int main() {
                 wg::request_stop(app_ctx);
                 return;
             } else if (event_name == "menu_reset_demo") {
+                loaded_layout_spec.reset();
                 seed_demo_state(layout.state());
                 layout.state().set("menu_message", "Menu: reset the full demo state to its seeded values.");
+            } else if (event_name == "menu_layout_save") {
+                std::string error;
+                const std::filesystem::path path = saved_layout_path();
+                if (save_json_file(path, render_window().to_json(), error)) {
+                    layout.state().set("menu_message", std::string("Layout saved to ") + path.string());
+                } else {
+                    layout.state().set("menu_message", std::string("Layout save failed: ") + error);
+                }
+            } else if (event_name == "menu_layout_load") {
+                Json loaded = Json::object();
+                std::string error;
+                const std::filesystem::path path = saved_layout_path();
+                if (load_json_file(path, loaded, error)) {
+                    loaded_layout_spec = std::move(loaded);
+                    layout.state().set("menu_message", std::string("Layout loaded from ") + path.string());
+                } else {
+                    layout.state().set("menu_message", std::string("Layout load failed: ") + error);
+                }
             } else if (event_name == "menu_seed_notes") {
                 layout.state().set("notes", "Seeded from the main menu. This proves menu commands can mutate normal widget state and rely on the same rerender path.");
                 layout.state().set("rich_notes", wg::ui_rtf_from_html("<p><b>Seeded from the menu</b> with <i>native RichEdit</i> content.</p>"));

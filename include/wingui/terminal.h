@@ -176,6 +176,11 @@ typedef struct SuperTerminalRgbaUploadOwned {
     void* free_user_data;
 } SuperTerminalRgbaUploadOwned;
 
+typedef enum SuperTerminalRgbaContentBufferMode {
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME = 0,
+    SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT = 1,
+} SuperTerminalRgbaContentBufferMode;
+
 typedef struct SuperTerminalRgbaGpuCopy {
     SuperTerminalPaneId dst_pane_id;
     uint32_t dst_buffer_index;
@@ -183,11 +188,6 @@ typedef struct SuperTerminalRgbaGpuCopy {
     uint32_t dst_y;
     SuperTerminalPaneId src_pane_id;
     uint32_t src_buffer_index;
-
-typedef enum SuperTerminalRgbaContentBufferMode {
-    SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME = 0,
-    SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT = 1,
-} SuperTerminalRgbaContentBufferMode;
     uint32_t src_x;
     uint32_t src_y;
     uint32_t region_width;
@@ -284,11 +284,6 @@ typedef struct SuperTerminalSpriteRender {
     SuperTerminalFreeFn free_fn;
     void*    free_user_data;
 } SuperTerminalSpriteRender;
-
-typedef enum SuperTerminalRgbaContentBufferMode {
-    SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME = 0,
-    SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT = 1,
-} SuperTerminalRgbaContentBufferMode;
 
 typedef struct SuperTerminalVectorDrawOwned {
     SuperTerminalPaneId pane_id;

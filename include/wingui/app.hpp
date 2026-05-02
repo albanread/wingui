@@ -786,6 +786,11 @@ using wingui::ui_menu_separator;
 using wingui::ui_menu_submenu;
 using wingui::ui_menu;
 using wingui::ui_menu_bar;
+using wingui::ui_command_item;
+using wingui::ui_command_item_checked;
+using wingui::ui_command_item_disabled;
+using wingui::ui_command_separator;
+using wingui::ui_command_bar;
 using wingui::ui_status_part;
 using wingui::ui_status_bar;
 

@@ -95,6 +95,7 @@
     <ClCompile Include="src\audio.cpp" />
     <ClCompile Include="src\native_ui.cpp" />
     <ClCompile Include="src\SoundBank.cpp" />
+    <ClCompile Include="src\spec_bind.cpp" />
     <ClCompile Include="src\SynthEngine.cpp" />
     <ClCompile Include="src\terminal.cpp" />
     <ClCompile Include="src\ui_model.cpp" />

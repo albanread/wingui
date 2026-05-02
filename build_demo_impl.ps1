@@ -158,6 +158,7 @@ Set-Location -LiteralPath $repoRoot
 
 $demoSourcePath = Resolve-DemoSourcePath -InputPath $DemoSource -RepoRoot $repoRoot
 $demoName = [System.IO.Path]::GetFileNameWithoutExtension($demoSourcePath)
+$demoExtension = [System.IO.Path]::GetExtension($demoSourcePath).ToLowerInvariant()
 $outputDir = Join-Path $repoRoot 'manual_build\out'
 $dllPath = Join-Path $outputDir 'wingui.dll'
 $libPath = Join-Path $outputDir 'wingui.lib'
@@ -198,7 +199,7 @@ $dllArgs += @(
     '/D_WINDOWS', '/D_USRDLL', '/DWINGUI_BUILD_DLL',
     '/I', 'include', '/LD',
     'src\abc_player.cpp', 'src\audio.cpp', 'src\native_ui.cpp', 'src\SoundBank.cpp',
-    'src\SynthEngine.cpp', 'src\terminal.cpp', 'src\ui_model.cpp', 'src\wingui.cpp',
+    'src\spec_bind.cpp', 'src\SynthEngine.cpp', 'src\terminal.cpp', 'src\ui_model.cpp', 'src\wingui.cpp',
     '/link', '/NOLOGO',
     "/OUT:$dllPath",
     "/IMPLIB:$libPath"
@@ -215,10 +216,17 @@ $dllArgs += @(
 $demoArgs = @()
 $demoArgs += $commonCompilerArgs
 $demoArgs += $configurationCompilerArgs
+
+$demoSourceCompileArg = if ($demoExtension -eq '.c') {
+    "/Tc$demoSourcePath"
+} else {
+    $demoSourcePath
+}
+
 $demoArgs += @(
     '/D_WINDOWS',
     '/I', 'include',
-    $demoSourcePath, 'src\ui_model.cpp',
+    $demoSourceCompileArg, '/Tpsrc\ui_model.cpp',
     '/link', '/NOLOGO',
     "/OUT:$demoExePath"
 )
