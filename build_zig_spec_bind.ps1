@@ -28,11 +28,13 @@ if (-not (Test-Path -LiteralPath (Join-Path $outputDir 'shaders') -PathType Cont
 $zigArgs = @(
     'build-exe',
     'src/demo_zig_spec_bind.zig',
+    'app_manifest.rc',
     '-I', 'include',
     '-L', $outputDir,
     '-lwingui',
     '-luser32',
     '-lc',
+    '--subsystem', 'windows',
     '-O', $(if ($Configuration -eq 'Release') { 'ReleaseFast' } else { 'Debug' })
 )
 

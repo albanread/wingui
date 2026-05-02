@@ -2,18 +2,18 @@
 
 ## Goal
 
-Spec + Bind is the C ABI path for Wingui's declarative native UI.
+Spec + Bind is the runtime half of Wingui's portable declarative native UI story.
 
 It separates two concerns:
 
-- `Spec`: a pure JSON window spec that describes structure, labels, ids, layout, menus, command bars, status bars, and widget state.
-- `Bind`: a runtime event table that maps event names from the spec to native callbacks supplied by the embedding language.
+- `spec_builder`: the authoring side that constructs or validates the JSON window spec
+- `spec_bind`: the runtime side that loads the spec, binds callbacks, and hosts the app
 
 The existing C++ builder stays as the most ergonomic authoring layer. Spec + Bind is the portable execution layer for C, Zig, Rust, Odin, C#, Python FFI, and other languages that can call a plain C ABI.
 
 ## Why
 
-The current JSON UI model already captures almost all view state. Event handlers are the missing piece for foreign-language use.
+The current JSON UI model already captures almost all view state. Event handlers and hosted execution were the missing portable runtime pieces for foreign-language use.
 
 The design target is:
 
@@ -36,6 +36,8 @@ The first shipped slice is intentionally narrow.
 - Close requests fall back to `request_stop(0)` when no handler is present.
 
 This is enough to make a foreign host own application state and re-render the declarative UI by publishing full JSON specs.
+
+The complementary authoring surface is now named `spec_builder`: build with `spec_builder`, run with `spec_bind`.
 
 ## Event contract
 
@@ -72,10 +74,15 @@ These are follow-up layers, not prerequisites for a useful portable runtime.
 
 ## Integration shape
 
-The implementation lives in its own public header and source file:
+The runtime implementation lives in its own public header and source file:
 
 - `include/wingui/spec_bind.h`
 - `src/spec_bind.cpp`
+
+The authoring-side boundary is reserved in:
+
+- `include/wingui/spec_builder.h`
+- `spec_builder.md`
 
 The rest of the codebase only needs thin build integration. The runtime reuses the existing hosted terminal API instead of reimplementing the window loop.
 

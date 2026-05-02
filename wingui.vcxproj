@@ -95,6 +95,7 @@
     <ClCompile Include="src\audio.cpp" />
     <ClCompile Include="src\native_ui.cpp" />
     <ClCompile Include="src\SoundBank.cpp" />
+    <ClCompile Include="src\spec_builder.cpp" />
     <ClCompile Include="src\spec_bind.cpp" />
     <ClCompile Include="src\SynthEngine.cpp" />
     <ClCompile Include="src\terminal.cpp" />
@@ -106,6 +107,7 @@
     <ClInclude Include="src\wingui_internal.h" />
     <ClInclude Include="include\wingui\app.hpp" />
     <ClInclude Include="include\wingui\native_ui.h" />
+    <ClInclude Include="include\wingui\spec_builder.h" />
     <ClInclude Include="include\wingui\terminal.h" />
     <ClInclude Include="include\wingui\ui_model.h" />
     <ClInclude Include="include\wingui\wingui.h" />

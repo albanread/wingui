@@ -199,7 +199,7 @@ $dllArgs += @(
     '/D_WINDOWS', '/D_USRDLL', '/DWINGUI_BUILD_DLL',
     '/I', 'include', '/LD',
     'src\abc_player.cpp', 'src\audio.cpp', 'src\native_ui.cpp', 'src\SoundBank.cpp',
-    'src\spec_bind.cpp', 'src\SynthEngine.cpp', 'src\terminal.cpp', 'src\ui_model.cpp', 'src\wingui.cpp',
+    'src\spec_builder.cpp', 'src\spec_bind.cpp', 'src\SynthEngine.cpp', 'src\terminal.cpp', 'src\ui_model.cpp', 'src\wingui.cpp',
     '/link', '/NOLOGO',
     "/OUT:$dllPath",
     "/IMPLIB:$libPath"
