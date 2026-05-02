@@ -17,6 +17,325 @@ namespace wingui {
 
 namespace {
 
+void append_rtf_escaped(std::string& out, const std::string& utf8) {
+    for (size_t index = 0; index < utf8.size();) {
+        const unsigned char ch = static_cast<unsigned char>(utf8[index]);
+        if (ch < 0x80) {
+            switch (ch) {
+            case '\\': out.append("\\\\"); break;
+            case '{': out.append("\\{"); break;
+            case '}': out.append("\\}"); break;
+            case '\n': out.append("\\par "); break;
+            case '\r': break;
+            case '\t': out.append("\\tab "); break;
+            default: out.push_back(static_cast<char>(ch)); break;
+            }
+            ++index;
+            continue;
+        }
+
+        uint32_t codepoint = 0xFFFDu;
+        size_t advance = 1;
+        if ((ch & 0xE0u) == 0xC0u && index + 1 < utf8.size()) {
+            codepoint = ((ch & 0x1Fu) << 6) |
+                        (static_cast<unsigned char>(utf8[index + 1]) & 0x3Fu);
+            advance = 2;
+        } else if ((ch & 0xF0u) == 0xE0u && index + 2 < utf8.size()) {
+            codepoint = ((ch & 0x0Fu) << 12) |
+                        ((static_cast<unsigned char>(utf8[index + 1]) & 0x3Fu) << 6) |
+                        (static_cast<unsigned char>(utf8[index + 2]) & 0x3Fu);
+            advance = 3;
+        } else if ((ch & 0xF8u) == 0xF0u && index + 3 < utf8.size()) {
+            codepoint = ((ch & 0x07u) << 18) |
+                        ((static_cast<unsigned char>(utf8[index + 1]) & 0x3Fu) << 12) |
+                        ((static_cast<unsigned char>(utf8[index + 2]) & 0x3Fu) << 6) |
+                        (static_cast<unsigned char>(utf8[index + 3]) & 0x3Fu);
+            advance = 4;
+        }
+        index += advance;
+
+        if (codepoint <= 0xFFFFu) {
+            const int value = (codepoint <= 0x7FFFu)
+                ? static_cast<int>(codepoint)
+                : static_cast<int>(codepoint) - 0x10000;
+            out.append("\\u");
+            out.append(std::to_string(value));
+            out.push_back('?');
+            continue;
+        }
+
+        codepoint -= 0x10000u;
+        const uint16_t high = static_cast<uint16_t>(0xD800u + ((codepoint >> 10) & 0x3FFu));
+        const uint16_t low = static_cast<uint16_t>(0xDC00u + (codepoint & 0x3FFu));
+        for (const uint16_t unit : {high, low}) {
+            const int value = (unit <= 0x7FFFu)
+                ? static_cast<int>(unit)
+                : static_cast<int>(unit) - 0x10000;
+            out.append("\\u");
+            out.append(std::to_string(value));
+            out.push_back('?');
+        }
+    }
+}
+
+std::string trim_ascii(const std::string& text) {
+    size_t start = 0;
+    while (start < text.size() && static_cast<unsigned char>(text[start]) <= 0x20u) ++start;
+    size_t end = text.size();
+    while (end > start && static_cast<unsigned char>(text[end - 1]) <= 0x20u) --end;
+    return text.substr(start, end - start);
+}
+
+bool ascii_iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ascii_starts_with(std::string_view text, std::string_view prefix) {
+    if (text.size() < prefix.size()) return false;
+    return ascii_iequals(text.substr(0, prefix.size()), prefix);
+}
+
+void append_decoded_html_entity(std::string& out, const std::string& entity) {
+    if (entity == "lt") out.push_back('<');
+    else if (entity == "gt") out.push_back('>');
+    else if (entity == "amp") out.push_back('&');
+    else if (entity == "quot") out.push_back('"');
+    else if (entity == "apos") out.push_back('\'');
+    else if (entity == "nbsp") out.push_back(' ');
+    else out.append("&" + entity + ";");
+}
+
+std::string markdown_inline_to_html(const std::string& line) {
+    std::string out;
+    for (size_t i = 0; i < line.size();) {
+        if (i + 1 < line.size() && line.compare(i, 2, "**") == 0) {
+            const size_t end = line.find("**", i + 2);
+            if (end != std::string::npos) {
+                out.append("<strong>");
+                out.append(markdown_inline_to_html(line.substr(i + 2, end - (i + 2))));
+                out.append("</strong>");
+                i = end + 2;
+                continue;
+            }
+        }
+        if (i + 1 < line.size() && line.compare(i, 2, "__") == 0) {
+            const size_t end = line.find("__", i + 2);
+            if (end != std::string::npos) {
+                out.append("<strong>");
+                out.append(markdown_inline_to_html(line.substr(i + 2, end - (i + 2))));
+                out.append("</strong>");
+                i = end + 2;
+                continue;
+            }
+        }
+        if (line[i] == '*' || line[i] == '_') {
+            const char marker = line[i];
+            const size_t end = line.find(marker, i + 1);
+            if (end != std::string::npos) {
+                out.append("<em>");
+                out.append(markdown_inline_to_html(line.substr(i + 1, end - (i + 1))));
+                out.append("</em>");
+                i = end + 1;
+                continue;
+            }
+        }
+        if (line[i] == '`') {
+            const size_t end = line.find('`', i + 1);
+            if (end != std::string::npos) {
+                out.append("<code>");
+                out.append(line.substr(i + 1, end - (i + 1)));
+                out.append("</code>");
+                i = end + 1;
+                continue;
+            }
+        }
+        if (line[i] == '&') out.append("&amp;");
+        else if (line[i] == '<') out.append("&lt;");
+        else if (line[i] == '>') out.append("&gt;");
+        else out.push_back(line[i]);
+        ++i;
+    }
+    return out;
+}
+
+std::string markdown_to_htmlish(const std::string& markdown) {
+    std::string html;
+    bool in_list = false;
+    bool in_code_block = false;
+    size_t start = 0;
+    while (start <= markdown.size()) {
+        const size_t end = markdown.find('\n', start);
+        std::string line = end == std::string::npos ? markdown.substr(start) : markdown.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::string trimmed = trim_ascii(line);
+
+        if (trimmed == "```") {
+            if (in_list) {
+                html.append("</ul>");
+                in_list = false;
+            }
+            html.append(in_code_block ? "</code></pre>" : "<pre><code>");
+            in_code_block = !in_code_block;
+        } else if (in_code_block) {
+            html.append(markdown_inline_to_html(line));
+            html.push_back('\n');
+        } else if (trimmed.empty()) {
+            if (in_list) {
+                html.append("</ul>");
+                in_list = false;
+            }
+        } else {
+            size_t heading_depth = 0;
+            while (heading_depth < trimmed.size() && trimmed[heading_depth] == '#') ++heading_depth;
+            if (heading_depth > 0 && heading_depth <= 6 && heading_depth < trimmed.size() && trimmed[heading_depth] == ' ') {
+                if (in_list) {
+                    html.append("</ul>");
+                    in_list = false;
+                }
+                html.append("<h");
+                html.push_back(static_cast<char>('0' + heading_depth));
+                html.push_back('>');
+                html.append(markdown_inline_to_html(trimmed.substr(heading_depth + 1)));
+                html.append("</h");
+                html.push_back(static_cast<char>('0' + heading_depth));
+                html.push_back('>');
+            } else if (ascii_starts_with(trimmed, "- ") || ascii_starts_with(trimmed, "* ") || ascii_starts_with(trimmed, "+ ")) {
+                if (!in_list) {
+                    html.append("<ul>");
+                    in_list = true;
+                }
+                html.append("<li>");
+                html.append(markdown_inline_to_html(trimmed.substr(2)));
+                html.append("</li>");
+            } else {
+                if (in_list) {
+                    html.append("</ul>");
+                    in_list = false;
+                }
+                html.append("<p>");
+                html.append(markdown_inline_to_html(trimmed));
+                html.append("</p>");
+            }
+        }
+
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    if (in_list) html.append("</ul>");
+    if (in_code_block) html.append("</code></pre>");
+    return html;
+}
+
+std::string html_to_rtf_body(const std::string& html) {
+    std::string out;
+    std::vector<std::string> stack;
+    auto close_top = [&](size_t count = 1) {
+        while (count-- > 0 && !stack.empty()) {
+            out.append(stack.back());
+            stack.pop_back();
+        }
+    };
+
+    for (size_t index = 0; index < html.size();) {
+        if (html[index] == '<') {
+            const size_t end = html.find('>', index + 1);
+            if (end == std::string::npos) break;
+            std::string tag = trim_ascii(html.substr(index + 1, end - index - 1));
+            const bool closing = !tag.empty() && tag[0] == '/';
+            if (closing) tag = trim_ascii(tag.substr(1));
+            const size_t space = tag.find_first_of(" \t\r\n");
+            const std::string name = space == std::string::npos ? tag : tag.substr(0, space);
+
+            if (!closing) {
+                if (ascii_iequals(name, "b") || ascii_iequals(name, "strong")) {
+                    out.append("{\\b ");
+                    stack.push_back("}");
+                } else if (ascii_iequals(name, "i") || ascii_iequals(name, "em")) {
+                    out.append("{\\i ");
+                    stack.push_back("}");
+                } else if (ascii_iequals(name, "u")) {
+                    out.append("{\\ul ");
+                    stack.push_back("}");
+                } else if (ascii_iequals(name, "code")) {
+                    out.append("{\\f1 ");
+                    stack.push_back("}");
+                } else if (ascii_iequals(name, "pre")) {
+                    out.append("\\par {\\f1 ");
+                    stack.push_back("}\\par ");
+                } else if (ascii_iequals(name, "br")) {
+                    out.append("\\line ");
+                } else if (ascii_iequals(name, "p") || ascii_iequals(name, "div")) {
+                    out.append("\\par ");
+                } else if (ascii_iequals(name, "li")) {
+                    out.append("\\par \\u8226?\\tab ");
+                } else if (ascii_iequals(name, "h1")) {
+                    out.append("\\par {\\b\\fs36 ");
+                    stack.push_back("}\\par ");
+                } else if (ascii_iequals(name, "h2")) {
+                    out.append("\\par {\\b\\fs32 ");
+                    stack.push_back("}\\par ");
+                } else if (ascii_iequals(name, "h3")) {
+                    out.append("\\par {\\b\\fs28 ");
+                    stack.push_back("}\\par ");
+                } else if (ascii_iequals(name, "h4") || ascii_iequals(name, "h5") || ascii_iequals(name, "h6")) {
+                    out.append("\\par {\\b\\fs24 ");
+                    stack.push_back("}\\par ");
+                }
+            } else {
+                if (ascii_iequals(name, "b") || ascii_iequals(name, "strong") ||
+                    ascii_iequals(name, "i") || ascii_iequals(name, "em") ||
+                    ascii_iequals(name, "u") || ascii_iequals(name, "code") ||
+                    ascii_iequals(name, "pre") || ascii_iequals(name, "h1") ||
+                    ascii_iequals(name, "h2") || ascii_iequals(name, "h3") ||
+                    ascii_iequals(name, "h4") || ascii_iequals(name, "h5") ||
+                    ascii_iequals(name, "h6")) {
+                    close_top();
+                } else if (ascii_iequals(name, "p") || ascii_iequals(name, "div") || ascii_iequals(name, "li")) {
+                    out.append("\\par ");
+                }
+            }
+
+            index = end + 1;
+            continue;
+        }
+
+        if (html[index] == '&') {
+            const size_t end = html.find(';', index + 1);
+            if (end != std::string::npos) {
+                std::string decoded;
+                append_decoded_html_entity(decoded, html.substr(index + 1, end - index - 1));
+                append_rtf_escaped(out, decoded);
+                index = end + 1;
+                continue;
+            }
+        }
+
+        size_t next_tag = html.find('<', index);
+        size_t next_entity = html.find('&', index);
+        size_t stop = std::min(next_tag == std::string::npos ? html.size() : next_tag,
+                               next_entity == std::string::npos ? html.size() : next_entity);
+        append_rtf_escaped(out, html.substr(index, stop - index));
+        index = stop;
+    }
+
+    close_top(stack.size());
+    return out;
+}
+
+std::string wrap_rtf_document(std::string body) {
+    std::string out = "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Segoe UI;}{\\f1 Consolas;}}\\viewkind4\\uc1 ";
+    out.append(std::move(body));
+    out.push_back('}');
+    return out;
+}
+
 // Convert a UiValue variant to a Json scalar.
 Json ui_value_to_json(const UiValue& v) {
     return std::visit([](const auto& val) -> Json {
@@ -446,6 +765,11 @@ UiWindow& UiWindow::menu_bar(Json menu_json) {
     return *this;
 }
 
+UiWindow& UiWindow::status_bar(Json status_json) {
+    extra_props_["statusBar"] = std::move(status_json);
+    return *this;
+}
+
 Json UiWindow::to_json() const {
     Json obj = Json::object();
     obj["type"]  = "window";
@@ -839,6 +1163,21 @@ UiNode ui_textarea(std::string l, std::string v, std::string e) {
 UiNode ui_rich_text(std::string l, std::string v, std::string e) {
     UiNode n("rich-text"); n.label(std::move(l)); n.value(std::move(v)); n.event(std::move(e)); return n;
 }
+std::string ui_rtf_from_plain_text(std::string text) {
+    std::string body;
+    body.reserve(text.size() * 2);
+    append_rtf_escaped(body, text);
+    return wrap_rtf_document(std::move(body));
+}
+
+std::string ui_rtf_from_html(std::string html) {
+    return wrap_rtf_document(html_to_rtf_body(html));
+}
+
+std::string ui_rtf_from_markdown(std::string markdown) {
+    return ui_rtf_from_html(markdown_to_htmlish(markdown));
+}
+
 UiNode ui_checkbox(std::string l, bool ch, std::string e) {
     UiNode n("checkbox"); n.label(std::move(l)); n.checked(ch); n.event(std::move(e)); return n;
 }
@@ -1007,6 +1346,12 @@ Json ui_menu_item_checked(std::string id_str, std::string text, bool checked) {
     return o;
 }
 
+Json ui_menu_item_disabled(std::string id_str, std::string text, bool disabled) {
+    Json o = ui_menu_item(std::move(id_str), std::move(text));
+    o["disabled"] = disabled;
+    return o;
+}
+
 Json ui_menu_separator() {
     Json o = Json::object();
     o["separator"] = true;
@@ -1030,6 +1375,24 @@ Json ui_menu(std::string text, Json items) {
 Json ui_menu_bar(Json menus) {
     Json o = Json::object();
     o["menus"] = std::move(menus);
+    return o;
+}
+
+Json ui_status_part(std::string text) {
+    Json o = Json::object();
+    o["text"] = std::move(text);
+    return o;
+}
+
+Json ui_status_part(std::string text, int64_t width) {
+    Json o = ui_status_part(std::move(text));
+    if (width > 0) o["width"] = width;
+    return o;
+}
+
+Json ui_status_bar(Json parts) {
+    Json o = Json::object();
+    o["parts"] = std::move(parts);
     return o;
 }
 

@@ -753,6 +753,9 @@ using wingui::ui_switch_toggle;
 using wingui::ui_slider;
 using wingui::ui_progress;
 using wingui::ui_canvas;
+using wingui::ui_rtf_from_plain_text;
+using wingui::ui_rtf_from_html;
+using wingui::ui_rtf_from_markdown;
 
 // D3D surface panes
 using wingui::ui_text_grid;
@@ -778,10 +781,13 @@ using wingui::ui_tab;
 // Menu helpers (return plain Json)
 using wingui::ui_menu_item;
 using wingui::ui_menu_item_checked;
+using wingui::ui_menu_item_disabled;
 using wingui::ui_menu_separator;
 using wingui::ui_menu_submenu;
 using wingui::ui_menu;
 using wingui::ui_menu_bar;
+using wingui::ui_status_part;
+using wingui::ui_status_bar;
 
 // Event parsing
 using wingui::ui_parse_event;

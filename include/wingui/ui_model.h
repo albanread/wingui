@@ -176,6 +176,7 @@ public:
     UiWindow& prop(const std::string& key, UiValue value);
     UiWindow& focused_pane_id(std::string id) { return prop("focusedPaneId", uv(std::move(id))); }
     UiWindow& menu_bar(Json menu_json);
+    UiWindow& status_bar(Json status_json);
 
     Json to_json() const;
 
@@ -401,6 +402,11 @@ UiNode ui_slider(std::string label, double value, std::string event_name);
 UiNode ui_progress(std::string label, double value);
 UiNode ui_canvas(int64_t width, int64_t height, Json commands = Json::array());
 
+// Rich-text helpers (produce RTF strings for ui_rich_text values)
+std::string ui_rtf_from_plain_text(std::string text);
+std::string ui_rtf_from_html(std::string html);
+std::string ui_rtf_from_markdown(std::string markdown);
+
 // Custom D3D surfaces
 UiNode ui_text_grid(int64_t columns, int64_t rows, std::string event_name = "");
 UiNode ui_text_grid(std::string id, int64_t columns, int64_t rows, std::string event_name = "", bool focused = false);
@@ -447,10 +453,14 @@ Json ui_tab(std::string value, std::string text, const UiNode& content);
 // Menu helpers (produce plain Json objects for the window menu-bar prop)
 Json ui_menu_item(std::string id, std::string text);
 Json ui_menu_item_checked(std::string id, std::string text, bool checked);
+Json ui_menu_item_disabled(std::string id, std::string text, bool disabled = true);
 Json ui_menu_separator();
 Json ui_menu_submenu(std::string text, Json items);
 Json ui_menu(std::string text, Json items);
 Json ui_menu_bar(Json menus);
+Json ui_status_part(std::string text);
+Json ui_status_part(std::string text, int64_t width);
+Json ui_status_bar(Json parts);
 
 // Window
 UiWindow ui_window(std::string title, UiNode body);

@@ -245,7 +245,7 @@ int main() {
                 {"meeting_date", "2026-05-01"},
                 {"meeting_time", "13:45"},
                 {"notes", "Try each control and watch the coverage panel."},
-                {"rich_notes", "<p><b>Rich text</b> should emit HTML.</p>"},
+                {"rich_notes", wg::ui_rtf_from_html("<p><b>Rich text</b> should emit RTF.</p>")},
                 {"enabled", true},
                 {"turbo", false},
                 {"intensity", 42.0},

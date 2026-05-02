@@ -886,9 +886,45 @@ void resizeHostWindowToNativeContent(SuperTerminalRuntimeHost* host) {
     RECT target_rect{0, 0, desired_client_width, desired_client_height};
     const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
     const DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
-    AdjustWindowRectEx(&target_rect, style, GetMenu(hwnd) != nullptr, ex_style);
-    const int window_width = (target_rect.right - target_rect.left) > 0 ? static_cast<int>(target_rect.right - target_rect.left) : 1;
-    const int window_height = (target_rect.bottom - target_rect.top) > 0 ? static_cast<int>(target_rect.bottom - target_rect.top) : 1;
+    using AdjustWindowRectExForDpiFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static auto adjust_for_dpi = reinterpret_cast<AdjustWindowRectExForDpiFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi"));
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    static auto get_dpi_for_window = reinterpret_cast<GetDpiForWindowFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    if (adjust_for_dpi && get_dpi_for_window) {
+        adjust_for_dpi(&target_rect, style, GetMenu(hwnd) != nullptr, ex_style, get_dpi_for_window(hwnd));
+    } else {
+        AdjustWindowRectEx(&target_rect, style, GetMenu(hwnd) != nullptr, ex_style);
+    }
+    int window_width = (target_rect.right - target_rect.left) > 0 ? static_cast<int>(target_rect.right - target_rect.left) : 1;
+    int window_height = (target_rect.bottom - target_rect.top) > 0 ? static_cast<int>(target_rect.bottom - target_rect.top) : 1;
+
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    const HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor && GetMonitorInfoW(monitor, &monitor_info)) {
+        const RECT work = monitor_info.rcWork;
+        const int work_width = std::max(1, static_cast<int>(work.right - work.left));
+        const int work_height = std::max(1, static_cast<int>(work.bottom - work.top));
+        window_width = std::min(window_width, work_width);
+        window_height = std::min(window_height, work_height);
+
+        RECT current_rect{};
+        if (GetWindowRect(hwnd, &current_rect)) {
+            const int clamped_x = std::clamp(static_cast<int>(current_rect.left), static_cast<int>(work.left), static_cast<int>(work.right) - window_width);
+            const int clamped_y = std::clamp(static_cast<int>(current_rect.top), static_cast<int>(work.top), static_cast<int>(work.bottom) - window_height);
+            SetWindowPos(hwnd,
+                nullptr,
+                clamped_x,
+                clamped_y,
+                window_width,
+                window_height,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            return;
+        }
+    }
+
     SetWindowPos(hwnd,
         nullptr,
         0,
@@ -1579,6 +1615,12 @@ intptr_t WINGUI_CALL hostWindowProc(
         case WM_ERASEBKGND:
             *handled = 1;
             return 1;
+        case WM_COMMAND:
+            if (lparam == 0 && wingui_native_handle_host_command(static_cast<int32_t>(LOWORD(wparam))) != 0) {
+                *handled = 1;
+                return 0;
+            }
+            break;
         case WM_CLOSE: {
             if (host->close_event_sent.exchange(1, std::memory_order_acq_rel) == 0) {
                 SuperTerminalEvent event{};
@@ -1735,7 +1777,17 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
     RECT rect{0, 0,
         static_cast<LONG>(std::max<uint32_t>(1, host->desc.columns) * static_cast<uint32_t>(host->atlas.info.cell_width)),
         static_cast<LONG>(std::max<uint32_t>(1, host->desc.rows) * static_cast<uint32_t>(host->atlas.info.cell_height))};
-    AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    using AdjustWindowRectExForDpiFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static auto adjust_for_dpi = reinterpret_cast<AdjustWindowRectExForDpiFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi"));
+    const UINT initial_dpi = host->desc.dpi_scale > 0.0f
+        ? static_cast<UINT>(std::max(96.0f, host->desc.dpi_scale * 96.0f))
+        : 96u;
+    if (adjust_for_dpi) {
+        adjust_for_dpi(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0, initial_dpi);
+    } else {
+        AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    }
 
     WinguiWindowDesc window_desc{};
     window_desc.class_name_utf8 = "SuperTerminalWindow";

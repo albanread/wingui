@@ -51,6 +51,7 @@ constexpr UINT_PTR kContainerSubclassId = 0x57534E43; // WSNC
 constexpr UINT_PTR kTransparentPaneSubclassId = 0x5753504E; // WSPN
 constexpr UINT_PTR kCanvasSubclassId = 0x57534356;    // WSCV
 constexpr UINT_PTR kImageSubclassId = 0x5753494D;     // WSIM
+constexpr UINT_PTR kRichEditSubclassId = 0x57535245;  // WSRE
 constexpr UINT_PTR kSplitViewSubclassId = 0x57535356; // WSSV
 constexpr UINT_PTR kScrollViewSubclassId = 0x57534352; // WSCR
 constexpr UINT_PTR kResizeTimerId = 1;     // debounce WM_SIZE rebuilds
@@ -135,6 +136,12 @@ RECT tabContentRect(HWND hwnd);
 RECT tabContentRectInParent(HWND hwnd);
 int tabHeaderHeightFromContentRect(const RECT& content_rect, int control_height);
 bool positionTabContentHost(HWND tab, ControlBinding& binding, int content_height);
+ordered_json* findWindowStatusBarSpec(ordered_json& spec);
+void applyStatusBarParts(HWND status_bar, const ordered_json& spec, int client_width);
+ordered_json snapshotSpec();
+void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec);
+void refreshNativeViewport(HWND hwnd);
+void updateNativeRootScrollbars(HWND hwnd);
 
 struct GridMetrics {
     int columns = 1;
@@ -208,7 +215,9 @@ struct NativeHostState {
     std::condition_variable cv;
     DWORD thread_id = 0;
     HWND hwnd = nullptr;
+    HWND viewport_host = nullptr;
     HWND content_host = nullptr;
+    HWND status_bar_hwnd = nullptr;
     bool ready = false;
     bool running = false;
     bool thread_started = false;
@@ -224,10 +233,14 @@ struct NativeHostState {
     HFONT heading_font = nullptr;
     bool suppress_events = false;
     int current_dpi = 96;
+    int raw_client_width = 0;
+    int raw_client_height = 0;
     int client_width = 0;
     int client_height = 0;
+    int status_bar_height = 0;
     int content_width = 0;
     int content_height = 0;
+    HWND focused_rich_text_hwnd = nullptr;
     int scroll_x = 0;
     int scroll_y = 0;
     std::mutex command_mutex;
@@ -877,6 +890,445 @@ std::wstring controlWindowText(HWND hwnd) {
     return value;
 }
 
+std::wstring normalizeLineEndings(std::wstring text) {
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (size_t index = 0; index < text.size(); ++index) {
+        const wchar_t ch = text[index];
+        if (ch == L'\r') {
+            if (index + 1 < text.size() && text[index + 1] == L'\n') {
+                ++index;
+            }
+            normalized.push_back(L'\n');
+            continue;
+        }
+        normalized.push_back(ch);
+    }
+    return normalized;
+}
+
+struct EditViewState {
+    DWORD selection_start = 0;
+    DWORD selection_end = 0;
+    int first_visible_line = 0;
+};
+
+struct RichEditStreamState {
+    const char* input = nullptr;
+    size_t input_size = 0;
+    size_t input_offset = 0;
+    std::string output;
+};
+
+DWORD CALLBACK richEditStreamInCallback(DWORD_PTR cookie, LPBYTE buffer, LONG cb, LONG* written) {
+    if (!written) return 1;
+    auto* state = reinterpret_cast<RichEditStreamState*>(cookie);
+    if (!state || !state->input) {
+        *written = 0;
+        return 1;
+    }
+    const size_t remaining = state->input_size > state->input_offset
+        ? (state->input_size - state->input_offset)
+        : 0;
+    const size_t count = std::min<size_t>(remaining, static_cast<size_t>(std::max<LONG>(0, cb)));
+    if (count > 0) {
+        std::memcpy(buffer, state->input + state->input_offset, count);
+        state->input_offset += count;
+    }
+    *written = static_cast<LONG>(count);
+    return 0;
+}
+
+DWORD CALLBACK richEditStreamOutCallback(DWORD_PTR cookie, LPBYTE buffer, LONG cb, LONG* written) {
+    if (!written) return 1;
+    auto* state = reinterpret_cast<RichEditStreamState*>(cookie);
+    if (!state || !buffer || cb < 0) {
+        *written = 0;
+        return 1;
+    }
+    state->output.append(reinterpret_cast<const char*>(buffer), static_cast<size_t>(cb));
+    *written = cb;
+    return 0;
+}
+
+bool richEditSetRtf(HWND hwnd, const std::string& rtf) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    RichEditStreamState state;
+    state.input = rtf.data();
+    state.input_size = rtf.size();
+    EDITSTREAM stream{};
+    stream.dwCookie = reinterpret_cast<DWORD_PTR>(&state);
+    stream.pfnCallback = richEditStreamInCallback;
+    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+    SendMessageW(hwnd, EM_STREAMIN, SF_RTF | SFF_SELECTION, reinterpret_cast<LPARAM>(&stream));
+    SendMessageW(hwnd, EM_SETSEL, 0, 0);
+    return stream.dwError == 0;
+}
+
+std::string richEditGetRtf(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return std::string();
+    RichEditStreamState state;
+    EDITSTREAM stream{};
+    stream.dwCookie = reinterpret_cast<DWORD_PTR>(&state);
+    stream.pfnCallback = richEditStreamOutCallback;
+    SendMessageW(hwnd, EM_STREAMOUT, SF_RTF, reinterpret_cast<LPARAM>(&stream));
+    return stream.dwError == 0 ? state.output : std::string();
+}
+
+void dispatchRichTextChangeEvent(HWND hwnd, ControlBinding& binding) {
+    if (!hwnd || !IsWindow(hwnd) || binding.event_name.empty()) return;
+    binding.value_text = richEditGetRtf(hwnd);
+    ordered_json event = ordered_json::object();
+    event["type"] = "ui-event";
+    event["event"] = binding.event_name;
+    event["source"] = "native-win32";
+    if (!binding.node_id.empty()) event["id"] = binding.node_id;
+    if (!binding.text.empty()) event["text"] = binding.text;
+    event["value"] = binding.value_text;
+    dispatchUiEventJson(event);
+}
+
+void dispatchControlFocusEvent(const ControlBinding& binding, bool focused) {
+    if (binding.event_name.empty()) return;
+    ordered_json event = ordered_json::object();
+    event["type"] = "ui-event";
+    event["event"] = binding.event_name;
+    event["source"] = "native-win32";
+    if (!binding.node_id.empty()) event["id"] = binding.node_id;
+    if (!binding.text.empty()) event["text"] = binding.text;
+    event["focused"] = focused;
+    event["controlType"] = binding.type;
+    event["value"] = focused;
+    dispatchUiEventJson(event);
+}
+
+bool toggleRichEditSelectionEffect(HWND hwnd, DWORD mask, DWORD effect) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    CHARFORMAT2W format{};
+    format.cbSize = sizeof(format);
+    if (SendMessageW(hwnd, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&format)) == 0) {
+        return false;
+    }
+
+    const bool enabled = (format.dwMask & mask) != 0 && (format.dwEffects & effect) != 0;
+    CHARFORMAT2W update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = mask;
+    update.dwEffects = enabled ? 0u : effect;
+    return SendMessageW(hwnd, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool setRichEditParagraphAlignment(HWND hwnd, WORD alignment) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    PARAFORMAT2 format{};
+    format.cbSize = sizeof(format);
+    format.dwMask = PFM_ALIGNMENT;
+    format.wAlignment = alignment;
+    return SendMessageW(hwnd, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&format)) != 0;
+}
+
+bool toggleRichEditBullets(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    PARAFORMAT2 current{};
+    current.cbSize = sizeof(current);
+    SendMessageW(hwnd, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&current));
+
+    PARAFORMAT2 update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = PFM_NUMBERING | PFM_STARTINDENT | PFM_OFFSET;
+    const bool enabled = (current.dwMask & PFM_NUMBERING) != 0 && current.wNumbering == PFN_BULLET;
+    if (enabled) {
+        update.wNumbering = 0;
+        update.dxStartIndent = 0;
+        update.dxOffset = 0;
+    } else {
+        update.wNumbering = PFN_BULLET;
+        update.dxStartIndent = 360;
+        update.dxOffset = -180;
+    }
+    return SendMessageW(hwnd, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool toggleRichEditNumbering(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    PARAFORMAT2 current{};
+    current.cbSize = sizeof(current);
+    SendMessageW(hwnd, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&current));
+
+    PARAFORMAT2 update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = PFM_NUMBERING | PFM_STARTINDENT | PFM_OFFSET | PFM_NUMBERINGSTART | PFM_NUMBERINGSTYLE | PFM_NUMBERINGTAB;
+    const bool enabled = (current.dwMask & PFM_NUMBERING) != 0 && current.wNumbering == PFN_ARABIC;
+    if (enabled) {
+        update.wNumbering = 0;
+        update.dxStartIndent = 0;
+        update.dxOffset = 0;
+        update.wNumberingStart = 0;
+        update.wNumberingStyle = 0;
+        update.wNumberingTab = 0;
+    } else {
+        update.wNumbering = PFN_ARABIC;
+        update.dxStartIndent = 360;
+        update.dxOffset = -180;
+        update.wNumberingStart = 1;
+        update.wNumberingStyle = 0;
+        update.wNumberingTab = 360;
+    }
+    return SendMessageW(hwnd, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool adjustRichEditParagraphIndent(HWND hwnd, LONG delta_twips) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    PARAFORMAT2 current{};
+    current.cbSize = sizeof(current);
+    SendMessageW(hwnd, EM_GETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&current));
+
+    PARAFORMAT2 update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = PFM_STARTINDENT;
+    update.dxStartIndent = std::max<LONG>(0, current.dxStartIndent + delta_twips);
+    return SendMessageW(hwnd, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool clearRichEditCharacterFormatting(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    CHARFORMAT2W update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE;
+    update.dwEffects = 0;
+    return SendMessageW(hwnd, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool clearRichEditParagraphFormatting(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    PARAFORMAT2 update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = PFM_ALIGNMENT | PFM_NUMBERING | PFM_STARTINDENT | PFM_OFFSET | PFM_NUMBERINGSTART | PFM_NUMBERINGSTYLE | PFM_NUMBERINGTAB;
+    update.wAlignment = PFA_LEFT;
+    update.wNumbering = 0;
+    update.dxStartIndent = 0;
+    update.dxOffset = 0;
+    update.wNumberingStart = 0;
+    update.wNumberingStyle = 0;
+    update.wNumberingTab = 0;
+    return SendMessageW(hwnd, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool adjustRichEditSelectionFontSize(HWND hwnd, LONG delta_twips) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    CHARFORMAT2W current{};
+    current.cbSize = sizeof(current);
+    SendMessageW(hwnd, EM_GETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&current));
+
+    LONG size = current.yHeight;
+    if (size <= 0) size = 200;
+    size = std::clamp<LONG>(size + delta_twips, 120, 1440);
+
+    CHARFORMAT2W update{};
+    update.cbSize = sizeof(update);
+    update.dwMask = CFM_SIZE;
+    update.yHeight = size;
+    return SendMessageW(hwnd, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&update)) != 0;
+}
+
+bool applyRichEditFormatSelectionCommand(HWND hwnd, const std::string& command) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (command == "bold") return toggleRichEditSelectionEffect(hwnd, CFM_BOLD, CFE_BOLD);
+    if (command == "italic") return toggleRichEditSelectionEffect(hwnd, CFM_ITALIC, CFE_ITALIC);
+    if (command == "underline") return toggleRichEditSelectionEffect(hwnd, CFM_UNDERLINE, CFE_UNDERLINE);
+    if (command == "clear") return clearRichEditCharacterFormatting(hwnd);
+    if (command == "align-left") return setRichEditParagraphAlignment(hwnd, PFA_LEFT);
+    if (command == "align-center") return setRichEditParagraphAlignment(hwnd, PFA_CENTER);
+    if (command == "align-right") return setRichEditParagraphAlignment(hwnd, PFA_RIGHT);
+    if (command == "align-justify") return setRichEditParagraphAlignment(hwnd, PFA_JUSTIFY);
+    if (command == "bullets") return toggleRichEditBullets(hwnd);
+    if (command == "numbering") return toggleRichEditNumbering(hwnd);
+    if (command == "indent") return adjustRichEditParagraphIndent(hwnd, 180);
+    if (command == "outdent") return adjustRichEditParagraphIndent(hwnd, -180);
+    return false;
+}
+
+LRESULT CALLBACK richEditSubclassProc(HWND hwnd,
+                                      UINT message,
+                                      WPARAM wparam,
+                                      LPARAM lparam,
+                                      UINT_PTR subclass_id,
+                                      DWORD_PTR ref_data) {
+    (void)subclass_id;
+    (void)ref_data;
+
+    enum class RichTextShortcut {
+        None,
+        Bold,
+        Italic,
+        Underline,
+        AlignLeft,
+        AlignCenter,
+        AlignRight,
+        AlignJustify,
+        ToggleBullets,
+        ToggleNumbering,
+        Indent,
+        Outdent,
+        ClearCharacterFormatting,
+        ClearParagraphFormatting,
+        IncreaseFontSize,
+        DecreaseFontSize,
+    };
+
+    auto rich_text_shortcut_for_key = [&](WPARAM key) -> RichTextShortcut {
+        const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool shift_down = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (!ctrl_down && key == VK_TAB) {
+            return shift_down ? RichTextShortcut::Outdent : RichTextShortcut::Indent;
+        }
+        switch (static_cast<int>(key)) {
+        case 'B':
+        case 0x02:
+            return RichTextShortcut::Bold;
+        case 'I':
+        case 0x09:
+            return RichTextShortcut::Italic;
+        case 'U':
+        case 0x15:
+            return RichTextShortcut::Underline;
+        case 'L':
+        case 0x0C:
+            return shift_down ? RichTextShortcut::ToggleBullets : RichTextShortcut::AlignLeft;
+        case '7':
+            return shift_down ? RichTextShortcut::ToggleNumbering : RichTextShortcut::None;
+        case 'E':
+        case 0x05:
+            return RichTextShortcut::AlignCenter;
+        case 'R':
+        case 0x12:
+            return RichTextShortcut::AlignRight;
+        case 'J':
+        case 0x0A:
+            return RichTextShortcut::AlignJustify;
+        case 'Q':
+        case 0x11:
+            return RichTextShortcut::ClearParagraphFormatting;
+        case VK_SPACE:
+            return RichTextShortcut::ClearCharacterFormatting;
+        case VK_OEM_PERIOD:
+            return shift_down ? RichTextShortcut::IncreaseFontSize : RichTextShortcut::None;
+        case VK_OEM_COMMA:
+            return shift_down ? RichTextShortcut::DecreaseFontSize : RichTextShortcut::None;
+        default:
+            return RichTextShortcut::None;
+        }
+    };
+
+    if (message == WM_GETDLGCODE) {
+        return DefSubclassProc(hwnd, message, wparam, lparam) | DLGC_WANTTAB;
+    }
+
+    if (message == WM_KEYDOWN) {
+        auto it = g_native.bindings.find(hwnd);
+        if (it != g_native.bindings.end() && it->second.type == "rich-text") {
+            bool handled = false;
+            switch (rich_text_shortcut_for_key(wparam)) {
+            case RichTextShortcut::Bold:
+                handled = toggleRichEditSelectionEffect(hwnd, CFM_BOLD, CFE_BOLD);
+                break;
+            case RichTextShortcut::Italic:
+                handled = toggleRichEditSelectionEffect(hwnd, CFM_ITALIC, CFE_ITALIC);
+                break;
+            case RichTextShortcut::Underline:
+                handled = toggleRichEditSelectionEffect(hwnd, CFM_UNDERLINE, CFE_UNDERLINE);
+                break;
+            case RichTextShortcut::AlignLeft:
+                handled = setRichEditParagraphAlignment(hwnd, PFA_LEFT);
+                break;
+            case RichTextShortcut::AlignCenter:
+                handled = setRichEditParagraphAlignment(hwnd, PFA_CENTER);
+                break;
+            case RichTextShortcut::AlignRight:
+                handled = setRichEditParagraphAlignment(hwnd, PFA_RIGHT);
+                break;
+            case RichTextShortcut::AlignJustify:
+                handled = setRichEditParagraphAlignment(hwnd, PFA_JUSTIFY);
+                break;
+            case RichTextShortcut::ToggleBullets:
+                handled = toggleRichEditBullets(hwnd);
+                break;
+            case RichTextShortcut::ToggleNumbering:
+                handled = toggleRichEditNumbering(hwnd);
+                break;
+            case RichTextShortcut::Indent:
+                handled = adjustRichEditParagraphIndent(hwnd, 180);
+                break;
+            case RichTextShortcut::Outdent:
+                handled = adjustRichEditParagraphIndent(hwnd, -180);
+                break;
+            case RichTextShortcut::ClearCharacterFormatting:
+                handled = clearRichEditCharacterFormatting(hwnd);
+                break;
+            case RichTextShortcut::ClearParagraphFormatting:
+                handled = clearRichEditParagraphFormatting(hwnd);
+                break;
+            case RichTextShortcut::IncreaseFontSize:
+                handled = adjustRichEditSelectionFontSize(hwnd, 20);
+                break;
+            case RichTextShortcut::DecreaseFontSize:
+                handled = adjustRichEditSelectionFontSize(hwnd, -20);
+                break;
+            case RichTextShortcut::None:
+                break;
+            }
+
+            if (handled) {
+                dispatchRichTextChangeEvent(hwnd, it->second);
+                return 0;
+            }
+        }
+    }
+
+    if (message == WM_CHAR || message == WM_SYSCHAR) {
+        const bool ctrl_down = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if ((ctrl_down && rich_text_shortcut_for_key(wparam) != RichTextShortcut::None) || wparam == VK_TAB) {
+            return 0;
+        }
+    }
+
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, richEditSubclassProc, kRichEditSubclassId);
+    }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void attachRichEditSubclass(HWND hwnd) {
+    if (!hwnd) return;
+    SetWindowSubclass(hwnd, richEditSubclassProc, kRichEditSubclassId, 0);
+}
+
+EditViewState captureEditViewState(HWND hwnd) {
+    EditViewState state;
+    SendMessageW(hwnd, EM_GETSEL,
+                 reinterpret_cast<WPARAM>(&state.selection_start),
+                 reinterpret_cast<LPARAM>(&state.selection_end));
+    state.first_visible_line = static_cast<int>(SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0));
+    return state;
+}
+
+void restoreEditViewState(HWND hwnd, const EditViewState& state) {
+    SendMessageW(hwnd,
+                 EM_SETSEL,
+                 static_cast<WPARAM>(state.selection_start),
+                 static_cast<LPARAM>(state.selection_end));
+    const int current_first_visible = static_cast<int>(SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0));
+    const int delta = state.first_visible_line - current_first_visible;
+    if (delta != 0) {
+        SendMessageW(hwnd, EM_LINESCROLL, 0, static_cast<LPARAM>(delta));
+    }
+}
+
 bool tryParseUtf8Number(const std::string& text, ordered_json& out) {
     const std::string trimmed = trimAsciiWhitespace(text);
     if (trimmed.empty()) return false;
@@ -1038,6 +1490,51 @@ MeasuredSize measureChildrenStack(HDC hdc, const std::vector<const ordered_json*
     return result;
 }
 
+std::vector<int> computeRowChildWidths(HDC hdc,
+                                       const std::vector<const ordered_json*>& children,
+                                       int available_width,
+                                       int min_child_width) {
+    std::vector<int> widths;
+    if (children.empty()) return widths;
+
+    const int safe_available = std::max(static_cast<int>(children.size()) * min_child_width, available_width);
+    widths.reserve(children.size());
+
+    int natural_total = 0;
+    for (const ordered_json* child : children) {
+        const MeasuredSize natural = measureNode(hdc, *child, safe_available);
+        const int width = std::max(min_child_width, natural.width);
+        widths.push_back(width);
+        natural_total += width;
+    }
+
+    if (natural_total <= safe_available) {
+        return widths;
+    }
+
+    int scaled_total = 0;
+    for (int& width : widths) {
+        width = std::max(min_child_width, static_cast<int>((static_cast<long long>(width) * safe_available) / std::max(1, natural_total)));
+        scaled_total += width;
+    }
+
+    while (scaled_total > safe_available) {
+        size_t widest_index = widths.size();
+        int widest_width = min_child_width;
+        for (size_t i = 0; i < widths.size(); ++i) {
+            if (widths[i] > widest_width) {
+                widest_width = widths[i];
+                widest_index = i;
+            }
+        }
+        if (widest_index == widths.size()) break;
+        --widths[widest_index];
+        --scaled_total;
+    }
+
+    return widths;
+}
+
 double splitPaneSizeValue(const ordered_json& pane, double fallback) {
     auto size_it = pane.find("size");
     if (size_it == pane.end()) return fallback;
@@ -1167,9 +1664,12 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
         const int gap = jsonInt(node, "gap", kDefaultGap);
         const auto children = childrenOf(node);
         MeasuredSize result{};
+        const int available_width = std::max(72, max_width - (padding * 2) - std::max(0, static_cast<int>(children.size()) - 1) * gap);
+        const std::vector<int> child_widths = computeRowChildWidths(hdc, children, available_width, 72);
         bool first = true;
-        const int child_limit = children.empty() ? max_width : std::max(72, (max_width - (padding * 2) - (static_cast<int>(children.size()) - 1) * gap) / static_cast<int>(children.size()));
-        for (const ordered_json* child : children) {
+        for (size_t i = 0; i < children.size(); ++i) {
+            const ordered_json* child = children[i];
+            const int child_limit = i < child_widths.size() ? child_widths[i] : 72;
             MeasuredSize child_size = measureNode(hdc, *child, child_limit);
             result.width += child_size.width;
             if (!first) result.width += gap;
@@ -1390,7 +1890,7 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
         const int column_count = columns ? std::max(1, static_cast<int>(columns->size())) : 1;
         const int row_count = rows ? static_cast<int>(rows->size()) : 0;
         int width = std::max(420, std::min(max_width, 820));
-        int height = 180 + std::min(row_count, 10) * 22;
+        int height = std::max(180 + std::min(row_count, 10) * 22, jsonInt(node, "height", 0));
         if (!label.empty()) {
             const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, width);
             width = std::max(width, static_cast<int>(label_size.cx));
@@ -1438,8 +1938,13 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
         const ordered_json* options = jsonArrayChild(node, "options");
         const int option_count = options ? std::max(1, static_cast<int>(options->size())) : 1;
         int width = std::max(240, std::min(max_width, 420));
-        int height = (type == "list-box") ? std::max(120, std::min(220, option_count * 22 + 12))
-                                          : std::max(72, option_count * 28);
+        int height = 0;
+        if (type == "list-box") {
+            const int rows = std::max(3, jsonInt(node, "rows", 6));
+            height = std::max(90, rows * 22 + 8);
+        } else {
+            height = option_count * 28;
+        }
         if (!label.empty()) {
             const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, width);
             width = std::max(width, static_cast<int>(label_size.cx));
@@ -2711,19 +3216,34 @@ void clearNativeControls(HWND hwnd) {
     g_native.bindings.clear();
     g_native.node_controls.clear();
     g_native.command_bindings.clear();
+    g_native.viewport_host = nullptr;
     g_native.content_host = nullptr;
+    g_native.status_bar_hwnd = nullptr;
+    g_native.raw_client_width = 0;
+    g_native.raw_client_height = 0;
     g_native.client_width = 0;
     g_native.client_height = 0;
+    g_native.status_bar_height = 0;
     g_native.content_width = 0;
     g_native.content_height = 0;
+    g_native.focused_rich_text_hwnd = nullptr;
     g_native.next_control_id = 1000;
+}
+
+void clearNativeMenu(HWND hwnd) {
     HMENU old_menu = g_native.current_menu;
     g_native.current_menu = nullptr;
-    SetMenu(hwnd, nullptr);
+    g_native.command_bindings.clear();
+    HWND menu_owner = (g_native.embedded_mode && g_native.parent_hwnd && IsWindow(g_native.parent_hwnd))
+        ? g_native.parent_hwnd
+        : hwnd;
+    if (menu_owner && IsWindow(menu_owner)) {
+        SetMenu(menu_owner, nullptr);
+        DrawMenuBar(menu_owner);
+    }
     if (old_menu) {
         DestroyMenu(old_menu);
     }
-    DrawMenuBar(hwnd);
 }
 
 bool isTruthyJson(const ordered_json& value) {
@@ -3821,9 +4341,18 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
         auto value_it = props.find("value");
         if (value_it == props.end() || !value_it->is_string()) return false;
         const std::wstring value = utf8ToWide(value_it->get<std::string>());
-        if (!windowTextEquals(control, value)) {
+        const std::wstring current = binding.multiline ? normalizeLineEndings(controlWindowText(control)) : controlWindowText(control);
+        const std::wstring desired = binding.multiline ? normalizeLineEndings(value) : value;
+        if (current != desired) {
+            EditViewState view_state{};
+            if (binding.multiline) {
+                view_state = captureEditViewState(control);
+            }
             g_native.suppress_events = true;
             SetWindowTextW(control, value.c_str());
+            if (binding.multiline) {
+                restoreEditViewState(control, view_state);
+            }
             g_native.suppress_events = false;
         }
         binding.value_text = value_it->get<std::string>();
@@ -3845,13 +4374,15 @@ bool applyNativeNodePropsPatch(HWND hwnd, const std::string& node_id, const orde
         }
         auto value_it = props.find("value");
         if (value_it != props.end() && value_it->is_string()) {
-            const std::wstring value = utf8ToWide(htmlToPlainText(value_it->get<std::string>()));
-            if (!windowTextEquals(control, value)) {
+            const std::string value = value_it->get<std::string>();
+            if (binding.value_text != value) {
+                const EditViewState view_state = captureEditViewState(control);
                 g_native.suppress_events = true;
-                SetWindowTextW(control, value.c_str());
+                richEditSetRtf(control, value);
+                restoreEditViewState(control, view_state);
                 g_native.suppress_events = false;
             }
-            binding.value_text = value_it->get<std::string>();
+            binding.value_text = value;
             handled = true;
         }
         return handled;
@@ -4207,12 +4738,42 @@ bool applyNativePatchOperation(HWND hwnd, const ordered_json& op) {
     if (op_name == "set-window-props") {
         auto props_it = op.find("props");
         if (props_it == op.end() || !props_it->is_object()) return false;
-        auto title_it = props_it->find("title");
-        if (props_it->size() == 1 && title_it != props_it->end() && title_it->is_string()) {
-            const std::wstring title = utf8ToWide(title_it->get<std::string>());
-            SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
+        bool handled_directly = false;
+        for (auto it = props_it->begin(); it != props_it->end(); ++it) {
+            if (it.key() == "title") {
+                if (!it.value().is_string()) return false;
+                const std::wstring title = utf8ToWide(it.value().get<std::string>());
+                SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
+                handled_directly = true;
+                continue;
+            }
+            if (it.key() == "menuBar") {
+                ordered_json spec = snapshotSpec();
+                if (!spec.is_object()) return false;
+                installNativeMenuIfPresent(hwnd, spec);
+                refreshNativeViewport(hwnd);
+                updateNativeRootScrollbars(hwnd);
+                handled_directly = true;
+                continue;
+            }
+            if (it.key() == "statusBar") {
+                if (!it.value().is_object() || !g_native.status_bar_hwnd || !IsWindow(g_native.status_bar_hwnd)) {
+                    handled_directly = false;
+                    break;
+                }
+                applyStatusBarParts(g_native.status_bar_hwnd, it.value(), std::max(1, g_native.raw_client_width));
+                refreshNativeViewport(hwnd);
+                updateNativeRootScrollbars(hwnd);
+                handled_directly = true;
+                continue;
+            }
+            handled_directly = false;
+            break;
+        }
+
+        if (handled_directly) {
             g_native.patch_direct_apply_count.fetch_add(1, std::memory_order_relaxed);
-            traceNativePatchDecision("direct", op_name, std::string(), "title-only");
+            traceNativePatchDecision("direct", op_name, std::string(), "window-props");
             return true;
         }
 
@@ -4320,12 +4881,15 @@ MeasuredSize layoutChildrenRow(HWND parent,
                                int max_width,
                                int padding,
                                int gap) {
-    const int child_limit = children.empty() ? max_width : std::max(72, (max_width - (padding * 2) - (static_cast<int>(children.size()) - 1) * gap) / static_cast<int>(children.size()));
+    const int available_width = std::max(72, max_width - (padding * 2) - std::max(0, static_cast<int>(children.size()) - 1) * gap);
+    const std::vector<int> child_widths = computeRowChildWidths(hdc, children, available_width, 72);
     int cursor_x = x + padding;
     int max_height = 0;
     bool first = true;
-    for (const ordered_json* child : children) {
+    for (size_t i = 0; i < children.size(); ++i) {
+        const ordered_json* child = children[i];
         if (!first) cursor_x += gap;
+        const int child_limit = i < child_widths.size() ? child_widths[i] : 72;
         MeasuredSize child_size = layoutNode(parent, hdc, *child, cursor_x, y + padding, child_limit);
         cursor_x += child_size.width;
         max_height = std::max(max_height, child_size.height);
@@ -4709,7 +5273,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
 
     if (type == "rich-text") {
         const std::wstring label = utf8ToWide(jsonString(node, "label"));
-        const std::wstring value = utf8ToWide(htmlToPlainText(jsonString(node, "value")));
+        const std::string value_rtf = jsonString(node, "value");
         const int control_width = std::max(320, std::min(max_width, 520));
         const int control_height = std::max(120, jsonInt(node, "minHeight", 140));
         int cursor_y = y;
@@ -4720,17 +5284,23 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             cursor_y += static_cast<int>(label_size.cy + 8);
         }
         DWORD edit_style = WS_TABSTOP | WS_BORDER | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN;
-        HWND rich = createChildControl(MSFTEDIT_CLASS, value.c_str(), edit_style, x, cursor_y, control_width, control_height, parent, g_native.ui_font);
+        HWND rich = createChildControl(MSFTEDIT_CLASS, L"", edit_style, x, cursor_y, control_width, control_height, parent, g_native.ui_font);
         if (rich) {
             SendMessageW(rich, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
+            const LRESULT event_mask = SendMessageW(rich, EM_GETEVENTMASK, 0, 0);
+            SendMessageW(rich, EM_SETEVENTMASK, 0, event_mask | ENM_CHANGE);
+            attachRichEditSubclass(rich);
             ControlBinding binding;
             binding.type = type;
             binding.event_name = jsonString(node, "event", "rich-text-change");
             binding.node_id = jsonString(node, "id");
             binding.text = jsonString(node, "label");
-            binding.value_text = jsonString(node, "value");
+            binding.value_text = value_rtf;
             binding.multiline = true;
             binding.companion_hwnd = label_hwnd;
+            if (!value_rtf.empty()) {
+                richEditSetRtf(rich, value_rtf);
+            }
             registerNodeControl(rich, binding);
         }
         return {control_width, (cursor_y - y) + control_height};
@@ -4995,6 +5565,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
     if (type == "table") {
         const std::wstring label = utf8ToWide(jsonString(node, "label"));
         const int control_width = std::max(420, std::min(max_width, 820));
+        const int control_height = std::max(180, jsonInt(node, "height", 240));
         int cursor_y = y;
         if (!label.empty()) {
             const SIZE label_size = measureWrappedText(hdc, g_native.ui_font, label, control_width);
@@ -5002,7 +5573,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             cursor_y += static_cast<int>(label_size.cy + 8);
         }
 
-        HWND table = createChildControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP | WS_BORDER, x, cursor_y, control_width, 240, parent, g_native.ui_font);
+        HWND table = createChildControl(WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP | WS_BORDER, x, cursor_y, control_width, control_height, parent, g_native.ui_font);
         if (table) {
             ListView_SetExtendedListViewStyle(table, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
 
@@ -5062,7 +5633,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             binding.value_text = jsonString(node, "selectedId");
             registerNodeControl(table, binding);
         }
-        return {control_width, (cursor_y - y) + 240};
+        return {control_width, (cursor_y - y) + control_height};
     }
 
     if (type == "tree-view") {
@@ -5300,6 +5871,34 @@ int clampScrollOffset(int pos, int client_extent, int content_extent) {
     return std::clamp(pos, 0, std::max(0, content_extent - client_extent));
 }
 
+RECT workAreaForRect(const RECT& rect) {
+    MONITORINFO monitor_info{};
+    monitor_info.cbSize = sizeof(monitor_info);
+    const HMONITOR monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    if (monitor && GetMonitorInfoW(monitor, &monitor_info)) {
+        return monitor_info.rcWork;
+    }
+
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    return work;
+}
+
+RECT clampWindowRectToWorkArea(const RECT& rect) {
+    RECT clamped = rect;
+    const RECT work = workAreaForRect(rect);
+    const int work_width = std::max(1, static_cast<int>(work.right - work.left));
+    const int work_height = std::max(1, static_cast<int>(work.bottom - work.top));
+    const int width = std::min(std::max(1, static_cast<int>(rect.right - rect.left)), work_width);
+    const int height = std::min(std::max(1, static_cast<int>(rect.bottom - rect.top)), work_height);
+
+    clamped.left = std::clamp(rect.left, work.left, work.right - width);
+    clamped.top = std::clamp(rect.top, work.top, work.bottom - height);
+    clamped.right = clamped.left + width;
+    clamped.bottom = clamped.top + height;
+    return clamped;
+}
+
 void syncNativeContentHostPosition() {
     if (!g_native.content_host || !IsWindow(g_native.content_host)) return;
     g_native.scroll_x = clampScrollOffset(g_native.scroll_x, g_native.client_width, g_native.content_width);
@@ -5343,14 +5942,18 @@ void updateNativeRootScrollbars(HWND hwnd) {
 void refreshNativeScrollMetrics(HWND hwnd) {
     RECT client{};
     GetClientRect(hwnd, &client);
-    const int initial_client_width = std::max(1, static_cast<int>(client.right - client.left));
-    const int initial_client_height = std::max(1, static_cast<int>(client.bottom - client.top));
-    g_native.client_width = initial_client_width;
-    g_native.client_height = initial_client_height;
+    const int initial_raw_client_width = std::max(1, static_cast<int>(client.right - client.left));
+    const int initial_raw_client_height = std::max(1, static_cast<int>(client.bottom - client.top));
+    refreshNativeViewport(hwnd);
 
-    const int layout_width = std::max(120, initial_client_width - (kRootPadding * 2));
+    const int layout_width = std::max(120, g_native.client_width - (kRootPadding * 2));
     ordered_json spec = snapshotSpec();
     if (!spec.is_object()) spec = ordered_json::object();
+
+    if (ordered_json* status_bar_spec = findWindowStatusBarSpec(spec)) {
+        applyStatusBarParts(g_native.status_bar_hwnd, *status_bar_spec, std::max(1, g_native.raw_client_width));
+        refreshNativeViewport(hwnd);
+    }
 
     HDC hdc = GetDC(g_native.content_host && IsWindow(g_native.content_host) ? g_native.content_host : hwnd);
     if (!hdc) return;
@@ -5372,9 +5975,9 @@ void refreshNativeScrollMetrics(HWND hwnd) {
 
     RECT final_client{};
     GetClientRect(hwnd, &final_client);
-    const int final_client_width = std::max(1, static_cast<int>(final_client.right - final_client.left));
-    const int final_client_height = std::max(1, static_cast<int>(final_client.bottom - final_client.top));
-    if (final_client_width != initial_client_width || final_client_height != initial_client_height) {
+    const int final_raw_client_width = std::max(1, static_cast<int>(final_client.right - final_client.left));
+    const int final_raw_client_height = std::max(1, static_cast<int>(final_client.bottom - final_client.top));
+    if (final_raw_client_width != initial_raw_client_width || final_raw_client_height != initial_raw_client_height) {
         rebuildNativeWindow(hwnd);
     }
 }
@@ -5442,6 +6045,28 @@ ordered_json* findTopLevelMenuBarNode(ordered_json& body) {
     return nullptr;
 }
 
+ordered_json* findWindowMenuBarSpec(ordered_json& spec) {
+    if (!spec.is_object()) return nullptr;
+    auto menu_it = spec.find("menuBar");
+    if (menu_it != spec.end() && menu_it->is_object()) {
+        return &(*menu_it);
+    }
+    auto body_it = spec.find("body");
+    if (body_it != spec.end() && body_it->is_object()) {
+        return findTopLevelMenuBarNode(*body_it);
+    }
+    return nullptr;
+}
+
+ordered_json* findWindowStatusBarSpec(ordered_json& spec) {
+    if (!spec.is_object()) return nullptr;
+    auto status_it = spec.find("statusBar");
+    if (status_it != spec.end() && status_it->is_object()) {
+        return &(*status_it);
+    }
+    return nullptr;
+}
+
 void removeMenuBarNode(ordered_json& body) {
     if (!body.is_object()) return;
     if (jsonString(body, "type") == "menu-bar") {
@@ -5462,9 +6087,150 @@ void removeMenuBarNode(ordered_json& body) {
     }
 }
 
+void applyStatusBarParts(HWND status_bar, const ordered_json& spec, int client_width) {
+    if (!status_bar || !IsWindow(status_bar)) return;
+
+    const ordered_json* parts = jsonArrayChild(spec, "parts");
+    if (!parts || parts->empty()) {
+        int single_part_right = -1;
+        SendMessageW(status_bar, SB_SETPARTS, 1, reinterpret_cast<LPARAM>(&single_part_right));
+        const std::wstring text = utf8ToWide(jsonString(spec, "text", ""));
+        SendMessageW(status_bar, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        return;
+    }
+
+    const int part_count = static_cast<int>(parts->size());
+    std::vector<int> widths(static_cast<size_t>(part_count), 0);
+    std::vector<int> right_edges(static_cast<size_t>(part_count), -1);
+    int total_fixed_width = 0;
+    int flexible_count = 0;
+
+    for (int index = 0; index < part_count; ++index) {
+        const ordered_json& part = (*parts)[static_cast<size_t>(index)];
+        const int requested_width = std::max(0, jsonInt(part, "width", 0));
+        widths[static_cast<size_t>(index)] = requested_width;
+        if (requested_width > 0) {
+            total_fixed_width += requested_width;
+        } else {
+            ++flexible_count;
+        }
+    }
+
+    const int remaining_width = std::max(0, client_width - total_fixed_width);
+    const int flexible_width = flexible_count > 0 ? (remaining_width / flexible_count) : 0;
+    int flexible_remainder = flexible_count > 0 ? (remaining_width % flexible_count) : 0;
+    int cursor = 0;
+    for (int index = 0; index < part_count; ++index) {
+        int width = widths[static_cast<size_t>(index)];
+        if (width <= 0) {
+            width = flexible_width;
+            if (flexible_remainder > 0) {
+                ++width;
+                --flexible_remainder;
+            }
+        }
+        cursor += std::max(0, width);
+        right_edges[static_cast<size_t>(index)] = (index + 1 == part_count) ? -1 : cursor;
+    }
+
+    if (flexible_count == 0 && !right_edges.empty()) {
+        right_edges.back() = -1;
+    }
+
+    SendMessageW(status_bar,
+                 SB_SETPARTS,
+                 static_cast<WPARAM>(part_count),
+                 reinterpret_cast<LPARAM>(right_edges.data()));
+    for (int index = 0; index < part_count; ++index) {
+        const ordered_json& part = (*parts)[static_cast<size_t>(index)];
+        const std::wstring text = utf8ToWide(jsonString(part, "text", ""));
+        SendMessageW(status_bar,
+                     SB_SETTEXTW,
+                     static_cast<WPARAM>(index),
+                     reinterpret_cast<LPARAM>(text.c_str()));
+    }
+}
+
+int layoutNativeStatusBar(HWND hwnd) {
+    if (!g_native.status_bar_hwnd || !IsWindow(g_native.status_bar_hwnd)) {
+        g_native.status_bar_height = 0;
+        return 0;
+    }
+
+    SendMessageW(g_native.status_bar_hwnd, WM_SIZE, 0, 0);
+    RECT status_rect{};
+    GetWindowRect(g_native.status_bar_hwnd, &status_rect);
+    const int status_height = std::max(0, static_cast<int>(status_rect.bottom - status_rect.top));
+    SetWindowPos(g_native.status_bar_hwnd,
+                 HWND_TOP,
+                 0,
+                 std::max(0, g_native.raw_client_height - status_height),
+                 std::max(1, g_native.raw_client_width),
+                 std::max(1, status_height),
+                 SWP_NOACTIVATE);
+    g_native.status_bar_height = status_height;
+    return status_height;
+}
+
+void refreshNativeViewport(HWND hwnd) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    g_native.raw_client_width = std::max(1, static_cast<int>(client.right - client.left));
+    g_native.raw_client_height = std::max(1, static_cast<int>(client.bottom - client.top));
+
+    const int status_height = layoutNativeStatusBar(hwnd);
+    g_native.client_width = g_native.raw_client_width;
+    g_native.client_height = std::max(1, g_native.raw_client_height - status_height);
+
+    if (g_native.viewport_host && IsWindow(g_native.viewport_host)) {
+        SetWindowPos(g_native.viewport_host,
+                     nullptr,
+                     0,
+                     0,
+                     std::max(1, g_native.client_width),
+                     std::max(1, g_native.client_height),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 bool buildMenuItemTree(const ordered_json& menu_node, MenuBuildResult& result, HMENU menu);
 
+HWND nativeMenuOwnerWindow(HWND hwnd) {
+    if (g_native.embedded_mode && g_native.parent_hwnd && IsWindow(g_native.parent_hwnd)) {
+        return g_native.parent_hwnd;
+    }
+    return hwnd;
+}
+
+bool tryHandleNativeMenuCommand(const ControlBinding& binding) {
+    const std::string prefix = "format-selection:";
+    if (binding.value_text.rfind(prefix, 0) != 0) {
+        return false;
+    }
+
+    HWND rich_text = g_native.focused_rich_text_hwnd;
+    if (!rich_text || !IsWindow(rich_text)) {
+        g_native.focused_rich_text_hwnd = nullptr;
+        return true;
+    }
+
+    auto it = g_native.bindings.find(rich_text);
+    if (it == g_native.bindings.end() || it->second.type != "rich-text") {
+        g_native.focused_rich_text_hwnd = nullptr;
+        return true;
+    }
+
+    const std::string command = binding.value_text.substr(prefix.size());
+    if (applyRichEditFormatSelectionCommand(rich_text, command)) {
+        dispatchRichTextChangeEvent(rich_text, it->second);
+    }
+    return true;
+}
+
 void dispatchCommandBindingEvent(const ControlBinding& binding) {
+    if (tryHandleNativeMenuCommand(binding)) {
+        return;
+    }
     ordered_json event = ordered_json::object();
     event["type"] = "ui-event";
     event["event"] = binding.event_name;
@@ -5478,7 +6244,10 @@ void dispatchCommandBindingEvent(const ControlBinding& binding) {
 bool buildMenuBar(const ordered_json& menu_bar, MenuBuildResult& result) {
     result.menu = CreateMenu();
     if (!result.menu) return false;
-    const ordered_json* menus = jsonArrayChild(menu_bar, "children");
+    const ordered_json* menus = jsonArrayChild(menu_bar, "menus");
+    if (!menus) {
+        menus = jsonArrayChild(menu_bar, "children");
+    }
     if (!menus) return true;
     for (const auto& item : *menus) {
         if (!item.is_object()) {
@@ -5544,8 +6313,16 @@ bool buildMenuItemTree(const ordered_json& menu_node, MenuBuildResult& result, H
             result.ok = false;
             return false;
         }
+        if (item.contains("separator") && isTruthyJson(item["separator"])) {
+            if (!AppendMenuW(menu, MF_SEPARATOR, 0, nullptr)) {
+                result.ok = false;
+                return false;
+            }
+            continue;
+        }
         const std::wstring text = utf8ToWide(jsonString(item, "text", jsonString(item, "label", "Item")));
         const bool disabled = item.contains("disabled") && isTruthyJson(item["disabled"]);
+        const bool checked = item.contains("checked") && isTruthyJson(item["checked"]);
         const ordered_json* nested_items = jsonArrayChild(item, "items");
         if (nested_items && !nested_items->empty()) {
             HMENU submenu = CreatePopupMenu();
@@ -5558,7 +6335,7 @@ bool buildMenuItemTree(const ordered_json& menu_node, MenuBuildResult& result, H
                 result.ok = false;
                 return false;
             }
-            const UINT flags = MF_POPUP | (disabled ? MF_GRAYED : 0);
+            const UINT flags = MF_POPUP | (disabled ? MF_GRAYED : 0) | (checked ? MF_CHECKED : 0);
             if (!AppendMenuW(menu, flags, reinterpret_cast<UINT_PTR>(submenu), text.c_str())) {
                 DestroyMenu(submenu);
                 result.ok = false;
@@ -5567,15 +6344,15 @@ bool buildMenuItemTree(const ordered_json& menu_node, MenuBuildResult& result, H
             continue;
         }
         const int command_id = result.next_control_id++;
-        const UINT flags = MF_STRING | (disabled ? MF_GRAYED : 0);
+        const UINT flags = MF_STRING | (disabled ? MF_GRAYED : 0) | (checked ? MF_CHECKED : 0);
         if (!AppendMenuW(menu, flags, static_cast<UINT_PTR>(command_id), text.c_str())) {
             result.ok = false;
             return false;
         }
         ControlBinding binding;
         binding.type = "menu-item";
-        binding.event_name = jsonString(item, "event");
         binding.node_id = jsonString(item, "id");
+        binding.event_name = jsonString(item, "event", binding.node_id);
         binding.text = jsonString(item, "text", jsonString(item, "label", "Item"));
         binding.value_text = jsonString(item, "value");
         result.command_bindings[command_id] = std::move(binding);
@@ -5590,15 +6367,17 @@ void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec) {
 
     if (ordered_json* body = const_cast<ordered_json*>(jsonObjectChild(spec, "body"))) {
         ordered_json body_copy = *body;
-        if (ordered_json* menu_bar = findTopLevelMenuBarNode(body_copy)) {
+        if (ordered_json* menu_bar = findWindowMenuBarSpec(spec)) {
             MenuBuildResult result;
             result.next_control_id = g_native.next_control_id;
             if (buildMenuBar(*menu_bar, result) && result.menu && result.ok) {
                 new_menu = result.menu;
                 new_command_bindings = std::move(result.command_bindings);
                 next_control_id = result.next_control_id;
-                removeMenuBarNode(body_copy);
-                spec["body"] = body_copy;
+                if (findTopLevelMenuBarNode(body_copy)) {
+                    removeMenuBarNode(body_copy);
+                    spec["body"] = body_copy;
+                }
             } else if (result.menu) {
                 DestroyMenu(result.menu);
             }
@@ -5609,11 +6388,50 @@ void installNativeMenuIfPresent(HWND hwnd, ordered_json& spec) {
     g_native.current_menu = new_menu;
     g_native.command_bindings = std::move(new_command_bindings);
     g_native.next_control_id = next_control_id;
-    SetMenu(hwnd, new_menu);
+    const HWND menu_owner = nativeMenuOwnerWindow(hwnd);
+    SetMenu(menu_owner, new_menu);
     if (old_menu) {
         DestroyMenu(old_menu);
     }
-    DrawMenuBar(hwnd);
+    DrawMenuBar(menu_owner);
+    if (g_native.embedded_mode && g_native.parent_hwnd && IsWindow(g_native.parent_hwnd) && hwnd && IsWindow(hwnd)) {
+        RECT client{};
+        if (GetClientRect(g_native.parent_hwnd, &client)) {
+            SetWindowPos(hwnd,
+                         HWND_TOP,
+                         0,
+                         0,
+                         std::max(1, static_cast<int>(client.right - client.left)),
+                         std::max(1, static_cast<int>(client.bottom - client.top)),
+                         SWP_SHOWWINDOW);
+        }
+    }
+}
+
+void installNativeStatusBarIfPresent(HWND hwnd, ordered_json& spec) {
+    g_native.status_bar_hwnd = nullptr;
+    g_native.status_bar_height = 0;
+
+    ordered_json* status_bar_spec = findWindowStatusBarSpec(spec);
+    if (!status_bar_spec) return;
+
+    DWORD style = CCS_BOTTOM | SBARS_TOOLTIPS;
+    if (!g_native.embedded_mode) style |= SBARS_SIZEGRIP;
+
+    HWND status_bar = createChildControl(STATUSCLASSNAMEW,
+                                         L"",
+                                         style,
+                                         0,
+                                         0,
+                                         std::max(1, g_native.raw_client_width),
+                                         24,
+                                         hwnd,
+                                         g_native.ui_font);
+    if (!status_bar) return;
+
+    g_native.status_bar_hwnd = status_bar;
+    applyStatusBarParts(status_bar, *status_bar_spec, std::max(1, g_native.raw_client_width));
+    layoutNativeStatusBar(hwnd);
 }
 
 void rebuildNativeWindow(HWND hwnd) {
@@ -5626,12 +6444,23 @@ void rebuildNativeWindow(HWND hwnd) {
     const std::wstring title = utf8ToWide(jsonString(spec, "title", "WinScheme Native UI"));
     SetWindowTextW(hwnd, title.empty() ? L"WinScheme Native UI" : title.c_str());
     installNativeMenuIfPresent(hwnd, spec);
+    refreshNativeViewport(hwnd);
+    installNativeStatusBarIfPresent(hwnd, spec);
+    refreshNativeViewport(hwnd);
 
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    g_native.client_width = std::max(1, static_cast<int>(client.right - client.left));
-    g_native.client_height = std::max(1, static_cast<int>(client.bottom - client.top));
     const int layout_width = std::max(120, g_native.client_width - (kRootPadding * 2));
+
+    HWND viewport_host = createChildControl(L"STATIC",
+                                            L"",
+                                            0,
+                                            0,
+                                            0,
+                                            std::max(1, g_native.client_width),
+                                            std::max(1, g_native.client_height),
+                                            hwnd,
+                                            nullptr);
+    if (viewport_host) attachContainerForwarding(viewport_host);
+    g_native.viewport_host = viewport_host;
 
     HWND content_host = createChildControl(L"STATIC",
                                            L"",
@@ -5640,12 +6469,13 @@ void rebuildNativeWindow(HWND hwnd) {
                                            0,
                                            std::max(1, g_native.client_width),
                                            std::max(1, g_native.client_height),
-                                           hwnd,
+                                           viewport_host ? viewport_host : hwnd,
                                            nullptr);
     if (content_host) attachContainerForwarding(content_host);
     g_native.content_host = content_host;
+    layoutNativeStatusBar(hwnd);
 
-    HDC hdc = GetDC(content_host ? content_host : hwnd);
+    HDC hdc = GetDC(content_host ? content_host : (viewport_host ? viewport_host : hwnd));
     if (!hdc) return;
     ensureFonts();
     SelectObject(hdc, g_native.ui_font);
@@ -5673,7 +6503,7 @@ void rebuildNativeWindow(HWND hwnd) {
             g_native.ui_font);
     }
 
-    ReleaseDC(content_host ? content_host : hwnd, hdc);
+    ReleaseDC(content_host ? content_host : (viewport_host ? viewport_host : hwnd), hdc);
 }
 
 void dispatchNativeWindowMessage(UINT message) {
@@ -6068,6 +6898,24 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         rebuildNativeWindow(hwnd);
         return 0;
 
+    case WM_GETMINMAXINFO:
+        {
+            MINMAXINFO* info = reinterpret_cast<MINMAXINFO*>(lparam);
+            if (!info) return 0;
+            RECT window_rect{};
+            if (!GetWindowRect(hwnd, &window_rect)) {
+                window_rect = RECT{0, 0, kDefaultWindowWidth, kDefaultWindowHeight};
+            }
+            const RECT work = workAreaForRect(window_rect);
+            info->ptMaxPosition.x = work.left;
+            info->ptMaxPosition.y = work.top;
+            info->ptMaxSize.x = std::max(1, static_cast<int>(work.right - work.left));
+            info->ptMaxSize.y = std::max(1, static_cast<int>(work.bottom - work.top));
+            info->ptMaxTrackSize.x = info->ptMaxSize.x;
+            info->ptMaxTrackSize.y = info->ptMaxSize.y;
+            return 0;
+        }
+
     case WM_SIZE:
         {
             const int width = std::max(0, static_cast<int>(LOWORD(lparam)));
@@ -6076,8 +6924,8 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             {
                 std::lock_guard<std::mutex> lock(g_native.mutex);
                 size_unchanged = g_native.content_host &&
-                    width == g_native.client_width &&
-                    height == g_native.client_height;
+                    width == g_native.raw_client_width &&
+                    height == g_native.raw_client_height;
             }
             if (size_unchanged) {
                 return 0;
@@ -6133,7 +6981,7 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             ShowWindow(hwnd, SW_SHOW);
         } else {
             rebuildNativeWindow(hwnd);
-            ShowWindow(hwnd, SW_SHOWNORMAL);
+            ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
         }
         return 0;
@@ -6187,7 +7035,7 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             HWND control = reinterpret_cast<HWND>(lparam);
             auto it = g_native.bindings.find(control);
             if (it != g_native.bindings.end()) {
-                const ControlBinding& binding = it->second;
+                ControlBinding& binding = it->second;
                 if (HIWORD(wparam) == BN_CLICKED &&
                     (binding.type == "button" || binding.type == "checkbox" || binding.type == "switch")) {
                     if (binding.type == "button") {
@@ -6217,7 +7065,8 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
                     if (!binding.node_id.empty()) event["id"] = binding.node_id;
                     if (!binding.text.empty()) event["text"] = binding.text;
                     if (binding.type == "rich-text") {
-                        event["value"] = plainTextToHtml(value);
+                        binding.value_text = richEditGetRtf(control);
+                        event["value"] = binding.value_text;
                     } else if (binding.type == "number-input") {
                         const std::string utf8_value = wideToUtf8(value);
                         ordered_json parsed = nullptr;
@@ -6227,10 +7076,25 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
                             event["value"] = utf8_value;
                         }
                         event["rawValue"] = utf8_value;
+                        binding.value_text = utf8_value;
                     } else {
-                        event["value"] = wideToUtf8(value);
+                        binding.value_text = wideToUtf8(binding.multiline ? normalizeLineEndings(value) : value);
+                        event["value"] = binding.value_text;
                     }
                     dispatchUiEventJson(event);
+                    return 0;
+                }
+
+                if ((HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS) &&
+                    (binding.type == "input" || binding.type == "textarea" || binding.type == "rich-text" || binding.type == "number-input")) {
+                    if (binding.type == "rich-text") {
+                        if (HIWORD(wparam) == EN_SETFOCUS) {
+                            g_native.focused_rich_text_hwnd = control;
+                        } else if (g_native.focused_rich_text_hwnd == control) {
+                            g_native.focused_rich_text_hwnd = nullptr;
+                        }
+                    }
+                    dispatchControlFocusEvent(binding, HIWORD(wparam) == EN_SETFOCUS);
                     return 0;
                 }
 
@@ -6587,10 +7451,13 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         // immediately below at the correct size and DPI.
         KillTimer(hwnd, kResizeTimerId);
         const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+        const RECT clamped = suggested
+            ? clampWindowRectToWorkArea(*suggested)
+            : clampWindowRectToWorkArea(RECT{0, 0, kDefaultWindowWidth, kDefaultWindowHeight});
         SetWindowPos(hwnd, nullptr,
-                     suggested->left, suggested->top,
-                     suggested->right  - suggested->left,
-                     suggested->bottom - suggested->top,
+                     clamped.left, clamped.top,
+                     clamped.right  - clamped.left,
+                     clamped.bottom - clamped.top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         rebuildNativeWindow(hwnd);
         return 0;
@@ -6602,6 +7469,7 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
 
     case WM_DESTROY:
         KillTimer(hwnd, kResizeTimerId);
+        clearNativeMenu(hwnd);
         {
             std::lock_guard<std::mutex> lock(g_native.mutex);
             g_native.hwnd = nullptr;
@@ -6656,24 +7524,31 @@ void nativeHostThreadMain() {
     }
 
     const DWORD window_style = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL;
+    const RECT initial_rect = [&]() {
+        RECT rect{0, 0, kDefaultWindowWidth, kDefaultWindowHeight};
+        AdjustWindowRectEx(&rect, window_style, FALSE, 0);
+        rect = clampWindowRectToWorkArea(rect);
+        const RECT work = workAreaForRect(rect);
+        const int width = static_cast<int>(rect.right - rect.left);
+        const int height = static_cast<int>(rect.bottom - rect.top);
+        const int work_width = static_cast<int>(work.right - work.left);
+        const int work_height = static_cast<int>(work.bottom - work.top);
+        rect.left = work.left + std::max(0, (work_width - width) / 2);
+        rect.top = work.top + std::max(0, (work_height - height) / 2);
+        rect.right = rect.left + width;
+        rect.bottom = rect.top + height;
+        return rect;
+    }();
 
     HWND hwnd = CreateWindowExW(
         0,
         kNativeWindowClassName,
         L"WinScheme Native UI",
         window_style,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        [&]() {
-            RECT rect{ 0, 0, kDefaultWindowWidth, kDefaultWindowHeight };
-            AdjustWindowRectEx(&rect, window_style, FALSE, 0);
-            return rect.right - rect.left;
-        }(),
-        [&]() {
-            RECT rect{ 0, 0, kDefaultWindowWidth, kDefaultWindowHeight };
-            AdjustWindowRectEx(&rect, window_style, FALSE, 0);
-            return rect.bottom - rect.top;
-        }(),
+        initial_rect.left,
+        initial_rect.top,
+        initial_rect.right - initial_rect.left,
+        initial_rect.bottom - initial_rect.top,
         nullptr,
         nullptr,
         GetModuleHandleW(nullptr),
@@ -7191,12 +8066,39 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t 
         setNativeLastError("Native UI host window is not available.");
         return 0;
     }
-    return MoveWindow(hwnd, x, y, std::max(0, width), std::max(0, height), TRUE) ? 1 : 0;
+    const RECT clamped = clampWindowRectToWorkArea(RECT{
+        x,
+        y,
+        x + std::max(1, width),
+        y + std::max(1, height),
+    });
+    return MoveWindow(hwnd,
+                      clamped.left,
+                      clamped.top,
+                      clamped.right - clamped.left,
+                      clamped.bottom - clamped.top,
+                      TRUE) ? 1 : 0;
 }
 
 extern "C" WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void) {
     std::lock_guard<std::mutex> lock(g_native.mutex);
     return g_native.hwnd;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int32_t command_id) {
+    clearNativeLastError();
+    if (command_id <= 0 || g_native.suppress_events) {
+        return 0;
+    }
+    auto command_it = g_native.command_bindings.find(command_id);
+    if (command_it == g_native.command_bindings.end()) {
+        return 0;
+    }
+    if (command_it->second.event_name.empty()) {
+        return 0;
+    }
+    dispatchCommandBindingEvent(command_it->second);
+    return 1;
 }
 
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height) {

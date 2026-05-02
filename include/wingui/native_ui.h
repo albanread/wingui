@@ -96,6 +96,7 @@ WINGUI_API void WINGUI_CALL wingui_native_end_embedded_session(void);
 WINGUI_API void WINGUI_CALL wingui_native_detach_embedded_host(void);
 WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t x, int32_t y, int32_t width, int32_t height);
 WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void);
+WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int32_t command_id);
 WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height);
 WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds);
 WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd);
