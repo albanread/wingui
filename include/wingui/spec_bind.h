@@ -115,6 +115,14 @@ WINGUI_API uint32_t WINGUI_CALL wingui_spec_bind_frame_active_buffer_index(
 WINGUI_API uint32_t WINGUI_CALL wingui_spec_bind_frame_buffer_count(
     const WinguiSpecBindFrameView* frame_view);
 
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_get_key_state(
+    const WinguiSpecBindFrameView* frame_view,
+    uint32_t virtual_key);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_get_keyboard_state(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiKeyboardState* out_state);
+
 WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_resolve_pane_utf8(
     const WinguiSpecBindFrameView* frame_view,
     const char* node_id_utf8,

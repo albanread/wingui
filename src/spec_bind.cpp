@@ -615,6 +615,24 @@ extern "C" WINGUI_API uint32_t WINGUI_CALL wingui_spec_bind_frame_buffer_count(
     return (frame_view && frame_view->tick) ? frame_view->tick->buffer_count : 0;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_get_key_state(
+    const WinguiSpecBindFrameView* frame_view,
+    uint32_t virtual_key) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_get_key_state")) {
+        return 0;
+    }
+    return super_terminal_get_key_state(frame_view->ctx, virtual_key);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_get_keyboard_state(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiKeyboardState* out_state) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_get_keyboard_state")) {
+        return 0;
+    }
+    return super_terminal_get_keyboard_state(frame_view->ctx, out_state);
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_resolve_pane_utf8(
     const WinguiSpecBindFrameView* frame_view,
     const char* node_id_utf8,

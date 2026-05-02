@@ -10,7 +10,7 @@ const DemoState = struct {
     enabled: bool = true,
     clicks: u32 = 0,
     event_count: u32 = 0,
-    last_event: [64]u8 = [_]u8{0} ** 64,
+    last_event: []const u8 = "startup",
     spec_buffer: [8192]u8 = [_]u8{0} ** 8192,
     patch_metrics: wingui.PatchMetrics = std.mem.zeroes(wingui.PatchMetrics),
 
@@ -19,22 +19,12 @@ const DemoState = struct {
         self.clicks = 0;
         self.event_count = 0;
         self.patch_metrics = std.mem.zeroes(wingui.PatchMetrics);
-        self.setLastEvent("startup");
-    }
-
-    fn setLastEvent(self: *DemoState, value: []const u8) void {
-        @memset(&self.last_event, 0);
-        const count = @min(value.len, self.last_event.len - 1);
-        @memcpy(self.last_event[0..count], value[0..count]);
-    }
-
-    fn lastEventSlice(self: *const DemoState) []const u8 {
-        return std.mem.sliceTo(&self.last_event, 0);
+        self.last_event = "startup";
     }
 
     fn markEvent(self: *DemoState, value: []const u8) void {
         self.event_count += 1;
-        self.setLastEvent(value);
+        self.last_event = value;
     }
 
     fn updatePatchMetrics(self: *DemoState) void {
@@ -77,7 +67,7 @@ const DemoState = struct {
         const events_text = try std.fmt.bufPrint(&events_buffer, "Events {}", .{self.event_count});
         const patches_text = try std.fmt.bufPrint(&patches_buffer, "Patches {}", .{self.patch_metrics.direct_apply_count});
         const rebuilds_text = try std.fmt.bufPrint(&rebuilds_buffer, "Rebuilds {}", .{rebuild_count});
-        const last_event_text = try std.fmt.bufPrint(&last_event_buffer, "Last {s}", .{self.lastEventSlice()});
+        const last_event_text = try std.fmt.bufPrint(&last_event_buffer, "Last {s}", .{self.last_event});
         const counter_label = try std.fmt.bufPrint(&counter_label_buffer, "Hello from Zig. The counter is {}.", .{self.clicks});
 
         return wingui.stringifyJsonToBufferZ(&self.spec_buffer, .{
@@ -153,40 +143,32 @@ const DemoState = struct {
         });
     }
 
-    fn republish(self: *DemoState) bool {
-        const runtime = self.runtime orelse return false;
-        const spec = self.buildSpec() catch return false;
-        runtime.loadSpec(spec) catch return false;
-        return true;
+    fn republish(self: *DemoState) !void {
+        const runtime = self.runtime orelse return error.WinguiCallFailed;
+        const spec = try self.buildSpec();
+        try runtime.loadSpec(spec);
     }
 };
 
-fn onCounterUp(state: *DemoState, runtime: *wingui.Runtime, event_view: wingui.EventView) void {
-    _ = runtime;
-    _ = event_view;
+fn onCounterUp(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
     state.clicks += 1;
     state.markEvent("zig_counter_up");
-    _ = state.republish();
+    state.republish() catch {};
 }
 
-fn onReset(state: *DemoState, runtime: *wingui.Runtime, event_view: wingui.EventView) void {
-    _ = runtime;
-    _ = event_view;
+fn onReset(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
     state.clicks = 0;
     state.markEvent("zig_reset");
-    _ = state.republish();
+    state.republish() catch {};
 }
 
-fn onToggleEnabled(state: *DemoState, runtime: *wingui.Runtime, event_view: wingui.EventView) void {
-    _ = runtime;
-    _ = event_view;
+fn onToggleEnabled(state: *DemoState, _: *wingui.Runtime, _: wingui.EventView) void {
     state.enabled = !state.enabled;
     state.markEvent("zig_toggle_enabled");
-    _ = state.republish();
+    state.republish() catch {};
 }
 
-fn onExit(state: *DemoState, runtime: *wingui.Runtime, event_view: wingui.EventView) void {
-    _ = event_view;
+fn onExit(state: *DemoState, runtime: *wingui.Runtime, _: wingui.EventView) void {
     state.markEvent("zig_exit");
     runtime.requestStop(0) catch {};
 }
@@ -220,9 +202,9 @@ pub fn main() u8 {
         return failWithMessage(demo_title_z);
     };
 
-    if (!state.republish()) {
+    state.republish() catch {
         return failWithMessage(demo_title_z);
-    }
+    };
 
     desc.columns = 110;
     desc.rows = 30;

@@ -26,6 +26,7 @@ pub const PatchResult = union(enum) {
 pub const RunDesc = raw.WinguiSpecBindRunDesc;
 pub const RunResult = raw.SuperTerminalRunResult;
 pub const PatchMetrics = raw.SuperTerminalNativeUiPatchMetrics;
+pub const KeyboardState = raw.WinguiKeyboardState;
 pub const PaneId = raw.SuperTerminalPaneId;
 pub const PaneLayout = raw.SuperTerminalPaneLayout;
 pub const PaneRef = raw.WinguiSpecBindPaneRef;
@@ -39,6 +40,25 @@ pub const SpriteInstance = raw.SuperTerminalSpriteInstance;
 pub const VectorPrimitive = raw.WinguiVectorPrimitive;
 pub const AssetId = raw.SuperTerminalAssetId;
 pub const FreeFn = raw.SuperTerminalFreeFn;
+
+pub const Key = struct {
+    pub const left: u32 = raw.WINGUI_KEY_LEFT;
+    pub const up: u32 = raw.WINGUI_KEY_UP;
+    pub const right: u32 = raw.WINGUI_KEY_RIGHT;
+    pub const down: u32 = raw.WINGUI_KEY_DOWN;
+    pub const space: u32 = raw.WINGUI_KEY_SPACE;
+    pub const escape: u32 = raw.WINGUI_KEY_ESCAPE;
+};
+
+pub const RgbaContentBufferMode = struct {
+    pub const frame: u32 = raw.SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME;
+    pub const persistent: u32 = raw.SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT;
+};
+
+pub const RgbaBlendMode = struct {
+    pub const replace: u32 = raw.WINGUI_RGBA_BLIT_OPAQUE;
+    pub const alpha_over: u32 = raw.WINGUI_RGBA_BLIT_ALPHA_OVER;
+};
 
 fn fail() Error {
     return error.WinguiCallFailed;
@@ -233,6 +253,22 @@ pub const FrameView = struct {
 
     pub fn bufferCount(self: FrameView) u32 {
         return raw.wingui_spec_bind_frame_buffer_count(self.raw_view);
+    }
+
+    pub fn keyDown(self: FrameView, virtual_key: u32) Error!bool {
+        const pressed = raw.wingui_spec_bind_frame_get_key_state(self.raw_view, virtual_key);
+        if (pressed < 0) {
+            return fail();
+        }
+        return pressed != 0;
+    }
+
+    pub fn keyboardState(self: FrameView) Error!KeyboardState {
+        var state: KeyboardState = std.mem.zeroes(KeyboardState);
+        if (raw.wingui_spec_bind_frame_get_keyboard_state(self.raw_view, &state) == 0) {
+            return fail();
+        }
+        return state;
     }
 
     pub fn resolvePane(self: FrameView, node_id: []const u8) Error!PaneRef {
