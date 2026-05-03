@@ -16,9 +16,27 @@ typedef struct SuperTerminalPaneId {
     uint64_t value;
 } SuperTerminalPaneId;
 
+typedef struct SuperTerminalWindowId {
+    uint64_t value;
+} SuperTerminalWindowId;
+
 typedef struct SuperTerminalAssetId {
     uint64_t value;
 } SuperTerminalAssetId;
+
+typedef struct SuperTerminalWindowDesc {
+    const char* title_utf8;
+    uint32_t columns;
+    uint32_t rows;
+    uint32_t flags;
+    uint32_t command_queue_capacity;
+    uint32_t event_queue_capacity;
+    const char* font_family_utf8;
+    int32_t font_pixel_height;
+    float dpi_scale;
+    const char* text_shader_path_utf8;
+    const char* initial_ui_json_utf8;
+} SuperTerminalWindowDesc;
 
 typedef struct SuperTerminalPaneLayout {
     int32_t x;
@@ -46,24 +64,26 @@ typedef enum SuperTerminalHostErrorCode {
 
 typedef enum SuperTerminalCommandType {
     SUPERTERMINAL_CMD_NOP = 0,
-    SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH = 1,
-    SUPERTERMINAL_CMD_NATIVE_UI_PATCH = 2,
-    SUPERTERMINAL_CMD_WINDOW_SET_TITLE = 3,
-    SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS = 4,
-    SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION = 5,
-    SUPERTERMINAL_CMD_REQUEST_PRESENT = 6,
-    SUPERTERMINAL_CMD_REQUEST_CLOSE = 7,
-    SUPERTERMINAL_CMD_RGBA_UPLOAD_OWNED = 8,
-    SUPERTERMINAL_CMD_FRAME_SWAP = 9,
-    SUPERTERMINAL_CMD_RGBA_GPU_COPY = 10,
-    SUPERTERMINAL_CMD_RGBA_ASSET_REGISTER_OWNED = 11,
-    SUPERTERMINAL_CMD_RGBA_ASSET_BLIT_TO_PANE = 12,
-    SUPERTERMINAL_CMD_INDEXED_UPLOAD_OWNED = 13,
-    SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED = 14,
-    SUPERTERMINAL_CMD_SPRITE_RENDER = 15,
-    SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED = 16,
-    SUPERTERMINAL_CMD_INDEXED_FILL_RECT = 17,
-    SUPERTERMINAL_CMD_INDEXED_DRAW_LINE = 18,
+    SUPERTERMINAL_CMD_CREATE_WINDOW = 1,
+    SUPERTERMINAL_CMD_CLOSE_WINDOW = 2,
+    SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH = 3,
+    SUPERTERMINAL_CMD_NATIVE_UI_PATCH = 4,
+    SUPERTERMINAL_CMD_WINDOW_SET_TITLE = 5,
+    SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS = 6,
+    SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION = 7,
+    SUPERTERMINAL_CMD_REQUEST_PRESENT = 8,
+    SUPERTERMINAL_CMD_REQUEST_CLOSE = 9,
+    SUPERTERMINAL_CMD_RGBA_UPLOAD_OWNED = 10,
+    SUPERTERMINAL_CMD_FRAME_SWAP = 11,
+    SUPERTERMINAL_CMD_RGBA_GPU_COPY = 12,
+    SUPERTERMINAL_CMD_RGBA_ASSET_REGISTER_OWNED = 13,
+    SUPERTERMINAL_CMD_RGBA_ASSET_BLIT_TO_PANE = 14,
+    SUPERTERMINAL_CMD_INDEXED_UPLOAD_OWNED = 15,
+    SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED = 16,
+    SUPERTERMINAL_CMD_SPRITE_RENDER = 17,
+    SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED = 18,
+    SUPERTERMINAL_CMD_INDEXED_FILL_RECT = 19,
+    SUPERTERMINAL_CMD_INDEXED_DRAW_LINE = 20,
 } SuperTerminalCommandType;
 
 typedef void (WINGUI_CALL *SuperTerminalFreeFn)(void* user_data, void* buffer);
@@ -79,6 +99,8 @@ typedef enum SuperTerminalEventType {
     SUPERTERMINAL_EVENT_NATIVE_UI = 7,
     SUPERTERMINAL_EVENT_CLOSE_REQUESTED = 8,
     SUPERTERMINAL_EVENT_HOST_STOPPING = 9,
+    SUPERTERMINAL_EVENT_WINDOW_CREATED = 10,
+    SUPERTERMINAL_EVENT_WINDOW_CLOSED = 11,
 } SuperTerminalEventType;
 
 typedef enum SuperTerminalMouseEventKind {
@@ -95,16 +117,28 @@ typedef enum SuperTerminalPaneInputDeviceKind {
 } SuperTerminalPaneInputDeviceKind;
 
 typedef struct SuperTerminalNativeUiPublish {
+    SuperTerminalWindowId window_id;
     const char* json_utf8;
 } SuperTerminalNativeUiPublish;
 
 typedef struct SuperTerminalNativeUiPatch {
+    SuperTerminalWindowId window_id;
     const char* patch_json_utf8;
 } SuperTerminalNativeUiPatch;
 
 typedef struct SuperTerminalSetTitle {
+    SuperTerminalWindowId window_id;
     char title_utf8[256];
 } SuperTerminalSetTitle;
+
+typedef struct SuperTerminalCreateWindow {
+    SuperTerminalWindowId window_id;
+    SuperTerminalWindowDesc desc;
+} SuperTerminalCreateWindow;
+
+typedef struct SuperTerminalCloseWindow {
+    SuperTerminalWindowId window_id;
+} SuperTerminalCloseWindow;
 
 typedef struct SuperTerminalTextGridCell {
     uint32_t row;
@@ -115,12 +149,14 @@ typedef struct SuperTerminalTextGridCell {
 } SuperTerminalTextGridCell;
 
 typedef struct SuperTerminalTextGridWriteCells {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     const SuperTerminalTextGridCell* cells;
     uint32_t cell_count;
 } SuperTerminalTextGridWriteCells;
 
 typedef struct SuperTerminalTextGridClearRegion {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t row;
     uint32_t column;
@@ -158,6 +194,7 @@ typedef struct SuperTerminalRgbaFrame {
 } SuperTerminalRgbaFrame;
 
 typedef struct SuperTerminalRgbaUploadOwned {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;
     uint32_t dst_x;
@@ -182,6 +219,7 @@ typedef enum SuperTerminalRgbaContentBufferMode {
 } SuperTerminalRgbaContentBufferMode;
 
 typedef struct SuperTerminalRgbaGpuCopy {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId dst_pane_id;
     uint32_t dst_buffer_index;
     uint32_t dst_x;
@@ -196,6 +234,7 @@ typedef struct SuperTerminalRgbaGpuCopy {
 } SuperTerminalRgbaGpuCopy;
 
 typedef struct SuperTerminalRgbaAssetRegisterOwned {
+    SuperTerminalWindowId window_id;
     SuperTerminalAssetId asset_id;
     uint32_t width;
     uint32_t height;
@@ -206,6 +245,7 @@ typedef struct SuperTerminalRgbaAssetRegisterOwned {
 } SuperTerminalRgbaAssetRegisterOwned;
 
 typedef struct SuperTerminalRgbaAssetBlitToPane {
+    SuperTerminalWindowId window_id;
     SuperTerminalAssetId asset_id;
     uint32_t src_x;
     uint32_t src_y;
@@ -218,6 +258,7 @@ typedef struct SuperTerminalRgbaAssetBlitToPane {
 } SuperTerminalRgbaAssetBlitToPane;
 
 typedef struct SuperTerminalIndexedUploadOwned {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;
     uint32_t buffer_width;
@@ -262,6 +303,7 @@ typedef struct SuperTerminalSpriteInstance {
 } SuperTerminalSpriteInstance;
 
 typedef struct SuperTerminalSpriteDefineOwned {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     SuperTerminalSpriteId sprite_id;
     uint32_t frame_w;             /* width of one frame in pixels            */
@@ -275,6 +317,7 @@ typedef struct SuperTerminalSpriteDefineOwned {
 } SuperTerminalSpriteDefineOwned;
 
 typedef struct SuperTerminalSpriteRender {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t target_width;        /* screen-space pixel width  (0 = use pane layout width)  */
     uint32_t target_height;       /* screen-space pixel height (0 = use pane layout height) */
@@ -286,6 +329,7 @@ typedef struct SuperTerminalSpriteRender {
 } SuperTerminalSpriteRender;
 
 typedef struct SuperTerminalVectorDrawOwned {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;        /* RGBA surface buffer to render into */
     uint32_t content_buffer_mode; /* SuperTerminalRgbaContentBufferMode */
@@ -299,6 +343,7 @@ typedef struct SuperTerminalVectorDrawOwned {
 } SuperTerminalVectorDrawOwned;
 
 typedef struct SuperTerminalIndexedFillRect {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;   /* indexed surface buffer */
     uint32_t x;              /* destination rect */
@@ -309,6 +354,7 @@ typedef struct SuperTerminalIndexedFillRect {
 } SuperTerminalIndexedFillRect;
 
 typedef struct SuperTerminalIndexedDrawLine {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;
     int32_t  x0;
@@ -322,6 +368,8 @@ typedef struct SuperTerminalCommand {
     SuperTerminalCommandType type;
     uint32_t sequence;
     union {
+        SuperTerminalCreateWindow create_window;
+        SuperTerminalCloseWindow close_window;
         SuperTerminalNativeUiPublish native_ui_publish;
         SuperTerminalNativeUiPatch native_ui_patch;
         SuperTerminalSetTitle set_title;
@@ -375,6 +423,7 @@ typedef struct SuperTerminalPaneInputEvent {
 } SuperTerminalPaneInputEvent;
 
 typedef struct SuperTerminalResizeEvent {
+    SuperTerminalWindowId window_id;
     uint32_t pixel_width;
     uint32_t pixel_height;
     uint32_t columns;
@@ -385,18 +434,29 @@ typedef struct SuperTerminalResizeEvent {
 } SuperTerminalResizeEvent;
 
 typedef struct SuperTerminalFocusEvent {
+    SuperTerminalWindowId window_id;
     int32_t focused;
 } SuperTerminalFocusEvent;
 
 typedef struct SuperTerminalNativeUiEvent {
+    SuperTerminalWindowId window_id;
     char payload_json_utf8[512];
 } SuperTerminalNativeUiEvent;
+
+typedef struct SuperTerminalWindowCreatedEvent {
+    SuperTerminalWindowId window_id;
+} SuperTerminalWindowCreatedEvent;
+
+typedef struct SuperTerminalWindowClosedEvent {
+    SuperTerminalWindowId window_id;
+} SuperTerminalWindowClosedEvent;
 
 typedef struct SuperTerminalHostStoppingEvent {
     int32_t exit_code;
 } SuperTerminalHostStoppingEvent;
 
 typedef struct SuperTerminalEvent {
+    SuperTerminalWindowId window_id;
     SuperTerminalEventType type;
     uint32_t sequence;
     union {
@@ -407,6 +467,8 @@ typedef struct SuperTerminalEvent {
         SuperTerminalResizeEvent resize;
         SuperTerminalFocusEvent focus;
         SuperTerminalNativeUiEvent native_ui;
+        SuperTerminalWindowCreatedEvent window_created;
+        SuperTerminalWindowClosedEvent window_closed;
         SuperTerminalHostStoppingEvent host_stopping;
     } data;
 } SuperTerminalEvent;
@@ -435,6 +497,7 @@ typedef struct SuperTerminalRunResult {
 } SuperTerminalRunResult;
 
 typedef struct SuperTerminalFrameTick {
+    SuperTerminalWindowId window_id;
     uint64_t frame_index;
     uint64_t elapsed_ms;
     uint64_t delta_ms;
@@ -516,6 +579,15 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_request_stop(
     SuperTerminalClientContext* ctx,
     int32_t exit_code);
 
+WINGUI_API int32_t WINGUI_CALL super_terminal_create_window(
+    SuperTerminalClientContext* ctx,
+    const SuperTerminalWindowDesc* desc,
+    SuperTerminalWindowId* out_window_id);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_close_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id);
+
 WINGUI_API int32_t WINGUI_CALL super_terminal_get_key_state(
     SuperTerminalClientContext* ctx,
     uint32_t virtual_key);
@@ -529,8 +601,20 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_resolve_pane_id_utf8(
     const char* node_id_utf8,
     SuperTerminalPaneId* out_pane_id);
 
+WINGUI_API int32_t WINGUI_CALL super_terminal_resolve_pane_id_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id);
+
 WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout(
     SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    SuperTerminalPaneLayout* out_layout);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
     SuperTerminalPaneId pane_id,
     SuperTerminalPaneLayout* out_layout);
 
@@ -546,12 +630,27 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json(
     SuperTerminalClientContext* ctx,
     const char* json_utf8);
 
+WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* json_utf8);
+
 WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
     SuperTerminalClientContext* ctx,
     const char* patch_json_utf8);
 
+WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* patch_json_utf8);
+
 WINGUI_API int32_t WINGUI_CALL super_terminal_set_title_utf8(
     SuperTerminalClientContext* ctx,
+    const char* title_utf8);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_set_title_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
     const char* title_utf8);
 
 WINGUI_API int32_t WINGUI_CALL super_terminal_text_grid_write_cells(

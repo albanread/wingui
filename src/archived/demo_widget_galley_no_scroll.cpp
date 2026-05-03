@@ -322,7 +322,13 @@ int main() {
     SuperTerminalClientContext* app_ctx = nullptr;
     std::optional<Json> loaded_layout_spec;
 
+    constexpr uint32_t kResponsiveStackThreshold = 1180;
+
     auto build_default_window = [&]() {
+        const uint32_t window_pixel_width = layout.state().get("window_pixel_width", 1280u).get<uint32_t>();
+        const uint32_t window_pixel_height = layout.state().get("window_pixel_height", 900u).get<uint32_t>();
+        const bool use_stacked_layout = window_pixel_width < kResponsiveStackThreshold;
+
         const std::string name = layout.state().get("name", std::string("Ada Lovelace")).get<std::string>();
         const double age = layout.state().get("age", 37.0).get<double>();
         const std::string meeting_date = layout.state().get("meeting_date", std::string("2026-05-01")).get<std::string>();
@@ -471,15 +477,37 @@ int main() {
             wg::ui_card("Event hits", build_hit_rows(hits)),
         };
 
+        const int64_t content_width = static_cast<int64_t>(std::max<uint32_t>(320u, window_pixel_width > 24u ? window_pixel_width - 24u : window_pixel_width));
+        wg::UiNode content_layout = wg::ui_split_view(
+            use_stacked_layout ? "vertical" : "horizontal",
+            "widget-galley-responsive-split",
+            wg::ui_split_pane("left", {
+                wg::ui_stack(left_nodes).gap(10),
+            }).size(use_stacked_layout ? 0.60 : 0.67),
+            wg::ui_split_pane("right", {
+                wg::ui_stack(summary_nodes).gap(10),
+            }).size(use_stacked_layout ? 0.40 : 0.33),
+            content_width,
+            0,
+            8,
+            true,
+            false
+        );
+
+        char viewport_text[96];
+        std::snprintf(viewport_text,
+                      sizeof(viewport_text),
+                      "%ux%u %s",
+                      static_cast<unsigned>(window_pixel_width),
+                      static_cast<unsigned>(window_pixel_height),
+                      use_stacked_layout ? "stacked" : "split");
+
         return wg::ui_window(
             "Widget Galley (No Scroll Areas)",
             wg::ui_stack({
                 wg::ui_heading("Interactive widget galley"),
                 wg::ui_text("This version relies on the window's root scrollbars rather than inner scroll views. The page keeps a bounded two-column layout and the host window owns vertical overflow."),
-                wg::ui_row({
-                    wg::ui_stack(left_nodes).gap(10),
-                    wg::ui_stack(summary_nodes).gap(10),
-                }).gap(16),
+                content_layout,
             }).gap(12).padding(12)
         )
             .command_bar(wg::ui_command_bar(Json::array({
@@ -533,6 +561,7 @@ int main() {
                 })),
             })))
             .status_bar(wg::ui_status_bar(Json::array({
+                wg::ui_status_part(viewport_text, 170),
                 wg::ui_status_part(std::string("Mode ") + reconcile_mode_text(layout.model().last_reconcile_mode())),
                 wg::ui_status_part(coverage_text, 110),
                 wg::ui_status_part(total_text, 90),
@@ -556,8 +585,16 @@ int main() {
             return layout.render(render_window);
         })
         .on_event([&](const wg::Event& e) {
+            if (e.is_resize()) {
+                layout.state().set("window_pixel_width", e.resize().pixel_width);
+                layout.state().set("window_pixel_height", e.resize().pixel_height);
+                if (!loaded_layout_spec) {
+                    layout.rerender();
+                }
+                return;
+            }
             if (e.is_close_requested()) {
-                wg::request_stop(nullptr);
+                wg::request_stop(app_ctx);
                 return;
             }
             if (!e.is_native_ui()) return;

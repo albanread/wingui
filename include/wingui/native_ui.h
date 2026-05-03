@@ -6,6 +6,8 @@
 extern "C" {
 #endif
 
+typedef struct WinguiNativeUiSession WinguiNativeUiSession;
+
 typedef int64_t (WINGUI_CALL *WinguiNativeDispatchEventJsonFn)(const char* event_json_utf8);
 typedef int64_t (WINGUI_CALL *WinguiNativeStringCommandFn)(const char* utf8);
 typedef const char* (WINGUI_CALL *WinguiNativeClipboardGetFn)(void);
@@ -77,6 +79,93 @@ typedef struct WinguiNativePatchMetrics {
     uint64_t resize_reject_count;
     uint64_t failed_patch_count;
 } WinguiNativePatchMetrics;
+
+WINGUI_API WinguiNativeUiSession* WINGUI_CALL wingui_native_session_create(void);
+WINGUI_API void WINGUI_CALL wingui_native_session_destroy(WinguiNativeUiSession* session);
+WINGUI_API void WINGUI_CALL wingui_native_session_set_callbacks(
+    WinguiNativeUiSession* session,
+    const WinguiNativeCallbacks* callbacks);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_available(WinguiNativeUiSession* session);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_backend_info(WinguiNativeUiSession* session);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_last_error_utf8(WinguiNativeUiSession* session);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_enqueue_command(
+    WinguiNativeUiSession* session,
+    const WinguiNativeCommand* command);
+WINGUI_API uint32_t WINGUI_CALL wingui_native_session_drain_command_queue(
+    WinguiNativeUiSession* session,
+    uint32_t max_commands);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_poll_event(
+    WinguiNativeUiSession* session,
+    WinguiNativeEvent* out_event);
+WINGUI_API void* WINGUI_CALL wingui_native_session_event_handle(WinguiNativeUiSession* session);
+WINGUI_API void WINGUI_CALL wingui_native_session_release_event(
+    WinguiNativeUiSession* session,
+    WinguiNativeEvent* event);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_publish_json(
+    WinguiNativeUiSession* session,
+    const char* utf8);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_patch_json(
+    WinguiNativeUiSession* session,
+    const char* utf8);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_host_run(WinguiNativeUiSession* session);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_begin_embedded(
+    WinguiNativeUiSession* session,
+    const WinguiNativeEmbeddedSessionDesc* desc);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_attach_embedded_host(
+    WinguiNativeUiSession* session,
+    const WinguiNativeEmbeddedHostDesc* desc);
+WINGUI_API void WINGUI_CALL wingui_native_session_end_embedded(WinguiNativeUiSession* session);
+WINGUI_API void WINGUI_CALL wingui_native_session_detach_embedded_host(WinguiNativeUiSession* session);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_set_host_bounds(
+    WinguiNativeUiSession* session,
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    int32_t height);
+WINGUI_API void* WINGUI_CALL wingui_native_session_host_hwnd(WinguiNativeUiSession* session);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_handle_host_command(
+    WinguiNativeUiSession* session,
+    int32_t command_id);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_get_content_size(
+    WinguiNativeUiSession* session,
+    int32_t* out_width,
+    int32_t* out_height);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_bounds(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    WinguiNativeNodeBounds* out_bounds);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_hwnd(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    void** out_hwnd);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_type_utf8(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    char* buffer_utf8,
+    uint32_t buffer_size);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_copy_focused_pane_id_utf8(
+    WinguiNativeUiSession* session,
+    char* buffer_utf8,
+    uint32_t buffer_size);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_get_patch_metrics(
+    WinguiNativeUiSession* session,
+    WinguiNativePatchMetrics* out_metrics);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_open_url(
+    WinguiNativeUiSession* session,
+    const char* utf8);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_clipboard_get(WinguiNativeUiSession* session);
+WINGUI_API int64_t WINGUI_CALL wingui_native_session_clipboard_set(
+    WinguiNativeUiSession* session,
+    const char* utf8);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_open_file(
+    WinguiNativeUiSession* session,
+    const char* initial_path_utf8);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_save_file(
+    WinguiNativeUiSession* session,
+    const char* initial_path_utf8);
+WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_folder(
+    WinguiNativeUiSession* session,
+    const char* initial_title_utf8);
 
 WINGUI_API void WINGUI_CALL wingui_native_set_callbacks(const WinguiNativeCallbacks* callbacks);
 WINGUI_API int64_t WINGUI_CALL wingui_native_available(void);

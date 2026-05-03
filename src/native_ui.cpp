@@ -265,9 +265,90 @@ struct NativeHostState {
     std::atomic<uint64_t> patch_window_rebuild_count{0};
     std::atomic<uint64_t> patch_resize_reject_count{0};
     std::atomic<uint64_t> patch_failed_count{0};
-} g_native;
+};
+
+struct NativeUiSessionImpl {
+    NativeHostState state;
+    WinguiNativeCallbacks callbacks{};
+    std::string backend_info;
+};
+
+thread_local NativeUiSessionImpl* g_current_native_session = nullptr;
+NativeUiSessionImpl g_default_native_session{};
+std::mutex g_native_session_map_mutex;
+std::unordered_map<HWND, NativeUiSessionImpl*> g_native_sessions_by_hwnd;
 
 std::mutex g_native_trace_mutex;
+
+NativeUiSessionImpl* defaultNativeSession() {
+    return &g_default_native_session;
+}
+
+NativeUiSessionImpl* activeNativeSession() {
+    return g_current_native_session ? g_current_native_session : defaultNativeSession();
+}
+
+NativeHostState& activeNativeState() {
+    return activeNativeSession()->state;
+}
+
+WinguiNativeCallbacks& activeNativeCallbacks() {
+    return activeNativeSession()->callbacks;
+}
+
+std::string& activeNativeBackendInfo() {
+    return activeNativeSession()->backend_info;
+}
+
+NativeUiSessionImpl* lookupNativeSessionForWindow(HWND hwnd) {
+    if (!hwnd) return activeNativeSession();
+
+    std::lock_guard<std::mutex> lock(g_native_session_map_mutex);
+    HWND current = hwnd;
+    while (current) {
+        auto it = g_native_sessions_by_hwnd.find(current);
+        if (it != g_native_sessions_by_hwnd.end() && it->second) {
+            return it->second;
+        }
+        auto* user_data = reinterpret_cast<NativeUiSessionImpl*>(GetWindowLongPtrW(current, GWLP_USERDATA));
+        if (user_data) {
+            return user_data;
+        }
+        HWND parent = GetParent(current);
+        if (!parent || parent == current) break;
+        current = parent;
+    }
+    return defaultNativeSession();
+}
+
+void registerNativeSessionWindow(NativeUiSessionImpl* session, HWND hwnd) {
+    if (!session || !hwnd) return;
+    std::lock_guard<std::mutex> lock(g_native_session_map_mutex);
+    g_native_sessions_by_hwnd[hwnd] = session;
+}
+
+void unregisterNativeSessionWindow(HWND hwnd) {
+    if (!hwnd) return;
+    std::lock_guard<std::mutex> lock(g_native_session_map_mutex);
+    g_native_sessions_by_hwnd.erase(hwnd);
+}
+
+struct ScopedNativeSession {
+    NativeUiSessionImpl* previous = nullptr;
+
+    explicit ScopedNativeSession(NativeUiSessionImpl* session)
+        : previous(g_current_native_session) {
+        g_current_native_session = session ? session : defaultNativeSession();
+    }
+
+    ~ScopedNativeSession() {
+        g_current_native_session = previous;
+    }
+};
+
+#define g_native activeNativeState()
+#define g_native_callbacks activeNativeCallbacks()
+#define g_backend_info activeNativeBackendInfo()
 
 std::wstring nativeEventTracePath() {
     wchar_t path_buffer[MAX_PATH];
@@ -583,10 +664,8 @@ struct MenuBuildResult {
     bool ok = true;
 };
 
-thread_local std::string g_backend_info;
 thread_local std::string g_native_last_error;
 IWICImagingFactory* g_wic_factory = nullptr;
-WinguiNativeCallbacks g_native_callbacks{};
 
 bool commandTypeNeedsPayload(WinguiNativeCommandType type) {
     return type == WINGUI_NATIVE_COMMAND_PUBLISH_JSON ||
@@ -1225,6 +1304,7 @@ LRESULT CALLBACK richEditSubclassProc(HWND hwnd,
                                       DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
 
     enum class RichTextShortcut {
         None,
@@ -2105,6 +2185,7 @@ LRESULT CALLBACK containerForwardSubclassProc(HWND hwnd,
                                               DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     auto forward_to_native_host = [&](UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
         HWND target = nullptr;
         {
@@ -2146,6 +2227,7 @@ LRESULT CALLBACK transparentPaneSubclassProc(HWND hwnd,
                                              DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -2312,6 +2394,7 @@ LRESULT CALLBACK scrollViewSubclassProc(HWND hwnd,
                                         DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     switch (message) {
     case WM_VSCROLL:
         {
@@ -2360,6 +2443,7 @@ LRESULT CALLBACK splitViewSubclassProc(HWND hwnd,
                                        DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     switch (message) {
     case WM_SETCURSOR:
         if (LOWORD(lparam) == HTCLIENT) {
@@ -2985,6 +3069,7 @@ LRESULT CALLBACK canvasSubclassProc(HWND hwnd,
                                     DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -3222,6 +3307,7 @@ LRESULT CALLBACK imageSubclassProc(HWND hwnd,
                                    DWORD_PTR ref_data) {
     (void)subclass_id;
     (void)ref_data;
+    ScopedNativeSession scoped(lookupNativeSessionForWindow(hwnd));
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -7113,6 +7199,17 @@ bool setUserAppNodeProp(ordered_json& spec, const std::string& node_id, const ch
 }
 
 LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    NativeUiSessionImpl* session = lookupNativeSessionForWindow(hwnd);
+    if (message == WM_NCCREATE) {
+        CREATESTRUCTW* create_struct = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        session = create_struct && create_struct->lpCreateParams
+            ? static_cast<NativeUiSessionImpl*>(create_struct->lpCreateParams)
+            : activeNativeSession();
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(session));
+        registerNativeSessionWindow(session, hwnd);
+        return TRUE;
+    }
+    ScopedNativeSession scoped(session);
     switch (message) {
     case WM_CREATE:
         {
@@ -7717,11 +7814,17 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
             }
         }
         return 0;
+
+    case WM_NCDESTROY:
+        unregisterNativeSessionWindow(hwnd);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return 0;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
-void nativeHostThreadMain() {
+void nativeHostThreadMain(NativeUiSessionImpl* session) {
+    ScopedNativeSession scoped(session);
     // --- Visual styles -------------------------------------------------
     // Activate a ComCtl32 v6 activation context for this thread so that
     // every control created here uses themed, modern rendering.  The
@@ -7789,7 +7892,7 @@ void nativeHostThreadMain() {
         nullptr,
         nullptr,
         GetModuleHandleW(nullptr),
-        nullptr);
+        activeNativeSession());
 
     {
         std::lock_guard<std::mutex> lock(g_native.mutex);
@@ -7837,7 +7940,8 @@ bool ensureNativeThread() {
     std::unique_lock<std::mutex> lock(g_native.mutex);
     if (g_native.running && g_native.hwnd) return true;
     if (!g_native.thread_started) {
-        std::thread thread(nativeHostThreadMain);
+        NativeUiSessionImpl* session = activeNativeSession();
+        std::thread thread(nativeHostThreadMain, session);
         thread.detach();
         g_native.thread_started = true;
     }
@@ -7884,7 +7988,7 @@ bool attachEmbeddedNativeHost(const WinguiNativeEmbeddedHostDesc& desc) {
         static_cast<HWND>(desc.parent_hwnd),
         nullptr,
         GetModuleHandleW(nullptr),
-        nullptr);
+        activeNativeSession());
     if (!hwnd) {
         setNativeLastError("Embedded native UI host window creation failed.");
         return false;
@@ -8143,32 +8247,94 @@ bool validateUserAppSpec(const ordered_json& spec, std::string& error) {
     return validateUserAppNode(spec, "window", error);
 }
 
+NativeUiSessionImpl* requireNativeSession(WinguiNativeUiSession* session) {
+    return session ? reinterpret_cast<NativeUiSessionImpl*>(session) : defaultNativeSession();
+}
+
+WinguiNativeUiSession* defaultNativeSessionHandle() {
+    return reinterpret_cast<WinguiNativeUiSession*>(defaultNativeSession());
+}
+
 } // namespace
 
-extern "C" WINGUI_API void WINGUI_CALL wingui_native_set_callbacks(const WinguiNativeCallbacks* callbacks) {
+extern "C" WINGUI_API WinguiNativeUiSession* WINGUI_CALL wingui_native_session_create(void) {
+    clearNativeLastError();
+    auto* session = new (std::nothrow) NativeUiSessionImpl();
+    if (!session) {
+        setNativeLastError("Failed to allocate native UI session.");
+    }
+    return reinterpret_cast<WinguiNativeUiSession*>(session);
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_session_destroy(WinguiNativeUiSession* session) {
+    NativeUiSessionImpl* native_session = requireNativeSession(session);
+    if (!session || native_session == defaultNativeSession()) return;
+    {
+        ScopedNativeSession scoped(native_session);
+        HWND hwnd = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_native.mutex);
+            hwnd = g_native.hwnd;
+        }
+        if (hwnd && IsWindow(hwnd)) {
+            DestroyWindow(hwnd);
+        }
+        if (native_session->state.event_handle) {
+            CloseHandle(native_session->state.event_handle);
+            native_session->state.event_handle = nullptr;
+        }
+        if (native_session->state.current_menu) {
+            DestroyMenu(native_session->state.current_menu);
+            native_session->state.current_menu = nullptr;
+        }
+        if (native_session->state.ui_font) {
+            DeleteObject(native_session->state.ui_font);
+            native_session->state.ui_font = nullptr;
+        }
+        if (native_session->state.heading_font) {
+            DeleteObject(native_session->state.heading_font);
+            native_session->state.heading_font = nullptr;
+        }
+    }
+    delete native_session;
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_session_set_callbacks(
+    WinguiNativeUiSession* session,
+    const WinguiNativeCallbacks* callbacks) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     g_native_callbacks = callbacks ? *callbacks : WinguiNativeCallbacks{};
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_available(void) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_available(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     return hostBridgeAvailable() ? 1 : 0;
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_backend_info(void) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_backend_info(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     g_backend_info = "backend=wingui-native-win32;status=fast-patch-p1;dispatch=";
     g_backend_info += g_native_callbacks.dispatch_event_json ? "callback+queue" : "queue";
     return g_backend_info.c_str();
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_last_error_utf8(void) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_last_error_utf8(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     return nativeLastErrorUtf8();
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_enqueue_command(const WinguiNativeCommand* command) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_enqueue_command(
+    WinguiNativeUiSession* session,
+    const WinguiNativeCommand* command) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return enqueueNativeCommandInternal(command) ? 1 : 0;
 }
 
-extern "C" WINGUI_API uint32_t WINGUI_CALL wingui_native_drain_command_queue(uint32_t max_commands) {
+extern "C" WINGUI_API uint32_t WINGUI_CALL wingui_native_session_drain_command_queue(
+    WinguiNativeUiSession* session,
+    uint32_t max_commands) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     uint32_t drained = 0;
     for (;;) {
@@ -8188,7 +8354,10 @@ extern "C" WINGUI_API uint32_t WINGUI_CALL wingui_native_drain_command_queue(uin
     return drained;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_poll_event(WinguiNativeEvent* out_event) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_poll_event(
+    WinguiNativeUiSession* session,
+    WinguiNativeEvent* out_event) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     if (!out_event) {
         setNativeLastError("Native UI event output is required.");
@@ -8209,12 +8378,16 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_poll_event(WinguiNativeE
     return copyReactiveEventToApi(queued, out_event) ? 1 : 0;
 }
 
-extern "C" WINGUI_API void* WINGUI_CALL wingui_native_event_handle(void) {
+extern "C" WINGUI_API void* WINGUI_CALL wingui_native_session_event_handle(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     std::lock_guard<std::mutex> lock(g_native.event_mutex);
     return ensureReactiveEventHandleLocked();
 }
 
-extern "C" WINGUI_API void WINGUI_CALL wingui_native_release_event(WinguiNativeEvent* event) {
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_session_release_event(
+    WinguiNativeUiSession* session,
+    WinguiNativeEvent* event) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     if (!event) return;
     if (event->payload_utf8) {
         std::free(event->payload_utf8);
@@ -8222,36 +8395,46 @@ extern "C" WINGUI_API void WINGUI_CALL wingui_native_release_event(WinguiNativeE
     std::memset(event, 0, sizeof(*event));
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_publish_json(const char* utf8) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_publish_json(
+    WinguiNativeUiSession* session,
+    const char* utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return executeNativePublishJson(utf8) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_patch_json(const char* utf8) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_patch_json(
+    WinguiNativeUiSession* session,
+    const char* utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return executeNativePatchJson(utf8) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_host_run(void) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_host_run(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return executeNativeHostRun() ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_begin_embedded_session(const WinguiNativeEmbeddedSessionDesc* desc) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_begin_embedded(
+    WinguiNativeUiSession* session,
+    const WinguiNativeEmbeddedSessionDesc* desc) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     if (!desc) {
         setNativeLastError("Embedded native UI session descriptor is required.");
         return 0;
     }
 
-    wingui_native_set_callbacks(&desc->callbacks);
+    wingui_native_session_set_callbacks(session, &desc->callbacks);
     if (!attachEmbeddedNativeHost(desc->host)) {
         return 0;
     }
 
     if (desc->initial_ui_json_utf8 && desc->initial_ui_json_utf8[0] != '\0') {
         if (!executeNativePublishJson(desc->initial_ui_json_utf8)) {
-            wingui_native_detach_embedded_host();
+            wingui_native_session_detach_embedded_host(session);
             return 0;
         }
     }
@@ -8259,7 +8442,10 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_begin_embedded_session(c
     return 1;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_attach_embedded_host(const WinguiNativeEmbeddedHostDesc* desc) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_attach_embedded_host(
+    WinguiNativeUiSession* session,
+    const WinguiNativeEmbeddedHostDesc* desc) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     if (!desc) {
         setNativeLastError("Embedded native UI host descriptor is required.");
@@ -8268,12 +8454,13 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_attach_embedded_host(con
     return attachEmbeddedNativeHost(*desc) ? 1 : 0;
 }
 
-extern "C" WINGUI_API void WINGUI_CALL wingui_native_end_embedded_session(void) {
-    wingui_native_detach_embedded_host();
-    wingui_native_set_callbacks(nullptr);
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_session_end_embedded(WinguiNativeUiSession* session) {
+    wingui_native_session_detach_embedded_host(session);
+    wingui_native_session_set_callbacks(session, nullptr);
 }
 
-extern "C" WINGUI_API void WINGUI_CALL wingui_native_detach_embedded_host(void) {
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_session_detach_embedded_host(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     HWND hwnd = nullptr;
     {
@@ -8292,7 +8479,13 @@ extern "C" WINGUI_API void WINGUI_CALL wingui_native_detach_embedded_host(void) 
     g_native.embedded_mode = false;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t x, int32_t y, int32_t width, int32_t height) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_set_host_bounds(
+    WinguiNativeUiSession* session,
+    int32_t x,
+    int32_t y,
+    int32_t width,
+    int32_t height) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     HWND hwnd = nullptr;
     {
@@ -8303,12 +8496,20 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t 
         setNativeLastError("Native UI host window is not available.");
         return 0;
     }
-    const RECT clamped = clampWindowRectToWorkArea(RECT{
-        x,
-        y,
-        x + std::max(1, width),
-        y + std::max(1, height),
-    });
+    bool embedded_mode = false;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        embedded_mode = g_native.embedded_mode;
+    }
+    if (embedded_mode) {
+        return MoveWindow(hwnd,
+                          x,
+                          y,
+                          std::max(1, width),
+                          std::max(1, height),
+                          TRUE) ? 1 : 0;
+    }
+    const RECT clamped = clampWindowRectToWorkArea(RECT{x, y, x + std::max(1, width), y + std::max(1, height)});
     return MoveWindow(hwnd,
                       clamped.left,
                       clamped.top,
@@ -8317,12 +8518,16 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t 
                       TRUE) ? 1 : 0;
 }
 
-extern "C" WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void) {
+extern "C" WINGUI_API void* WINGUI_CALL wingui_native_session_host_hwnd(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     std::lock_guard<std::mutex> lock(g_native.mutex);
     return g_native.hwnd;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int32_t command_id) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_handle_host_command(
+    WinguiNativeUiSession* session,
+    int32_t command_id) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     if (command_id <= 0 || g_native.suppress_events) {
         return 0;
@@ -8338,7 +8543,11 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int3
     return 1;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_get_content_size(
+    WinguiNativeUiSession* session,
+    int32_t* out_width,
+    int32_t* out_height) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     if (!out_width || !out_height) {
         setNativeLastError("Native UI content size requires width and height outputs.");
         return 0;
@@ -8350,27 +8559,47 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t
     return 1;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_bounds(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    WinguiNativeNodeBounds* out_bounds) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return tryGetNativeNodeBounds(node_id_utf8, out_bounds) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_hwnd(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    void** out_hwnd) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return tryGetNativeNodeHwnd(node_id_utf8, out_hwnd) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_type_utf8(const char* node_id_utf8, char* buffer_utf8, uint32_t buffer_size) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_try_get_node_type_utf8(
+    WinguiNativeUiSession* session,
+    const char* node_id_utf8,
+    char* buffer_utf8,
+    uint32_t buffer_size) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return tryGetNativeNodeTypeUtf8(node_id_utf8, buffer_utf8, buffer_size) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_copy_focused_pane_id_utf8(
+    WinguiNativeUiSession* session,
+    char* buffer_utf8,
+    uint32_t buffer_size) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     clearNativeLastError();
     return copyFocusedPaneIdUtf8(buffer_utf8, buffer_size) ? 1 : 0;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_patch_metrics(WinguiNativePatchMetrics* out_metrics) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_get_patch_metrics(
+    WinguiNativeUiSession* session,
+    WinguiNativePatchMetrics* out_metrics) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     if (!out_metrics) {
         setNativeLastError("Native UI patch metrics require an output buffer.");
         return 0;
@@ -8386,32 +8615,172 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_patch_metrics(Wingui
     return 1;
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_open_url(const char* utf8) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_open_url(
+    WinguiNativeUiSession* session,
+    const char* utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.open_url;
     return fn ? fn(utf8) : 0;
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_clipboard_get(void) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_clipboard_get(WinguiNativeUiSession* session) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.clipboard_get;
     return fn ? fn() : "";
 }
 
-extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_clipboard_set(const char* utf8) {
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_session_clipboard_set(
+    WinguiNativeUiSession* session,
+    const char* utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.clipboard_set;
     return fn ? fn(utf8) : 0;
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_open_file(const char* initial_path_utf8) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_open_file(
+    WinguiNativeUiSession* session,
+    const char* initial_path_utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.choose_open_file;
     return fn ? fn(initial_path_utf8) : "";
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_save_file(const char* initial_path_utf8) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_save_file(
+    WinguiNativeUiSession* session,
+    const char* initial_path_utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.choose_save_file;
     return fn ? fn(initial_path_utf8) : "";
 }
 
-extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_folder(const char* initial_title_utf8) {
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_session_choose_folder(
+    WinguiNativeUiSession* session,
+    const char* initial_title_utf8) {
+    ScopedNativeSession scoped(requireNativeSession(session));
     auto fn = g_native_callbacks.choose_folder;
     return fn ? fn(initial_title_utf8) : "";
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_set_callbacks(const WinguiNativeCallbacks* callbacks) {
+    wingui_native_session_set_callbacks(defaultNativeSessionHandle(), callbacks);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_available(void) {
+    return wingui_native_session_available(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_backend_info(void) {
+    return wingui_native_session_backend_info(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_last_error_utf8(void) {
+    return wingui_native_session_last_error_utf8(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_enqueue_command(const WinguiNativeCommand* command) {
+    return wingui_native_session_enqueue_command(defaultNativeSessionHandle(), command);
+}
+
+extern "C" WINGUI_API uint32_t WINGUI_CALL wingui_native_drain_command_queue(uint32_t max_commands) {
+    return wingui_native_session_drain_command_queue(defaultNativeSessionHandle(), max_commands);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_poll_event(WinguiNativeEvent* out_event) {
+    return wingui_native_session_poll_event(defaultNativeSessionHandle(), out_event);
+}
+
+extern "C" WINGUI_API void* WINGUI_CALL wingui_native_event_handle(void) {
+    return wingui_native_session_event_handle(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_release_event(WinguiNativeEvent* event) {
+    wingui_native_session_release_event(defaultNativeSessionHandle(), event);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_publish_json(const char* utf8) {
+    return wingui_native_session_publish_json(defaultNativeSessionHandle(), utf8);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_patch_json(const char* utf8) {
+    return wingui_native_session_patch_json(defaultNativeSessionHandle(), utf8);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_host_run(void) {
+    return wingui_native_session_host_run(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_begin_embedded_session(const WinguiNativeEmbeddedSessionDesc* desc) {
+    return wingui_native_session_begin_embedded(defaultNativeSessionHandle(), desc);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_attach_embedded_host(const WinguiNativeEmbeddedHostDesc* desc) {
+    return wingui_native_session_attach_embedded_host(defaultNativeSessionHandle(), desc);
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_end_embedded_session(void) {
+    wingui_native_session_end_embedded(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API void WINGUI_CALL wingui_native_detach_embedded_host(void) {
+    wingui_native_session_detach_embedded_host(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_set_host_bounds(int32_t x, int32_t y, int32_t width, int32_t height) {
+    return wingui_native_session_set_host_bounds(defaultNativeSessionHandle(), x, y, width, height);
+}
+
+extern "C" WINGUI_API void* WINGUI_CALL wingui_native_host_hwnd(void) {
+    return wingui_native_session_host_hwnd(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int32_t command_id) {
+    return wingui_native_session_handle_host_command(defaultNativeSessionHandle(), command_id);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height) {
+    return wingui_native_session_get_content_size(defaultNativeSessionHandle(), out_width, out_height);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
+    return wingui_native_session_try_get_node_bounds(defaultNativeSessionHandle(), node_id_utf8, out_bounds);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd) {
+    return wingui_native_session_try_get_node_hwnd(defaultNativeSessionHandle(), node_id_utf8, out_hwnd);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_type_utf8(const char* node_id_utf8, char* buffer_utf8, uint32_t buffer_size) {
+    return wingui_native_session_try_get_node_type_utf8(defaultNativeSessionHandle(), node_id_utf8, buffer_utf8, buffer_size);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size) {
+    return wingui_native_session_copy_focused_pane_id_utf8(defaultNativeSessionHandle(), buffer_utf8, buffer_size);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_get_patch_metrics(WinguiNativePatchMetrics* out_metrics) {
+    return wingui_native_session_get_patch_metrics(defaultNativeSessionHandle(), out_metrics);
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_open_url(const char* utf8) {
+    return wingui_native_session_open_url(defaultNativeSessionHandle(), utf8);
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_clipboard_get(void) {
+    return wingui_native_session_clipboard_get(defaultNativeSessionHandle());
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_clipboard_set(const char* utf8) {
+    return wingui_native_session_clipboard_set(defaultNativeSessionHandle(), utf8);
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_open_file(const char* initial_path_utf8) {
+    return wingui_native_session_choose_open_file(defaultNativeSessionHandle(), initial_path_utf8);
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_save_file(const char* initial_path_utf8) {
+    return wingui_native_session_choose_save_file(defaultNativeSessionHandle(), initial_path_utf8);
+}
+
+extern "C" WINGUI_API const char* WINGUI_CALL wingui_native_choose_folder(const char* initial_title_utf8) {
+    return wingui_native_session_choose_folder(defaultNativeSessionHandle(), initial_title_utf8);
 }

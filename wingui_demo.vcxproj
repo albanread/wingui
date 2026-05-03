@@ -91,7 +91,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="src\demo.cpp" />
+    <ClCompile Include="src\demo_multi_window.cpp" />
     <ClCompile Include="src\ui_model.cpp" />
   </ItemGroup>
 

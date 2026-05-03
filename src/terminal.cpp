@@ -36,6 +36,7 @@ struct SuperTerminalRuntimeHost;
 struct SuperTerminalHostedAppRuntime;
 
 struct SuperTerminalClientContext {
+    SuperTerminalRuntimeHost* app_host = nullptr;
     SuperTerminalRuntimeHost* host = nullptr;
 };
 
@@ -44,6 +45,8 @@ struct SuperTerminalHostedAppRuntime {
 };
 
 constexpr uint32_t kSuperTerminalWakeMessage = WM_APP + 0x61;
+constexpr UINT_PTR kSuperTerminalResizeTimerId = 1;
+constexpr UINT kSuperTerminalResizeDebounceMs = 120;
 constexpr uint32_t kDefaultQueueCapacity = 1024;
 constexpr uint32_t kDefaultColumns = 80;
 constexpr uint32_t kDefaultRows = 25;
@@ -272,7 +275,10 @@ struct RingQueue {
 
 struct SuperTerminalRuntimeHost {
     SuperTerminalAppDesc desc{};
+    SuperTerminalRuntimeHost* app_host = nullptr;
+    SuperTerminalWindowId window_id{};
     WinguiWindow* window = nullptr;
+    WinguiNativeUiSession* native_session = nullptr;
     WinguiContext* context = nullptr;
     WinguiTextGridRenderer* text_renderer = nullptr;
     WinguiIndexedGraphicsRenderer* indexed_renderer = nullptr;
@@ -300,24 +306,68 @@ struct SuperTerminalRuntimeHost {
     std::atomic<uint32_t> event_sequence{0};
     std::atomic<uint32_t> display_buffer_index{0};
     std::atomic<uint64_t> next_asset_id{1};
+    std::atomic<uint64_t> next_window_id{1};
     std::unordered_map<uint64_t, WinguiRgbaSurface*> rgba_assets;
     std::mutex asset_mutex;
+    std::mutex window_mutex;
+    std::vector<SuperTerminalRuntimeHost*> windows;
     ShelfPacker sprite_atlas_packer;
     int32_t exit_code = 0;
     int32_t host_error_code = SUPERTERMINAL_HOST_ERROR_NONE;
     std::string message;
     bool native_attached = false;
     SuperTerminalPaneId active_pane_id{};
+    DWORD ui_thread_id = 0;
 };
 
 namespace {
 
 SuperTerminalRuntimeHost* g_active_host = nullptr;
 
+SuperTerminalRuntimeHost* appHostOf(SuperTerminalRuntimeHost* host) {
+    if (!host) return nullptr;
+    return host->app_host ? host->app_host : host;
+}
+
+bool windowIdsEqual(SuperTerminalWindowId left, SuperTerminalWindowId right) {
+    return left.value == right.value;
+}
+
+SuperTerminalRuntimeHost* primaryWindowHost(SuperTerminalRuntimeHost* app_host) {
+    if (!app_host) return nullptr;
+    std::lock_guard<std::mutex> lock(app_host->window_mutex);
+    return app_host->windows.empty() ? nullptr : app_host->windows.front();
+}
+
+SuperTerminalRuntimeHost* findWindowHost(SuperTerminalRuntimeHost* app_host, SuperTerminalWindowId window_id) {
+    if (!app_host || window_id.value == 0) return nullptr;
+    std::lock_guard<std::mutex> lock(app_host->window_mutex);
+    for (SuperTerminalRuntimeHost* candidate : app_host->windows) {
+        if (candidate && windowIdsEqual(candidate->window_id, window_id)) {
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+void registerWindowHost(SuperTerminalRuntimeHost* app_host, SuperTerminalRuntimeHost* window_host) {
+    if (!app_host || !window_host) return;
+    std::lock_guard<std::mutex> lock(app_host->window_mutex);
+    app_host->windows.push_back(window_host);
+}
+
+void unregisterWindowHost(SuperTerminalRuntimeHost* app_host, SuperTerminalRuntimeHost* window_host) {
+    if (!app_host || !window_host) return;
+    std::lock_guard<std::mutex> lock(app_host->window_mutex);
+    auto it = std::remove(app_host->windows.begin(), app_host->windows.end(), window_host);
+    app_host->windows.erase(it, app_host->windows.end());
+}
+
 void setHostError(SuperTerminalRuntimeHost* host, int32_t code, const char* message) {
-    if (host) {
-        host->host_error_code = code;
-        host->message = message ? message : "";
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
+    if (app_host) {
+        app_host->host_error_code = code;
+        app_host->message = message ? message : "";
     }
     wingui_set_last_error_string_internal(message ? message : "super_terminal failure");
 }
@@ -348,6 +398,8 @@ bool initSurface(TerminalSurface* surface, uint32_t columns, uint32_t rows);
 bool initBufferedSurface(BufferedTerminalSurface* surface, uint32_t columns, uint32_t rows);
 uint32_t currentModifiers();
 bool pushEvent(SuperTerminalRuntimeHost* host, const SuperTerminalEvent& event);
+bool initWindowAndRenderer(SuperTerminalRuntimeHost* host);
+void shutdownHost(SuperTerminalRuntimeHost* host);
 
 RegisteredPane* findRegisteredPaneLocked(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id) {
     if (!host || pane_id.value == 0) return nullptr;
@@ -421,7 +473,10 @@ bool assignPaneNodeIdLocked(SuperTerminalRuntimeHost* host,
 
     pane->node_id = node_id_utf8;
     char node_type_utf8[64]{};
-    if (wingui_native_try_get_node_type_utf8(node_id_utf8, node_type_utf8, static_cast<uint32_t>(sizeof(node_type_utf8)))) {
+    if (wingui_native_session_try_get_node_type_utf8(host->native_session,
+                                                     node_id_utf8,
+                                                     node_type_utf8,
+                                                     static_cast<uint32_t>(sizeof(node_type_utf8)))) {
         pane->render_kind = paneRenderKindForNodeType(node_type_utf8);
         if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
             char buffer[256];
@@ -507,7 +562,7 @@ bool resolvePaneLayout(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_
     }
 
     WinguiNativeNodeBounds bounds{};
-    if (!wingui_native_try_get_node_bounds(node_id.c_str(), &bounds)) {
+    if (!wingui_native_session_try_get_node_bounds(host->native_session, node_id.c_str(), &bounds)) {
         return false;
     }
 
@@ -589,9 +644,11 @@ SuperTerminalPaneId hitTestPane(SuperTerminalRuntimeHost* host, int32_t x, int32
 
 void pushPaneFocusEvent(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id, int32_t focused) {
     if (!host || pane_id.value == 0) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     SuperTerminalEvent event{};
+    event.window_id = host->window_id;
     event.type = SUPERTERMINAL_EVENT_PANE_INPUT;
-    event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     event.data.pane_input.pane_id = pane_id;
     event.data.pane_input.device_kind = SUPERTERMINAL_PANE_INPUT_FOCUS;
     event.data.pane_input.event_kind = 0;
@@ -614,7 +671,9 @@ void setActivePane(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id) 
 void syncActivePaneFromDeclarativeFocus(SuperTerminalRuntimeHost* host) {
     if (!host) return;
     char node_id_utf8[128]{};
-    if (!wingui_native_copy_focused_pane_id_utf8(node_id_utf8, static_cast<uint32_t>(sizeof(node_id_utf8)))) {
+    if (!wingui_native_session_copy_focused_pane_id_utf8(host->native_session,
+                                                         node_id_utf8,
+                                                         static_cast<uint32_t>(sizeof(node_id_utf8)))) {
         return;
     }
     if (node_id_utf8[0] == '\0') {
@@ -638,9 +697,11 @@ void pushPaneMouseEvent(SuperTerminalRuntimeHost* host,
                         const SuperTerminalMouseEvent& mouse,
                         uint32_t modifiers) {
     if (!host || pane_id.value == 0) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     SuperTerminalEvent event{};
+    event.window_id = host->window_id;
     event.type = SUPERTERMINAL_EVENT_PANE_INPUT;
-    event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     event.data.pane_input.pane_id = pane_id;
     event.data.pane_input.device_kind = SUPERTERMINAL_PANE_INPUT_MOUSE;
     event.data.pane_input.event_kind = mouse.kind;
@@ -655,9 +716,11 @@ void pushPaneMouseEvent(SuperTerminalRuntimeHost* host,
 
 void pushPaneKeyEvent(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id, const SuperTerminalKeyEvent& key) {
     if (!host || pane_id.value == 0) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     SuperTerminalEvent event{};
+    event.window_id = host->window_id;
     event.type = SUPERTERMINAL_EVENT_PANE_INPUT;
-    event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     event.data.pane_input.pane_id = pane_id;
     event.data.pane_input.device_kind = SUPERTERMINAL_PANE_INPUT_KEYBOARD;
     event.data.pane_input.event_kind = key.is_down ? 1u : 0u;
@@ -677,28 +740,76 @@ uint32_t currentModifiers() {
 
 bool pushEvent(SuperTerminalRuntimeHost* host, const SuperTerminalEvent& event) {
     if (!host) return false;
-    return host->event_queue.push(event);
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
+    SuperTerminalEvent routed = event;
+    if (routed.window_id.value == 0) {
+        routed.window_id = host->window_id;
+    }
+    return app_host->event_queue.push(routed);
+}
+
+void pollNativeUiSessionEvents(SuperTerminalRuntimeHost* host) {
+    if (!host || !host->native_session) return;
+    for (;;) {
+        WinguiNativeEvent native_event{};
+        if (!wingui_native_session_poll_event(host->native_session, &native_event)) {
+            break;
+        }
+        if (native_event.type == WINGUI_NATIVE_EVENT_DISPATCH_JSON && native_event.payload_utf8) {
+            SuperTerminalEvent event{};
+            event.window_id = host->window_id;
+            event.type = SUPERTERMINAL_EVENT_NATIVE_UI;
+            event.sequence = appHostOf(host)->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            copyUtf8Truncate(event.data.native_ui.payload_json_utf8,
+                             sizeof(event.data.native_ui.payload_json_utf8),
+                             native_event.payload_utf8);
+            event.data.native_ui.window_id = host->window_id;
+            pushEvent(host, event);
+        }
+        wingui_native_session_release_event(host->native_session, &native_event);
+    }
 }
 
 void sendHostStoppingEvent(SuperTerminalRuntimeHost* host, int32_t exit_code) {
     if (!host) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     SuperTerminalEvent event{};
+    event.window_id = {};
     event.type = SUPERTERMINAL_EVENT_HOST_STOPPING;
-    event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     event.data.host_stopping.exit_code = exit_code;
     pushEvent(host, event);
 }
 
 void requestStopInternal(SuperTerminalRuntimeHost* host, int32_t exit_code, bool close_window) {
     if (!host) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     int32_t expected = 0;
-    if (host->stop_requested.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
-        host->exit_code = exit_code;
-        sendHostStoppingEvent(host, exit_code);
+    if (app_host->stop_requested.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        app_host->exit_code = exit_code;
+        sendHostStoppingEvent(app_host, exit_code);
     }
     if (close_window && host->window) {
         HWND hwnd = static_cast<HWND>(wingui_window_hwnd(host->window));
         if (hwnd) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    } else if (app_host->ui_thread_id != 0) {
+        PostThreadMessageW(app_host->ui_thread_id, kSuperTerminalWakeMessage, 0, 0);
+    }
+}
+
+void requestCloseAllWindows(SuperTerminalRuntimeHost* app_host) {
+    if (!app_host) return;
+    std::vector<SuperTerminalRuntimeHost*> windows;
+    {
+        std::lock_guard<std::mutex> lock(app_host->window_mutex);
+        windows = app_host->windows;
+    }
+    for (SuperTerminalRuntimeHost* window_host : windows) {
+        if (!window_host || !window_host->window) continue;
+        HWND hwnd = static_cast<HWND>(wingui_window_hwnd(window_host->window));
+        if (hwnd && IsWindow(hwnd)) {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         }
     }
@@ -776,7 +887,7 @@ bool enqueueResizeEvent(SuperTerminalRuntimeHost* host, uint32_t pixel_width, ui
     return pushEvent(host, event);
 }
 
-bool updateSurfaceForClientSize(SuperTerminalRuntimeHost* host) {
+bool updateSurfaceForClientSize(SuperTerminalRuntimeHost* host, bool emit_resize_event = true) {
     if (!host || !host->window) return false;
     int32_t client_width = 0;
     int32_t client_height = 0;
@@ -793,7 +904,9 @@ bool updateSurfaceForClientSize(SuperTerminalRuntimeHost* host) {
             return false;
         }
     }
-    enqueueResizeEvent(host, static_cast<uint32_t>(std::max(client_width, 0)), static_cast<uint32_t>(std::max(client_height, 0)));
+    if (emit_resize_event) {
+        enqueueResizeEvent(host, static_cast<uint32_t>(std::max(client_width, 0)), static_cast<uint32_t>(std::max(client_height, 0)));
+    }
     host->render_dirty.store(1, std::memory_order_release);
     return true;
 }
@@ -1022,7 +1135,7 @@ bool ensurePaneTextGridPresenter(SuperTerminalRuntimeHost* host,
     if (!host || pane.node_id.empty() || layout.width <= 0 || layout.height <= 0) return false;
 
     void* node_hwnd_raw = nullptr;
-    if (!wingui_native_try_get_node_hwnd(pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
+    if (!wingui_native_session_try_get_node_hwnd(host->native_session, pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
         return false;
     }
 
@@ -1179,7 +1292,7 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
     if (!host || pane.node_id.empty() || layout.width <= 0 || layout.height <= 0) return false;
 
     void* node_hwnd_raw = nullptr;
-    if (!wingui_native_try_get_node_hwnd(pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
+    if (!wingui_native_session_try_get_node_hwnd(host->native_session, pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
         return false;
     }
 
@@ -1277,7 +1390,7 @@ void resizeHostWindowToNativeContent(SuperTerminalRuntimeHost* host) {
 
     int32_t desired_client_width = 0;
     int32_t desired_client_height = 0;
-    if (!wingui_native_get_content_size(&desired_client_width, &desired_client_height)) return;
+    if (!wingui_native_session_get_content_size(host->native_session, &desired_client_width, &desired_client_height)) return;
     if (desired_client_width <= 0 || desired_client_height <= 0) return;
 
     int32_t current_client_width = 0;
@@ -1488,7 +1601,7 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
         if (!wingui_present(host->context, 1)) {
             return false;
         }
-        if (HWND native_hwnd = static_cast<HWND>(wingui_native_host_hwnd())) {
+        if (HWND native_hwnd = static_cast<HWND>(wingui_native_session_host_hwnd(host->native_session))) {
             SetWindowPos(native_hwnd, HWND_TOP, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
@@ -1500,28 +1613,187 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
 int64_t WINGUI_CALL nativeDispatchEventJson(const char* event_json_utf8) {
     if (!g_active_host || !event_json_utf8) return 0;
     SuperTerminalEvent event{};
+    event.window_id = {};
     event.type = SUPERTERMINAL_EVENT_NATIVE_UI;
-    event.sequence = g_active_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.sequence = appHostOf(g_active_host)->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     copyUtf8Truncate(event.data.native_ui.payload_json_utf8, sizeof(event.data.native_ui.payload_json_utf8), event_json_utf8);
     return pushEvent(g_active_host, event) ? 1 : 0;
+}
+
+char* duplicateUtf8Owned(const char* text) {
+    if (!text || !*text) return nullptr;
+    const size_t length = std::strlen(text) + 1;
+    char* copy = static_cast<char*>(std::malloc(length));
+    if (!copy) return nullptr;
+    std::memcpy(copy, text, length);
+    return copy;
+}
+
+void freeWindowDescOwned(const SuperTerminalWindowDesc& desc) {
+    std::free(const_cast<char*>(desc.title_utf8));
+    std::free(const_cast<char*>(desc.font_family_utf8));
+    std::free(const_cast<char*>(desc.text_shader_path_utf8));
+    std::free(const_cast<char*>(desc.initial_ui_json_utf8));
+}
+
+void populateHostDescFromWindowDesc(SuperTerminalAppDesc* out_desc, const SuperTerminalWindowDesc& src) {
+    if (!out_desc) return;
+    std::memset(out_desc, 0, sizeof(*out_desc));
+    out_desc->title_utf8 = src.title_utf8;
+    out_desc->columns = src.columns;
+    out_desc->rows = src.rows;
+    out_desc->flags = src.flags;
+    out_desc->command_queue_capacity = src.command_queue_capacity;
+    out_desc->event_queue_capacity = src.event_queue_capacity;
+    out_desc->font_family_utf8 = src.font_family_utf8;
+    out_desc->font_pixel_height = src.font_pixel_height;
+    out_desc->dpi_scale = src.dpi_scale;
+    out_desc->text_shader_path_utf8 = src.text_shader_path_utf8;
+    out_desc->initial_ui_json_utf8 = src.initial_ui_json_utf8;
+}
+
+SuperTerminalWindowId commandWindowId(const SuperTerminalCommand& command) {
+    switch (command.type) {
+        case SUPERTERMINAL_CMD_CREATE_WINDOW:
+            return command.data.create_window.window_id;
+        case SUPERTERMINAL_CMD_CLOSE_WINDOW:
+            return command.data.close_window.window_id;
+        case SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH:
+            return command.data.native_ui_publish.window_id;
+        case SUPERTERMINAL_CMD_NATIVE_UI_PATCH:
+            return command.data.native_ui_patch.window_id;
+        case SUPERTERMINAL_CMD_WINDOW_SET_TITLE:
+            return command.data.set_title.window_id;
+        case SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS:
+            return command.data.text_grid_write_cells.window_id;
+        case SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION:
+            return command.data.text_grid_clear_region.window_id;
+        case SUPERTERMINAL_CMD_RGBA_UPLOAD_OWNED:
+            return command.data.rgba_upload_owned.window_id;
+        case SUPERTERMINAL_CMD_RGBA_GPU_COPY:
+            return command.data.rgba_gpu_copy.window_id;
+        case SUPERTERMINAL_CMD_RGBA_ASSET_REGISTER_OWNED:
+            return command.data.rgba_asset_register_owned.window_id;
+        case SUPERTERMINAL_CMD_RGBA_ASSET_BLIT_TO_PANE:
+            return command.data.rgba_asset_blit_to_pane.window_id;
+        case SUPERTERMINAL_CMD_INDEXED_UPLOAD_OWNED:
+            return command.data.indexed_upload_owned.window_id;
+        case SUPERTERMINAL_CMD_SPRITE_DEFINE_OWNED:
+            return command.data.sprite_define_owned.window_id;
+        case SUPERTERMINAL_CMD_SPRITE_RENDER:
+            return command.data.sprite_render.window_id;
+        case SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED:
+            return command.data.vector_draw_owned.window_id;
+        case SUPERTERMINAL_CMD_INDEXED_FILL_RECT:
+            return command.data.indexed_fill_rect.window_id;
+        case SUPERTERMINAL_CMD_INDEXED_DRAW_LINE:
+            return command.data.indexed_draw_line.window_id;
+        default:
+            return {};
+    }
+}
+
+bool initWindowHost(SuperTerminalRuntimeHost* app_host,
+                    const SuperTerminalWindowDesc& desc,
+                    SuperTerminalWindowId window_id,
+                    SuperTerminalRuntimeHost** out_window_host) {
+    if (out_window_host) *out_window_host = nullptr;
+    if (!app_host || window_id.value == 0) return false;
+
+    auto* window_host = new (std::nothrow) SuperTerminalRuntimeHost();
+    if (!window_host) {
+        wingui_set_last_error_string_internal("super_terminal_create_window: allocation failed");
+        return false;
+    }
+
+    window_host->app_host = app_host;
+    window_host->window_id = window_id;
+    populateHostDescFromWindowDesc(&window_host->desc, desc);
+    window_host->desc.columns = window_host->desc.columns ? window_host->desc.columns : kDefaultColumns;
+    window_host->desc.rows = window_host->desc.rows ? window_host->desc.rows : kDefaultRows;
+
+    if (!initBufferedSurface(&window_host->surface, window_host->desc.columns, window_host->desc.rows)) {
+        delete window_host;
+        wingui_set_last_error_string_internal("super_terminal_create_window: failed to initialize surface");
+        return false;
+    }
+    if (!initWindowAndRenderer(window_host)) {
+        shutdownHost(window_host);
+        delete window_host;
+        return false;
+    }
+
+    registerWindowHost(app_host, window_host);
+    window_host->render_dirty.store(1, std::memory_order_release);
+    updateSurfaceForClientSize(window_host);
+    if (window_host->desc.initial_ui_json_utf8 && *window_host->desc.initial_ui_json_utf8) {
+        wingui_native_session_publish_json(window_host->native_session, window_host->desc.initial_ui_json_utf8);
+        wingui_native_session_host_run(window_host->native_session);
+        syncActivePaneFromDeclarativeFocus(window_host);
+    }
+    if (!wingui_window_show(window_host->window, SW_SHOWDEFAULT)) {
+        unregisterWindowHost(app_host, window_host);
+        shutdownHost(window_host);
+        delete window_host;
+        return false;
+    }
+
+    SuperTerminalEvent event{};
+    event.window_id = window_id;
+    event.type = SUPERTERMINAL_EVENT_WINDOW_CREATED;
+    event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    event.data.window_created.window_id = window_id;
+    pushEvent(window_host, event);
+
+    if (out_window_host) *out_window_host = window_host;
+    return true;
+}
+
+void destroyWindowHost(SuperTerminalRuntimeHost* app_host, SuperTerminalRuntimeHost* window_host) {
+    if (!app_host || !window_host) return;
+    unregisterWindowHost(app_host, window_host);
+    shutdownHost(window_host);
+    delete window_host;
 }
 
 void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& command) {
     if (!host) return;
     switch (command.type) {
+        case SUPERTERMINAL_CMD_CREATE_WINDOW: {
+            SuperTerminalRuntimeHost* app_host = appHostOf(host);
+            SuperTerminalRuntimeHost* window_host = nullptr;
+            initWindowHost(app_host,
+                           command.data.create_window.desc,
+                           command.data.create_window.window_id,
+                           &window_host);
+            freeWindowDescOwned(command.data.create_window.desc);
+            break;
+        }
+        case SUPERTERMINAL_CMD_CLOSE_WINDOW: {
+            SuperTerminalRuntimeHost* app_host = appHostOf(host);
+            HWND hwnd = host->window ? static_cast<HWND>(wingui_window_hwnd(host->window)) : nullptr;
+            if (hwnd && IsWindow(hwnd)) {
+                DestroyWindow(hwnd);
+            }
+            if (host != app_host) {
+                destroyWindowHost(app_host, host);
+            }
+            break;
+        }
         case SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH:
             if (command.data.native_ui_publish.json_utf8) {
-                if (!wingui_native_publish_json(command.data.native_ui_publish.json_utf8)) {
+                if (!wingui_native_session_publish_json(host->native_session,
+                                                       command.data.native_ui_publish.json_utf8)) {
                 }
-                wingui_native_host_run();
-                resizeHostWindowToNativeContent(host);
+                wingui_native_session_host_run(host->native_session);
                 syncActivePaneFromDeclarativeFocus(host);
                 free(const_cast<char*>(command.data.native_ui_publish.json_utf8));
             }
             break;
         case SUPERTERMINAL_CMD_NATIVE_UI_PATCH:
             if (command.data.native_ui_patch.patch_json_utf8) {
-                if (!wingui_native_patch_json(command.data.native_ui_patch.patch_json_utf8)) {
+                if (!wingui_native_session_patch_json(host->native_session,
+                                                     command.data.native_ui_patch.patch_json_utf8)) {
                 }
                 syncActivePaneFromDeclarativeFocus(host);
                 free(const_cast<char*>(command.data.native_ui_patch.patch_json_utf8));
@@ -2015,9 +2287,21 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
 
 void drainCommands(SuperTerminalRuntimeHost* host) {
     if (!host) return;
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
     SuperTerminalCommand command{};
-    while (host->command_queue.pop(&command)) {
-        applyCommand(host, command);
+    while (app_host->command_queue.pop(&command)) {
+        SuperTerminalRuntimeHost* target = nullptr;
+        const SuperTerminalWindowId window_id = commandWindowId(command);
+        if (command.type == SUPERTERMINAL_CMD_CREATE_WINDOW) {
+            target = app_host;
+        } else if (window_id.value != 0) {
+            target = findWindowHost(app_host, window_id);
+        } else {
+            target = primaryWindowHost(app_host);
+        }
+        if (target) {
+            applyCommand(target, command);
+        }
     }
 }
 
@@ -2032,53 +2316,98 @@ intptr_t WINGUI_CALL hostWindowProc(
     if (!host || !handled) {
         return 0;
     }
+    SuperTerminalRuntimeHost* app_host = appHostOf(host);
 
     switch (message) {
         case WM_ERASEBKGND:
             *handled = 1;
             return 1;
         case WM_COMMAND:
-            if (lparam == 0 && wingui_native_handle_host_command(static_cast<int32_t>(LOWORD(wparam))) != 0) {
+            if (lparam == 0 && wingui_native_session_handle_host_command(host->native_session, static_cast<int32_t>(LOWORD(wparam))) != 0) {
                 *handled = 1;
                 return 0;
             }
             break;
         case WM_CLOSE: {
+            if (app_host->stop_requested.load(std::memory_order_acquire) != 0) {
+                const HWND hwnd = static_cast<HWND>(wingui_window_hwnd(window));
+                if (hwnd && IsWindow(hwnd)) {
+                    DestroyWindow(hwnd);
+                }
+                *handled = 1;
+                return 0;
+            }
             if (host->close_event_sent.exchange(1, std::memory_order_acq_rel) == 0) {
                 SuperTerminalEvent event{};
+                event.window_id = host->window_id;
                 event.type = SUPERTERMINAL_EVENT_CLOSE_REQUESTED;
-                event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+                event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
                 pushEvent(host, event);
             }
-            requestStopInternal(host, host->exit_code, false);
-            DestroyWindow(static_cast<HWND>(wingui_window_hwnd(window)));
             *handled = 1;
             return 0;
         }
-        case WM_DESTROY:
-            PostQuitMessage(host->exit_code);
+        case WM_DESTROY: {
+            const HWND hwnd = static_cast<HWND>(wingui_window_hwnd(window));
+            if (hwnd && IsWindow(hwnd)) {
+                KillTimer(hwnd, kSuperTerminalResizeTimerId);
+            }
+            SuperTerminalEvent event{};
+            event.window_id = host->window_id;
+            event.type = SUPERTERMINAL_EVENT_WINDOW_CLOSED;
+            event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            event.data.window_closed.window_id = host->window_id;
+            pushEvent(host, event);
+            unregisterWindowHost(app_host, host);
+            SuperTerminalRuntimeHost* primary = primaryWindowHost(app_host);
+            if (!primary && app_host->stop_requested.load(std::memory_order_acquire) != 0) {
+                PostQuitMessage(app_host->exit_code);
+            }
             *handled = 1;
             return 0;
+        }
         case WM_SIZE:
-            if (wparam != SIZE_MINIMIZED && host->context) {
+            if (wparam != SIZE_MINIMIZED) {
                 const uint32_t width = static_cast<uint32_t>(LOWORD(lparam));
                 const uint32_t height = static_cast<uint32_t>(HIWORD(lparam));
-                wingui_resize_context(host->context, width, height);
-                wingui_native_set_host_bounds(0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height));
-                if (HWND native_hwnd = static_cast<HWND>(wingui_native_host_hwnd())) {
+                if (host->context) {
+                    wingui_resize_context(host->context, width, height);
+                }
+                wingui_native_session_set_host_bounds(host->native_session,
+                                                      0,
+                                                      0,
+                                                      static_cast<int32_t>(width),
+                                                      static_cast<int32_t>(height));
+                if (HWND native_hwnd = static_cast<HWND>(wingui_native_session_host_hwnd(host->native_session))) {
                     SetWindowPos(native_hwnd, HWND_TOP, 0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height),
                         SWP_SHOWWINDOW);
                 }
-                updateSurfaceForClientSize(host);
+                updateSurfaceForClientSize(host, false);
+                if (HWND hwnd = static_cast<HWND>(wingui_window_hwnd(window))) {
+                    KillTimer(hwnd, kSuperTerminalResizeTimerId);
+                    SetTimer(hwnd, kSuperTerminalResizeTimerId, kSuperTerminalResizeDebounceMs, nullptr);
+                }
+            }
+            break;
+        case WM_TIMER:
+            if (wparam == kSuperTerminalResizeTimerId) {
+                if (HWND hwnd = static_cast<HWND>(wingui_window_hwnd(window))) {
+                    KillTimer(hwnd, kSuperTerminalResizeTimerId);
+                }
+                updateSurfaceForClientSize(host, true);
+                *handled = 1;
+                return 0;
             }
             break;
         case WM_SETFOCUS:
         case WM_KILLFOCUS: {
             host->window_focused.store(message == WM_SETFOCUS ? 1 : 0, std::memory_order_release);
             SuperTerminalEvent event{};
+            event.window_id = host->window_id;
             event.type = SUPERTERMINAL_EVENT_FOCUS;
-            event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
             event.data.focus.focused = message == WM_SETFOCUS ? 1 : 0;
+            event.data.focus.window_id = host->window_id;
             pushEvent(host, event);
             pushPaneFocusEvent(host, host->active_pane_id, message == WM_SETFOCUS ? 1 : 0);
             break;
@@ -2088,8 +2417,9 @@ intptr_t WINGUI_CALL hostWindowProc(
         case WM_KEYUP:
         case WM_SYSKEYUP: {
             SuperTerminalEvent event{};
+            event.window_id = host->window_id;
             event.type = SUPERTERMINAL_EVENT_KEY;
-            event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
             event.data.key.virtual_key = static_cast<uint32_t>(wparam);
             event.data.key.repeat_count = static_cast<uint32_t>(lparam & 0xffffu);
             event.data.key.is_down = (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) ? 1 : 0;
@@ -2101,8 +2431,9 @@ intptr_t WINGUI_CALL hostWindowProc(
         case WM_CHAR:
         case WM_SYSCHAR: {
             SuperTerminalEvent event{};
+            event.window_id = host->window_id;
             event.type = SUPERTERMINAL_EVENT_CHAR;
-            event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
             event.data.character.codepoint = static_cast<uint32_t>(wparam);
             pushEvent(host, event);
             break;
@@ -2123,8 +2454,9 @@ intptr_t WINGUI_CALL hostWindowProc(
                 const POINT mouse_point = mousePointForMessage(message, lparam, mouse_state, hwnd);
                 const uint32_t modifiers = currentModifiers();
                 SuperTerminalEvent event{};
+                event.window_id = host->window_id;
                 event.type = SUPERTERMINAL_EVENT_MOUSE;
-                event.sequence = host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+                event.sequence = app_host->event_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
                 event.data.mouse.x = mouse_point.x;
                 event.data.mouse.y = mouse_point.y;
                 event.data.mouse.buttons = mouse_state.buttons;
@@ -2231,9 +2563,14 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
         return false;
     }
 
+    host->native_session = wingui_native_session_create();
+    if (!host->native_session) {
+        setHostError(host, SUPERTERMINAL_HOST_ERROR_NATIVE_UI_ATTACH, wingui_native_last_error_utf8());
+        return false;
+    }
+
     WinguiNativeCallbacks native_callbacks{};
-    native_callbacks.dispatch_event_json = nativeDispatchEventJson;
-    wingui_native_set_callbacks(&native_callbacks);
+    wingui_native_session_set_callbacks(host->native_session, &native_callbacks);
 
     WinguiNativeEmbeddedHostDesc native_desc{};
     native_desc.parent_hwnd = wingui_window_hwnd(host->window);
@@ -2242,8 +2579,8 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
     native_desc.width = client_width;
     native_desc.height = client_height;
     native_desc.visible = 1;
-    if (!wingui_native_attach_embedded_host(&native_desc)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_NATIVE_UI_ATTACH, wingui_native_last_error_utf8());
+    if (!wingui_native_session_attach_embedded_host(host->native_session, &native_desc)) {
+        setHostError(host, SUPERTERMINAL_HOST_ERROR_NATIVE_UI_ATTACH, wingui_native_session_last_error_utf8(host->native_session));
         return false;
     }
     host->native_attached = true;
@@ -2257,8 +2594,12 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
         host->client_thread.join();
     }
     if (host->native_attached) {
-        wingui_native_detach_embedded_host();
+        wingui_native_session_detach_embedded_host(host->native_session);
         host->native_attached = false;
+    }
+    if (host->native_session) {
+        wingui_native_session_destroy(host->native_session);
+        host->native_session = nullptr;
     }
     {
         SuperTerminalCommand leftover{};
@@ -2524,7 +2865,12 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_run(
     }
 
     SuperTerminalRuntimeHost host{};
+    host.app_host = &host;
+    host.window_id.value = 1;
+    host.next_window_id.store(2, std::memory_order_release);
+    host.ui_thread_id = GetCurrentThreadId();
     host.desc = *desc;
+    host.client_ctx.app_host = &host;
     host.client_ctx.host = &host;
     host.desc.columns = host.desc.columns ? host.desc.columns : kDefaultColumns;
     host.desc.rows = host.desc.rows ? host.desc.rows : kDefaultRows;
@@ -2553,11 +2899,13 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_run(
         return 0;
     }
 
+        registerWindowHost(&host, &host);
+
     g_active_host = &host;
 
     if (host.desc.initial_ui_json_utf8 && *host.desc.initial_ui_json_utf8) {
-        wingui_native_publish_json(host.desc.initial_ui_json_utf8);
-        wingui_native_host_run();
+        wingui_native_session_publish_json(host.native_session, host.desc.initial_ui_json_utf8);
+        wingui_native_session_host_run(host.native_session);
         syncActivePaneFromDeclarativeFocus(&host);
     }
 
@@ -2572,10 +2920,22 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_run(
 
     while (true) {
         drainCommands(&host);
-        if (host.render_dirty.load(std::memory_order_acquire) != 0) {
-            if (!renderSurface(&host)) {
-                setHostError(&host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
-                requestStopInternal(&host, -1, true);
+        std::vector<SuperTerminalRuntimeHost*> windows;
+        {
+            std::lock_guard<std::mutex> lock(host.window_mutex);
+            windows = host.windows;
+        }
+        if (host.stop_requested.load(std::memory_order_acquire) != 0 && windows.empty()) {
+            break;
+        }
+        for (SuperTerminalRuntimeHost* window_host : windows) {
+            if (!window_host) continue;
+            pollNativeUiSessionEvents(window_host);
+            if (window_host->render_dirty.load(std::memory_order_acquire) != 0) {
+                if (!renderSurface(window_host)) {
+                    setHostError(&host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
+                    requestStopInternal(&host, -1, false);
+                }
             }
         }
         if (!pumpMessages(&host)) {
@@ -2629,19 +2989,19 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_run_hosted_app(
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_enqueue(
     SuperTerminalClientContext* ctx,
     const SuperTerminalCommand* command) {
-    if (!ctx || !ctx->host || !command) {
+    if (!ctx || !ctx->app_host || !command) {
         wingui_set_last_error_string_internal("super_terminal_enqueue: invalid arguments");
         return 0;
     }
+    SuperTerminalRuntimeHost* app_host = ctx->app_host;
     SuperTerminalCommand command_copy = *command;
-    command_copy.sequence = ctx->host->command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (!ctx->host->command_queue.push(command_copy)) {
+    command_copy.sequence = app_host->command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!app_host->command_queue.push(command_copy)) {
         wingui_set_last_error_string_internal("super_terminal_enqueue: queue is full");
         return 0;
     }
-    HWND hwnd = static_cast<HWND>(wingui_window_hwnd(ctx->host->window));
-    if (hwnd) {
-        PostMessageW(hwnd, kSuperTerminalWakeMessage, 0, 0);
+    if (app_host->ui_thread_id != 0) {
+        PostThreadMessageW(app_host->ui_thread_id, kSuperTerminalWakeMessage, 0, 0);
     }
     wingui_clear_last_error_internal();
     return 1;
@@ -2651,12 +3011,13 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_wait_event(
     SuperTerminalClientContext* ctx,
     uint32_t timeout_ms,
     SuperTerminalEvent* out_event) {
-    if (!ctx || !ctx->host || !out_event) {
+    if (!ctx || !ctx->app_host || !out_event) {
         wingui_set_last_error_string_internal("super_terminal_wait_event: invalid arguments");
         return 0;
     }
+    SuperTerminalRuntimeHost* app_host = ctx->app_host;
     const DWORD wait_ms = timeout_ms == SUPERTERMINAL_WAIT_INFINITE ? INFINITE : timeout_ms;
-    const DWORD wait_result = WaitForSingleObject(ctx->host->event_queue.event_handle, wait_ms);
+    const DWORD wait_result = WaitForSingleObject(app_host->event_queue.event_handle, wait_ms);
     if (wait_result == WAIT_TIMEOUT) {
         wingui_clear_last_error_internal();
         return 0;
@@ -2665,7 +3026,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_wait_event(
         wingui_set_last_error_string_internal("super_terminal_wait_event: wait failed");
         return 0;
     }
-    if (!ctx->host->event_queue.pop(out_event)) {
+    if (!app_host->event_queue.pop(out_event)) {
         wingui_clear_last_error_internal();
         return 0;
     }
@@ -2675,24 +3036,66 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_wait_event(
 
 extern "C" WINGUI_API void* WINGUI_CALL super_terminal_event_handle(
     SuperTerminalClientContext* ctx) {
-    if (!ctx || !ctx->host) {
+    if (!ctx || !ctx->app_host) {
         wingui_set_last_error_string_internal("super_terminal_event_handle: invalid arguments");
         return nullptr;
     }
     wingui_clear_last_error_internal();
-    return ctx->host->event_queue.event_handle;
+    return ctx->app_host->event_queue.event_handle;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_request_stop(
     SuperTerminalClientContext* ctx,
     int32_t exit_code) {
-    if (!ctx || !ctx->host) {
+    if (!ctx || !ctx->app_host) {
         wingui_set_last_error_string_internal("super_terminal_request_stop: invalid arguments");
         return 0;
     }
-    requestStopInternal(ctx->host, exit_code, true);
+    requestStopInternal(ctx->app_host, exit_code, false);
+    requestCloseAllWindows(ctx->app_host);
     wingui_clear_last_error_internal();
     return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_create_window(
+    SuperTerminalClientContext* ctx,
+    const SuperTerminalWindowDesc* desc,
+    SuperTerminalWindowId* out_window_id) {
+    if (out_window_id) out_window_id->value = 0;
+    if (!ctx || !ctx->app_host || !desc || !out_window_id) {
+        wingui_set_last_error_string_internal("super_terminal_create_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_CREATE_WINDOW;
+    command.data.create_window.window_id.value = ctx->app_host->next_window_id.fetch_add(1, std::memory_order_relaxed);
+    command.data.create_window.desc = *desc;
+    command.data.create_window.desc.title_utf8 = duplicateUtf8Owned(desc->title_utf8);
+    command.data.create_window.desc.font_family_utf8 = duplicateUtf8Owned(desc->font_family_utf8);
+    command.data.create_window.desc.text_shader_path_utf8 = duplicateUtf8Owned(desc->text_shader_path_utf8);
+    command.data.create_window.desc.initial_ui_json_utf8 = duplicateUtf8Owned(desc->initial_ui_json_utf8);
+    if (!super_terminal_enqueue(ctx, &command)) {
+        freeWindowDescOwned(command.data.create_window.desc);
+        return 0;
+    }
+    *out_window_id = command.data.create_window.window_id;
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_close_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id) {
+    if (!ctx || !ctx->app_host || window_id.value == 0) {
+        wingui_set_last_error_string_internal("super_terminal_close_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_CLOSE_WINDOW;
+    command.data.close_window.window_id = window_id;
+    return super_terminal_enqueue(ctx, &command);
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_key_state(
@@ -2724,12 +3127,31 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_resolve_pane_id_utf8(
         return 0;
     }
 
+    return super_terminal_resolve_pane_id_for_window(ctx, ctx->host->window_id, node_id_utf8, out_pane_id);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_resolve_pane_id_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id) {
+    if (!ctx || !ctx->app_host || !node_id_utf8 || !*node_id_utf8 || !out_pane_id) {
+        wingui_set_last_error_string_internal("super_terminal_resolve_pane_id_for_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalRuntimeHost* host = findWindowHost(ctx->app_host, window_id);
+    if (!host) {
+        wingui_set_last_error_string_internal("super_terminal_resolve_pane_id_for_window: window not found");
+        return 0;
+    }
+
     SuperTerminalPaneId pane_id{};
     pane_id.value = hashPaneNodeId(node_id_utf8);
 
     {
-        std::lock_guard<std::mutex> lock(ctx->host->pane_mutex);
-        if (!assignPaneNodeIdLocked(ctx->host, pane_id, node_id_utf8, "super_terminal_resolve_pane_id_utf8")) {
+        std::lock_guard<std::mutex> lock(host->pane_mutex);
+        if (!assignPaneNodeIdLocked(host, pane_id, node_id_utf8, "super_terminal_resolve_pane_id_for_window")) {
             return 0;
         }
     }
@@ -2748,8 +3170,27 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout(
         return 0;
     }
 
+    return super_terminal_get_pane_layout_for_window(ctx, ctx->host->window_id, pane_id, out_layout);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    SuperTerminalPaneId pane_id,
+    SuperTerminalPaneLayout* out_layout) {
+    if (!ctx || !ctx->app_host || !out_layout) {
+        wingui_set_last_error_string_internal("super_terminal_get_pane_layout_for_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalRuntimeHost* host = findWindowHost(ctx->app_host, window_id);
+    if (!host) {
+        wingui_set_last_error_string_internal("super_terminal_get_pane_layout_for_window: window not found");
+        return 0;
+    }
+
     if (pane_id.value == 0) {
-        if (!resolvePaneLayout(ctx->host, pane_id, out_layout)) {
+        if (!resolvePaneLayout(host, pane_id, out_layout)) {
             wingui_set_last_error_string_internal("super_terminal_get_pane_layout: root layout is unavailable");
             return 0;
         }
@@ -2757,7 +3198,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout(
         return 1;
     }
 
-    if (!copyPaneLayoutFromCache(ctx->host, pane_id, out_layout)) {
+    if (!copyPaneLayoutFromCache(host, pane_id, out_layout)) {
         wingui_set_last_error_string_internal("super_terminal_get_pane_layout: pane layout is unavailable");
         return 0;
     }
@@ -2784,7 +3225,8 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_native_ui_patch_met
         return 0;
     }
     WinguiNativePatchMetrics native_metrics{};
-    if (!wingui_native_get_patch_metrics(&native_metrics)) {
+    SuperTerminalRuntimeHost* host = primaryWindowHost(appHostOf(ctx->app_host));
+    if (!host || !wingui_native_session_get_patch_metrics(host->native_session, &native_metrics)) {
         return 0;
     }
     out_metrics->publish_count = native_metrics.publish_count;
@@ -2801,17 +3243,29 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_native_ui_patch_met
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json(
     SuperTerminalClientContext* ctx,
     const char* json_utf8) {
-    if (!json_utf8) {
+    if (!ctx || !ctx->host) {
         wingui_set_last_error_string_internal("super_terminal_publish_ui_json: invalid arguments");
+        return 0;
+    }
+    return super_terminal_publish_ui_json_for_window(ctx, ctx->host->window_id, json_utf8);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* json_utf8) {
+    if (!json_utf8) {
+        wingui_set_last_error_string_internal("super_terminal_publish_ui_json_for_window: invalid arguments");
         return 0;
     }
     char* owned = _strdup(json_utf8);
     if (!owned) {
-        wingui_set_last_error_string_internal("super_terminal_publish_ui_json: out of memory");
+        wingui_set_last_error_string_internal("super_terminal_publish_ui_json_for_window: out of memory");
         return 0;
     }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_NATIVE_UI_PUBLISH;
+    command.data.native_ui_publish.window_id = window_id;
     command.data.native_ui_publish.json_utf8 = owned;
     const int32_t result = super_terminal_enqueue(ctx, &command);
     if (!result) free(owned);
@@ -2821,17 +3275,29 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_publish_ui_json(
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
     SuperTerminalClientContext* ctx,
     const char* patch_json_utf8) {
-    if (!patch_json_utf8) {
+    if (!ctx || !ctx->host) {
         wingui_set_last_error_string_internal("super_terminal_patch_ui_json: invalid arguments");
+        return 0;
+    }
+    return super_terminal_patch_ui_json_for_window(ctx, ctx->host->window_id, patch_json_utf8);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* patch_json_utf8) {
+    if (!patch_json_utf8) {
+        wingui_set_last_error_string_internal("super_terminal_patch_ui_json_for_window: invalid arguments");
         return 0;
     }
     char* owned = _strdup(patch_json_utf8);
     if (!owned) {
-        wingui_set_last_error_string_internal("super_terminal_patch_ui_json: out of memory");
+        wingui_set_last_error_string_internal("super_terminal_patch_ui_json_for_window: out of memory");
         return 0;
     }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_NATIVE_UI_PATCH;
+    command.data.native_ui_patch.window_id = window_id;
     command.data.native_ui_patch.patch_json_utf8 = owned;
     const int32_t result = super_terminal_enqueue(ctx, &command);
     if (!result) free(owned);
@@ -2841,12 +3307,24 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_patch_ui_json(
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_set_title_utf8(
     SuperTerminalClientContext* ctx,
     const char* title_utf8) {
-    if (!title_utf8) {
+    if (!ctx || !ctx->host) {
         wingui_set_last_error_string_internal("super_terminal_set_title_utf8: invalid arguments");
+        return 0;
+    }
+    return super_terminal_set_title_for_window(ctx, ctx->host->window_id, title_utf8);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_set_title_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    const char* title_utf8) {
+    if (!title_utf8) {
+        wingui_set_last_error_string_internal("super_terminal_set_title_for_window: invalid arguments");
         return 0;
     }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_WINDOW_SET_TITLE;
+    command.data.set_title.window_id = window_id;
     copyUtf8Truncate(command.data.set_title.title_utf8, sizeof(command.data.set_title.title_utf8), title_utf8);
     return super_terminal_enqueue(ctx, &command);
 }
@@ -2871,6 +3349,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_text_grid_write_cells(
     }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS;
+    command.data.text_grid_write_cells.window_id = ctx && ctx->host ? ctx->host->window_id : SuperTerminalWindowId{};
     command.data.text_grid_write_cells.pane_id = pane_id;
     command.data.text_grid_write_cells.cells = owned_cells;
     command.data.text_grid_write_cells.cell_count = cell_count;

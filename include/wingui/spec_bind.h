@@ -9,6 +9,7 @@ extern "C" {
 typedef struct WinguiSpecBindRuntime WinguiSpecBindRuntime;
 
 typedef struct WinguiSpecBindEventView {
+    SuperTerminalWindowId window_id;
     const char* event_name_utf8;
     const char* payload_json_utf8;
     const char* source_utf8;
@@ -17,6 +18,7 @@ typedef struct WinguiSpecBindEventView {
 typedef struct WinguiSpecBindFrameView WinguiSpecBindFrameView;
 
 typedef struct WinguiSpecBindPaneRef {
+    SuperTerminalWindowId window_id;
     SuperTerminalPaneId pane_id;
     uint32_t buffer_index;
     uint32_t active_buffer_index;
@@ -90,12 +92,27 @@ WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_request_stop(
     WinguiSpecBindRuntime* runtime,
     int32_t exit_code);
 
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_create_window(
+    WinguiSpecBindRuntime* runtime,
+    const SuperTerminalWindowDesc* desc,
+    SuperTerminalWindowId* out_window_id);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_close_window(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalWindowId window_id);
+
 WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_get_patch_metrics(
     WinguiSpecBindRuntime* runtime,
     SuperTerminalNativeUiPatchMetrics* out_metrics);
 
 WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_id_utf8(
     WinguiSpecBindRuntime* runtime,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_id_for_window(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalWindowId window_id,
     const char* node_id_utf8,
     SuperTerminalPaneId* out_pane_id);
 

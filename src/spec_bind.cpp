@@ -185,6 +185,7 @@ bool bindPaneRef(const WinguiSpecBindFrameView* frame_view,
     }
 
     out_pane->pane_id = pane_id;
+    out_pane->window_id = frame_view->tick->window_id;
     out_pane->buffer_index = frame_view->tick->buffer_index;
     out_pane->active_buffer_index = frame_view->tick->active_buffer_index;
     wingui_clear_last_error_internal();
@@ -266,6 +267,7 @@ int32_t WINGUI_CALL runtimeSetup(SuperTerminalClientContext* ctx, void* user_dat
 
 void dispatchBoundEvent(
     WinguiSpecBindRuntime* runtime,
+    SuperTerminalWindowId window_id,
     const char* event_name_utf8,
     const char* payload_json_utf8,
     const char* source_utf8) {
@@ -275,6 +277,7 @@ void dispatchBoundEvent(
     }
 
     WinguiSpecBindEventView view{};
+    view.window_id = window_id;
     view.event_name_utf8 = event_name_utf8;
     view.payload_json_utf8 = payload_json_utf8;
     view.source_utf8 = source_utf8;
@@ -296,6 +299,7 @@ void WINGUI_CALL runtimeOnEvent(
         const auto [event_name, source_name] = parseNativeUiEventFields(payload_json_utf8);
         dispatchBoundEvent(
             runtime,
+            event->window_id,
             event_name.empty() ? nullptr : event_name.c_str(),
             payload_json_utf8,
             source_name.empty() ? nullptr : source_name.c_str());
@@ -306,6 +310,7 @@ void WINGUI_CALL runtimeOnEvent(
         const BoundHandler bound = findBoundHandler(runtime, kCloseRequestedEventName);
         if (bound.handler) {
             WinguiSpecBindEventView view{};
+            view.window_id = event->window_id;
             view.event_name_utf8 = kCloseRequestedEventName;
             view.payload_json_utf8 = kCloseRequestedPayload;
             view.source_utf8 = "host";
@@ -320,7 +325,7 @@ void WINGUI_CALL runtimeOnEvent(
         const std::string payload = std::string("{\"event\":\"") + kHostStoppingEventName +
             "\",\"type\":\"host-stopping\",\"exit_code\":" +
             std::to_string(event->data.host_stopping.exit_code) + "}";
-        dispatchBoundEvent(runtime, kHostStoppingEventName, payload.c_str(), "host");
+        dispatchBoundEvent(runtime, event->window_id, kHostStoppingEventName, payload.c_str(), "host");
     }
 }
 
@@ -554,6 +559,47 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_request_stop(
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_create_window(
+    WinguiSpecBindRuntime* runtime,
+    const SuperTerminalWindowDesc* desc,
+    SuperTerminalWindowId* out_window_id) {
+    if (!runtime || !desc || !out_window_id) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_create_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_create_window: runtime is not active");
+        return 0;
+    }
+    return super_terminal_create_window(active_context, desc, out_window_id);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_close_window(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalWindowId window_id) {
+    if (!runtime || window_id.value == 0) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_close_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_close_window: runtime is not active");
+        return 0;
+    }
+    return super_terminal_close_window(active_context, window_id);
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_get_patch_metrics(
     WinguiSpecBindRuntime* runtime,
     SuperTerminalNativeUiPatchMetrics* out_metrics) {
@@ -600,6 +646,34 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_
     }
     if (!super_terminal_resolve_pane_id_utf8(active_context, node_id_utf8, out_pane_id)) {
         wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_utf8: pane resolution failed");
+        return 0;
+    }
+
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_id_for_window(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalWindowId window_id,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id) {
+    if (!runtime || window_id.value == 0 || !node_id_utf8 || !node_id_utf8[0] || !out_pane_id) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_for_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_for_window: runtime is not active");
+        return 0;
+    }
+    if (!super_terminal_resolve_pane_id_for_window(active_context, window_id, node_id_utf8, out_pane_id)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_for_window: pane resolution failed");
         return 0;
     }
 
