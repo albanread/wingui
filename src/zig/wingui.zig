@@ -312,14 +312,18 @@ pub const FrameView = struct {
         return info;
     }
 
-    pub fn textGridWriteCells(self: FrameView, pane: PaneRef, cells: []const TextGridCell) Error!void {
+    pub fn writeFrameTextGridCells(self: FrameView, pane: PaneRef, cells: []const TextGridCell) Error!void {
         const ptr = if (cells.len == 0) null else cells.ptr;
         if (raw.wingui_spec_bind_frame_text_grid_write_cells(self.raw_view, pane, ptr, @intCast(cells.len)) == 0) {
             return fail();
         }
     }
 
-    pub fn textGridClearRegion(
+    pub fn textGridWriteCells(self: FrameView, pane: PaneRef, cells: []const TextGridCell) Error!void {
+        return self.writeFrameTextGridCells(pane, cells);
+    }
+
+    pub fn clearFrameTextGridRegion(
         self: FrameView,
         pane: PaneRef,
         row: u32,
@@ -343,6 +347,20 @@ pub const FrameView = struct {
         ) == 0) {
             return fail();
         }
+    }
+
+    pub fn textGridClearRegion(
+        self: FrameView,
+        pane: PaneRef,
+        row: u32,
+        column: u32,
+        width: u32,
+        height: u32,
+        fill_codepoint: u32,
+        foreground: GraphicsColour,
+        background: GraphicsColour,
+    ) Error!void {
+        return self.clearFrameTextGridRegion(pane, row, column, width, height, fill_codepoint, foreground, background);
     }
 
     pub fn indexedGraphicsUpload(self: FrameView, pane: PaneRef, frame: *const IndexedGraphicsFrame) Error!void {
@@ -889,6 +907,50 @@ pub const Runtime = struct {
             return fail();
         }
         return metrics;
+    }
+
+    pub fn resolvePaneId(self: *Runtime, node_id: []const u8) Error!PaneId {
+        const node_id_z = try allocTempZ(node_id);
+        defer std.heap.c_allocator.free(node_id_z);
+
+        var pane_id: PaneId = std.mem.zeroes(PaneId);
+        if (raw.wingui_spec_bind_runtime_resolve_pane_id_utf8(self.handle, node_id_z.ptr, &pane_id) == 0) {
+            return fail();
+        }
+        return pane_id;
+    }
+
+    pub fn writeRetainedTextGridCells(self: *Runtime, pane_id: PaneId, cells: []const TextGridCell) Error!void {
+        const ptr = if (cells.len == 0) null else cells.ptr;
+        if (raw.wingui_spec_bind_runtime_text_grid_write_cells(self.handle, pane_id, ptr, @intCast(cells.len)) == 0) {
+            return fail();
+        }
+    }
+
+    pub fn clearRetainedTextGridRegion(
+        self: *Runtime,
+        pane_id: PaneId,
+        row: u32,
+        column: u32,
+        width: u32,
+        height: u32,
+        fill_codepoint: u32,
+        foreground: GraphicsColour,
+        background: GraphicsColour,
+    ) Error!void {
+        if (raw.wingui_spec_bind_runtime_text_grid_clear_region(
+            self.handle,
+            pane_id,
+            row,
+            column,
+            width,
+            height,
+            fill_codepoint,
+            foreground,
+            background,
+        ) == 0) {
+            return fail();
+        }
     }
 
     pub fn run(self: *Runtime, desc: *const RunDesc) Error!RunResult {

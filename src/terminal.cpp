@@ -51,6 +51,58 @@ constexpr char kDefaultShaderPath[] = "shaders/text_grid.hlsl";
 constexpr char kDefaultGraphicsShaderPath[] = "shaders/graphics.hlsl";
 constexpr char kDefaultSpriteShaderPath[] = "shaders/sprite.hlsl";
 
+std::mutex g_terminal_trace_mutex;
+
+std::wstring terminalTracePath() {
+    wchar_t path_buffer[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, path_buffer, MAX_PATH);
+    if (length == 0 || length == MAX_PATH) {
+        return L"native_patch_trace.log";
+    }
+
+    std::wstring path(path_buffer, length);
+    const size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) {
+        path.resize(slash + 1);
+    } else {
+        path.clear();
+    }
+    path += L"native_patch_trace.log";
+    return path;
+}
+
+void traceNativePatchEvent(const std::string& message) {
+    char buffer[1024];
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "[%llu][tid=%lu] %s",
+                  static_cast<unsigned long long>(GetTickCount64()),
+                  static_cast<unsigned long>(GetCurrentThreadId()),
+                  message.c_str());
+
+    std::lock_guard<std::mutex> lock(g_terminal_trace_mutex);
+    const std::wstring path = terminalTracePath();
+    HANDLE file = CreateFileW(path.c_str(),
+                              FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr,
+                              OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    DWORD written = 0;
+    WriteFile(file, buffer, static_cast<DWORD>(std::strlen(buffer)), &written, nullptr);
+    WriteFile(file, "\r\n", 2, &written, nullptr);
+    CloseHandle(file);
+}
+
+bool shouldTraceWorkspacePaneNodeId(const std::string& node_id) {
+    return node_id == "workspace_editor" ||
+        node_id == "workspace_graphics" ||
+        node_id == "workspace_repl";
+}
+
 struct TerminalCell {
     uint32_t codepoint = ' ';
     WinguiGraphicsColour foreground{255, 255, 255, 255};
@@ -120,6 +172,15 @@ struct RegisteredPane {
     SuperTerminalPaneLayout layout{};
     uint32_t render_kind = PANE_RENDER_TEXT_GRID;
     BufferedTerminalSurface surface;
+    std::vector<WinguiGlyphInstance> text_grid_glyph_instances[2];
+    bool text_grid_cache_dirty[2]{true, true};
+    uint64_t text_grid_cache_build_count[2]{0, 0};
+    uint64_t text_grid_cache_hit_count[2]{0, 0};
+    uint64_t text_grid_gpu_upload_count[2]{0, 0};
+    void* text_grid_hwnd = nullptr;
+    WinguiContext* text_grid_context = nullptr;
+    WinguiTextGridRenderer* pane_text_renderer = nullptr;
+    int32_t pane_text_renderer_atlas_set = 0;
     WinguiIndexedSurface* indexed_surface_handle = nullptr;
     uint32_t indexed_screen_width = 0;
     uint32_t indexed_screen_height = 0;
@@ -328,6 +389,63 @@ RegisteredPane* registeredPaneForIdLocked(SuperTerminalRuntimeHost* host, SuperT
     return create_if_missing ? ensureRegisteredPaneLocked(host, pane_id) : findRegisteredPaneLocked(host, pane_id);
 }
 
+uint32_t paneRenderKindForNodeType(const char* node_type_utf8) {
+    if (!node_type_utf8 || !*node_type_utf8) return PANE_RENDER_TEXT_GRID;
+    if (std::strcmp(node_type_utf8, "rgba-pane") == 0) return PANE_RENDER_RGBA;
+    if (std::strcmp(node_type_utf8, "indexed-graphics") == 0) return PANE_RENDER_INDEXED;
+    return PANE_RENDER_TEXT_GRID;
+}
+
+bool assignPaneNodeIdLocked(SuperTerminalRuntimeHost* host,
+                           SuperTerminalPaneId pane_id,
+                           const char* node_id_utf8,
+                           const char* error_prefix) {
+    if (!host || pane_id.value == 0 || !node_id_utf8 || !*node_id_utf8) return false;
+
+    RegisteredPane* pane = ensureRegisteredPaneLocked(host, pane_id);
+    if (!pane) {
+        if (error_prefix) {
+            std::string message = std::string(error_prefix) + ": failed to allocate pane state";
+            wingui_set_last_error_string_internal(message.c_str());
+        }
+        return false;
+    }
+
+    if (!pane->node_id.empty() && pane->node_id != node_id_utf8) {
+        if (error_prefix) {
+            std::string message = std::string(error_prefix) + ": pane id collision between node ids '" + pane->node_id + "' and '" + node_id_utf8 + "'";
+            wingui_set_last_error_string_internal(message.c_str());
+        }
+        return false;
+    }
+
+    pane->node_id = node_id_utf8;
+    char node_type_utf8[64]{};
+    if (wingui_native_try_get_node_type_utf8(node_id_utf8, node_type_utf8, static_cast<uint32_t>(sizeof(node_type_utf8)))) {
+        pane->render_kind = paneRenderKindForNodeType(node_type_utf8);
+        if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
+            char buffer[256];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "classify-pane id=%s type=%s render=%u",
+                          pane->node_id.c_str(),
+                          node_type_utf8,
+                          static_cast<unsigned>(pane->render_kind));
+            traceNativePatchEvent(buffer);
+        }
+    }
+    return true;
+}
+
+std::string paneNodeIdForTrace(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id) {
+    if (!host || pane_id.value == 0) return std::string();
+    std::lock_guard<std::mutex> lock(host->pane_mutex);
+    if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
+        return pane->node_id;
+    }
+    return std::string();
+}
+
 TerminalSurface* surfaceBuffer(BufferedTerminalSurface* surface_set, uint32_t buffer_index) {
     if (!surface_set) return nullptr;
     return &surface_set->buffers[buffer_index & 1u];
@@ -406,6 +524,22 @@ bool resolvePaneLayout(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_
     std::lock_guard<std::mutex> lock(host->pane_mutex);
     if (RegisteredPane* pane = findRegisteredPaneLocked(host, pane_id)) {
         pane->layout = *out_layout;
+        if (shouldTraceWorkspacePaneNodeId(node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "resolve-pane-layout id=%s pane=%llu x=%d y=%d w=%d h=%d visible=%d cols=%u rows=%u",
+                          node_id.c_str(),
+                          static_cast<unsigned long long>(pane_id.value),
+                          static_cast<int>(out_layout->x),
+                          static_cast<int>(out_layout->y),
+                          static_cast<int>(out_layout->width),
+                          static_cast<int>(out_layout->height),
+                          static_cast<int>(out_layout->visible),
+                          static_cast<unsigned>(out_layout->columns),
+                          static_cast<unsigned>(out_layout->rows));
+            traceNativePatchEvent(buffer);
+        }
     }
     return true;
 }
@@ -492,11 +626,9 @@ void syncActivePaneFromDeclarativeFocus(SuperTerminalRuntimeHost* host) {
     pane_id.value = hashPaneNodeId(node_id_utf8);
     {
         std::lock_guard<std::mutex> lock(host->pane_mutex);
-        RegisteredPane* pane = ensureRegisteredPaneLocked(host, pane_id);
-        if (!pane) {
+        if (!assignPaneNodeIdLocked(host, pane_id, node_id_utf8, "syncActivePaneFromDeclarativeFocus")) {
             return;
         }
-        pane->node_id = node_id_utf8;
     }
     setActivePane(host, pane_id);
 }
@@ -698,8 +830,30 @@ void writeCellsToMirroredSurface(SuperTerminalRuntimeHost* host, const SuperTerm
     std::lock_guard<std::mutex> lock(host->pane_mutex);
     BufferedTerminalSurface* surface_set = textGridSurfaceSetForPaneLocked(host, write_cells.pane_id, true);
     if (!surface_set) return;
+    RegisteredPane* pane = registeredPaneForIdLocked(host, write_cells.pane_id, false);
+    if (pane) {
+        if (shouldTraceWorkspacePaneNodeId(pane->node_id) && write_cells.cell_count > 0) {
+            const SuperTerminalTextGridCell& first = write_cells.cells[0];
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "queue-write-cells id=%s pane=%llu surface=%p count=%u first=(r%u,c%u,cp%u)",
+                          pane->node_id.c_str(),
+                          static_cast<unsigned long long>(write_cells.pane_id.value),
+                          static_cast<void*>(surface_set),
+                          static_cast<unsigned>(write_cells.cell_count),
+                          static_cast<unsigned>(first.row),
+                          static_cast<unsigned>(first.column),
+                          static_cast<unsigned>(first.codepoint));
+            traceNativePatchEvent(buffer);
+        }
+    }
     writeCellsToSurface(&surface_set->buffers[0], write_cells, *host);
     writeCellsToSurface(&surface_set->buffers[1], write_cells, *host);
+    if (pane) {
+        pane->text_grid_cache_dirty[0] = true;
+        pane->text_grid_cache_dirty[1] = true;
+    }
 }
 
 void clearMirroredSurfaceRegion(SuperTerminalRuntimeHost* host, const SuperTerminalTextGridClearRegion& clear_region) {
@@ -707,25 +861,49 @@ void clearMirroredSurfaceRegion(SuperTerminalRuntimeHost* host, const SuperTermi
     std::lock_guard<std::mutex> lock(host->pane_mutex);
     BufferedTerminalSurface* surface_set = textGridSurfaceSetForPaneLocked(host, clear_region.pane_id, true);
     if (!surface_set) return;
+    RegisteredPane* pane = registeredPaneForIdLocked(host, clear_region.pane_id, false);
+    if (pane) {
+        if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "queue-clear-region id=%s pane=%llu surface=%p row=%u col=%u w=%u h=%u fill=%u",
+                          pane->node_id.c_str(),
+                          static_cast<unsigned long long>(clear_region.pane_id.value),
+                          static_cast<void*>(surface_set),
+                          static_cast<unsigned>(clear_region.row),
+                          static_cast<unsigned>(clear_region.column),
+                          static_cast<unsigned>(clear_region.width),
+                          static_cast<unsigned>(clear_region.height),
+                          static_cast<unsigned>(clear_region.fill_codepoint));
+            traceNativePatchEvent(buffer);
+        }
+    }
     clearSurfaceRegion(&surface_set->buffers[0], clear_region);
     clearSurfaceRegion(&surface_set->buffers[1], clear_region);
+    if (pane) {
+        pane->text_grid_cache_dirty[0] = true;
+        pane->text_grid_cache_dirty[1] = true;
+    }
 }
 
-bool renderTextGridSurface(SuperTerminalRuntimeHost* host, TerminalSurface* surface, const SuperTerminalPaneLayout& layout) {
-    if (!host || !surface || layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
+void buildGlyphInstances(const SuperTerminalRuntimeHost& host,
+                         TerminalSurface* surface,
+                         std::vector<WinguiGlyphInstance>* out_instances) {
+    if (!surface || !out_instances) return;
 
-    host->glyph_instances.resize(surface->cells.size());
-    const uint32_t atlas_cols = std::max<uint32_t>(1, host->atlas.info.cols);
+    out_instances->resize(surface->cells.size());
+    const uint32_t atlas_cols = std::max<uint32_t>(1, host.atlas.info.cols);
     for (uint32_t row = 0; row < surface->rows; ++row) {
         for (uint32_t col = 0; col < surface->columns; ++col) {
             const TerminalCell& cell = surface->cells[static_cast<size_t>(row) * surface->columns + col];
-            const uint32_t codepoint = clampCodepoint(*host, cell.codepoint);
-            const uint32_t glyph_index = codepoint - host->atlas.info.first_codepoint;
-            WinguiGlyphInstance& instance = host->glyph_instances[static_cast<size_t>(row) * surface->columns + col];
+            const uint32_t codepoint = clampCodepoint(host, cell.codepoint);
+            const uint32_t glyph_index = codepoint - host.atlas.info.first_codepoint;
+            WinguiGlyphInstance& instance = (*out_instances)[static_cast<size_t>(row) * surface->columns + col];
             instance.pos_x = static_cast<float>(col);
             instance.pos_y = static_cast<float>(row);
-            instance.uv_x = static_cast<float>((glyph_index % atlas_cols)) * host->atlas.info.cell_width;
-            instance.uv_y = static_cast<float>((glyph_index / atlas_cols)) * host->atlas.info.cell_height;
+            instance.uv_x = static_cast<float>((glyph_index % atlas_cols)) * host.atlas.info.cell_width;
+            instance.uv_y = static_cast<float>((glyph_index / atlas_cols)) * host.atlas.info.cell_height;
             instance.fg[0] = cell.foreground.r;
             instance.fg[1] = cell.foreground.g;
             instance.fg[2] = cell.foreground.b;
@@ -737,6 +915,12 @@ bool renderTextGridSurface(SuperTerminalRuntimeHost* host, TerminalSurface* surf
             instance.flags = 0;
         }
     }
+}
+
+bool renderTextGridSurface(SuperTerminalRuntimeHost* host, TerminalSurface* surface, const SuperTerminalPaneLayout& layout) {
+    if (!host || !surface || layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
+
+    buildGlyphInstances(*host, surface, &host->glyph_instances);
 
     WinguiTextGridFrame frame{};
     frame.instances = host->glyph_instances.data();
@@ -750,6 +934,31 @@ bool renderTextGridSurface(SuperTerminalRuntimeHost* host, TerminalSurface* surf
     frame.uniforms.row_origin = 0.0f;
     frame.uniforms.effects_mode = 0.0f;
     return wingui_text_grid_renderer_render(host->text_renderer, layout.x, layout.y, layout.width, layout.height, &frame) != 0;
+}
+
+bool renderTextGridSurfaceWithRenderer(SuperTerminalRuntimeHost* host,
+                                       WinguiTextGridRenderer* renderer,
+                                       TerminalSurface* surface,
+                                       int32_t x,
+                                       int32_t y,
+                                       int32_t width,
+                                       int32_t height) {
+    if (!host || !renderer || !surface || width <= 0 || height <= 0) return true;
+
+    buildGlyphInstances(*host, surface, &host->glyph_instances);
+
+    WinguiTextGridFrame frame{};
+    frame.instances = host->glyph_instances.data();
+    frame.instance_count = static_cast<uint32_t>(host->glyph_instances.size());
+    frame.uniforms.viewport_width = static_cast<float>(std::max(width, 1));
+    frame.uniforms.viewport_height = static_cast<float>(std::max(height, 1));
+    frame.uniforms.cell_width = host->atlas.info.cell_width;
+    frame.uniforms.cell_height = host->atlas.info.cell_height;
+    frame.uniforms.atlas_width = host->atlas.info.atlas_width;
+    frame.uniforms.atlas_height = host->atlas.info.atlas_height;
+    frame.uniforms.row_origin = 0.0f;
+    frame.uniforms.effects_mode = 0.0f;
+    return wingui_text_grid_renderer_render(renderer, x, y, width, height, &frame) != 0;
 }
 
 bool renderIndexedPane(SuperTerminalRuntimeHost* host,
@@ -794,6 +1003,176 @@ void destroyPaneRgbaPresenter(RegisteredPane& pane) {
     pane.pane_vector_renderer_atlas_set = 0;
 }
 
+void destroyPaneTextGridPresenter(RegisteredPane& pane) {
+    if (pane.pane_text_renderer) {
+        wingui_destroy_text_grid_renderer(pane.pane_text_renderer);
+        pane.pane_text_renderer = nullptr;
+    }
+    if (pane.text_grid_context) {
+        wingui_destroy_context(pane.text_grid_context);
+        pane.text_grid_context = nullptr;
+    }
+    pane.text_grid_hwnd = nullptr;
+    pane.pane_text_renderer_atlas_set = 0;
+}
+
+bool ensurePaneTextGridPresenter(SuperTerminalRuntimeHost* host,
+                                 RegisteredPane& pane,
+                                 const SuperTerminalPaneLayout& layout) {
+    if (!host || pane.node_id.empty() || layout.width <= 0 || layout.height <= 0) return false;
+
+    void* node_hwnd_raw = nullptr;
+    if (!wingui_native_try_get_node_hwnd(pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
+        return false;
+    }
+
+    const int32_t target_width = std::max(layout.width, 1);
+    const int32_t target_height = std::max(layout.height, 1);
+    if (pane.text_grid_hwnd != node_hwnd_raw || !pane.text_grid_context || !pane.pane_text_renderer) {
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "attach-text-grid-presenter id=%s hwnd=%p old_hwnd=%p w=%d h=%d",
+                          pane.node_id.c_str(),
+                          node_hwnd_raw,
+                          pane.text_grid_hwnd,
+                          static_cast<int>(target_width),
+                          static_cast<int>(target_height));
+            traceNativePatchEvent(buffer);
+        }
+        destroyPaneTextGridPresenter(pane);
+
+        WinguiContextDesc context_desc{};
+        context_desc.hwnd = node_hwnd_raw;
+        context_desc.width = static_cast<uint32_t>(target_width);
+        context_desc.height = static_cast<uint32_t>(target_height);
+        context_desc.buffer_count = 2;
+        context_desc.vsync_interval = 1;
+        if (!wingui_create_context(&context_desc, &pane.text_grid_context)) {
+            destroyPaneTextGridPresenter(pane);
+            return false;
+        }
+
+        WinguiTextGridRendererDesc renderer_desc{};
+        renderer_desc.context = pane.text_grid_context;
+        renderer_desc.shader_path_utf8 = host->desc.text_shader_path_utf8 && *host->desc.text_shader_path_utf8 ? host->desc.text_shader_path_utf8 : kDefaultShaderPath;
+        if (!wingui_create_text_grid_renderer(&renderer_desc, &pane.pane_text_renderer)) {
+            destroyPaneTextGridPresenter(pane);
+            return false;
+        }
+
+        if (!wingui_text_grid_renderer_set_atlas(pane.pane_text_renderer, &host->atlas)) {
+            destroyPaneTextGridPresenter(pane);
+            return false;
+        }
+
+        pane.text_grid_hwnd = node_hwnd_raw;
+        pane.pane_text_renderer_atlas_set = 1;
+    }
+
+    if (pane.pane_text_renderer && !pane.pane_text_renderer_atlas_set) {
+        if (wingui_text_grid_renderer_set_atlas(pane.pane_text_renderer, &host->atlas)) {
+            pane.pane_text_renderer_atlas_set = 1;
+        }
+    }
+
+    wingui_resize_context(pane.text_grid_context, static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height));
+    if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        char buffer[256];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "resize-text-grid-context id=%s hwnd=%p w=%d h=%d",
+                      pane.node_id.c_str(),
+                      pane.text_grid_hwnd,
+                      static_cast<int>(target_width),
+                      static_cast<int>(target_height));
+        traceNativePatchEvent(buffer);
+    }
+    return true;
+}
+
+bool renderTextGridPane(SuperTerminalRuntimeHost* host,
+                        RegisteredPane& pane,
+                        TerminalSurface* surface,
+                        const SuperTerminalPaneLayout& layout,
+                        uint32_t buffer_index) {
+    if (layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
+    if (!ensurePaneTextGridPresenter(host, pane, layout)) return true;
+
+    std::vector<WinguiGlyphInstance>& cached_instances = pane.text_grid_glyph_instances[buffer_index & 1u];
+    bool& cache_dirty = pane.text_grid_cache_dirty[buffer_index & 1u];
+    uint64_t& cache_build_count = pane.text_grid_cache_build_count[buffer_index & 1u];
+    uint64_t& cache_hit_count = pane.text_grid_cache_hit_count[buffer_index & 1u];
+    uint64_t& gpu_upload_count = pane.text_grid_gpu_upload_count[buffer_index & 1u];
+    if (cache_dirty || cached_instances.size() != surface->cells.size()) {
+        buildGlyphInstances(*host, surface, &cached_instances);
+        if (!wingui_text_grid_renderer_upload_instances(
+                pane.pane_text_renderer,
+                cached_instances.data(),
+                static_cast<uint32_t>(cached_instances.size()))) {
+            return false;
+        }
+        gpu_upload_count += 1;
+        cache_dirty = false;
+        cache_build_count += 1;
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "text-cache-rebuild id=%s buf=%u builds=%llu hits=%llu cells=%u dirty=%u",
+                          pane.node_id.c_str(),
+                          static_cast<unsigned>(buffer_index & 1u),
+                          static_cast<unsigned long long>(cache_build_count),
+                          static_cast<unsigned long long>(cache_hit_count),
+                          static_cast<unsigned>(cached_instances.size()),
+                          1u);
+            traceNativePatchEvent(buffer);
+
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "text-gpu-upload id=%s buf=%u uploads=%llu builds=%llu hits=%llu cells=%u",
+                          pane.node_id.c_str(),
+                          static_cast<unsigned>(buffer_index & 1u),
+                          static_cast<unsigned long long>(gpu_upload_count),
+                          static_cast<unsigned long long>(cache_build_count),
+                          static_cast<unsigned long long>(cache_hit_count),
+                          static_cast<unsigned>(cached_instances.size()));
+            traceNativePatchEvent(buffer);
+        }
+    } else {
+        cache_hit_count += 1;
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id) &&
+            (cache_hit_count <= 3 || (cache_hit_count % 120u) == 0u)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "text-cache-hit id=%s buf=%u builds=%llu hits=%llu cells=%u",
+                          pane.node_id.c_str(),
+                          static_cast<unsigned>(buffer_index & 1u),
+                          static_cast<unsigned long long>(cache_build_count),
+                          static_cast<unsigned long long>(cache_hit_count),
+                          static_cast<unsigned>(cached_instances.size()));
+            traceNativePatchEvent(buffer);
+        }
+    }
+
+    if (!wingui_begin_frame(pane.text_grid_context, 0.0f, 0.0f, 0.0f, 1.0f)) return false;
+    WinguiTextGridFrame frame{};
+    frame.instances = cached_instances.data();
+    frame.instance_count = static_cast<uint32_t>(cached_instances.size());
+    frame.uniforms.viewport_width = static_cast<float>(std::max(layout.width, 1));
+    frame.uniforms.viewport_height = static_cast<float>(std::max(layout.height, 1));
+    frame.uniforms.cell_width = host->atlas.info.cell_width;
+    frame.uniforms.cell_height = host->atlas.info.cell_height;
+    frame.uniforms.atlas_width = host->atlas.info.atlas_width;
+    frame.uniforms.atlas_height = host->atlas.info.atlas_height;
+    frame.uniforms.row_origin = 0.0f;
+    frame.uniforms.effects_mode = 0.0f;
+    if (!wingui_text_grid_renderer_render_uploaded(pane.pane_text_renderer, 0, 0, layout.width, layout.height, &frame.uniforms)) return false;
+    return wingui_present(pane.text_grid_context, 1) != 0;
+}
+
 bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
                              RegisteredPane& pane,
                              const SuperTerminalPaneLayout& layout) {
@@ -811,6 +1190,20 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
     if (pane.rgba_hwnd != node_hwnd_raw || !pane.rgba_context || !pane.pane_rgba_renderer ||
         !pane.rgba_surface_handle || !pane.pane_vector_renderer ||
         pane.rgba_surface_buffer_count != required_surface_buffer_count) {
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "attach-rgba-presenter id=%s hwnd=%p old_hwnd=%p w=%d h=%d buffers=%u mode=%u",
+                          pane.node_id.c_str(),
+                          node_hwnd_raw,
+                          pane.rgba_hwnd,
+                          static_cast<int>(target_width),
+                          static_cast<int>(target_height),
+                          static_cast<unsigned>(required_surface_buffer_count),
+                          static_cast<unsigned>(pane.rgba_content_buffer_mode));
+            traceNativePatchEvent(buffer);
+        }
         destroyPaneRgbaPresenter(pane);
 
         WinguiContextDesc context_desc{};
@@ -861,6 +1254,18 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
     pane.rgba_screen_height = static_cast<uint32_t>(target_height);
     pane.rgba_pixel_aspect_num = pane.rgba_pixel_aspect_num ? pane.rgba_pixel_aspect_num : 1u;
     pane.rgba_pixel_aspect_den = pane.rgba_pixel_aspect_den ? pane.rgba_pixel_aspect_den : 1u;
+    if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        char buffer[256];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "resize-rgba-context id=%s hwnd=%p w=%d h=%d buffers=%u",
+                      pane.node_id.c_str(),
+                      pane.rgba_hwnd,
+                      static_cast<int>(target_width),
+                      static_cast<int>(target_height),
+                      static_cast<unsigned>(pane.rgba_surface_buffer_count));
+        traceNativePatchEvent(buffer);
+    }
     return wingui_rgba_surface_ensure_buffers(
         pane.rgba_surface_handle,
         pane.rgba_screen_width,
@@ -961,7 +1366,8 @@ bool renderRgbaPane(SuperTerminalRuntimeHost* host,
 }
 
 bool renderSurface(SuperTerminalRuntimeHost* host) {
-    if (!host || !host->context || !host->text_renderer) return false;
+    if (!host) return false;
+    if (!host->native_attached && (!host->context || !host->text_renderer)) return false;
 
     bool parent_frame_started = false;
     bool parent_rendered_any = false;
@@ -1032,18 +1438,33 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
 
         TerminalSurface* surface = textGridSurfaceForPaneBuffer(host, pane_id, false, display_buffer_index);
         if (!surface) continue;
-        if (!begin_parent_frame()) return false;
         if ((surface->columns != layout.columns || surface->rows != layout.rows) && layout.columns > 0 && layout.rows > 0) {
             std::lock_guard<std::mutex> lock(host->pane_mutex);
             if (BufferedTerminalSurface* surface_set = textGridSurfaceSetForPaneLocked(host, pane_id, false)) {
                 resizeBufferedSurfacePreserve(surface_set, layout.columns, layout.rows);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
+                    pane->text_grid_cache_dirty[0] = true;
+                    pane->text_grid_cache_dirty[1] = true;
+                }
                 surface = &surface_set->buffers[display_buffer_index];
             }
         }
-        if (!renderTextGridSurface(host, surface, layout)) {
-            return false;
+        if (host->native_attached) {
+            bool ok = true;
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
+                    ok = renderTextGridPane(host, *pane, surface, layout, display_buffer_index);
+                }
+            }
+            if (!ok) return false;
+        } else {
+            if (!begin_parent_frame()) return false;
+            if (!renderTextGridSurface(host, surface, layout)) {
+                return false;
+            }
+            parent_rendered_any = true;
         }
-        parent_rendered_any = true;
     }
 
     if (!parent_rendered_any && !host->native_attached) {
@@ -1111,6 +1532,7 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
             break;
         case SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS:
             writeCellsToMirroredSurface(host, command.data.text_grid_write_cells);
+            free(const_cast<SuperTerminalTextGridCell*>(command.data.text_grid_write_cells.cells));
             host->render_dirty.store(1, std::memory_order_release);
             break;
         case SUPERTERMINAL_CMD_TEXT_GRID_CLEAR_REGION:
@@ -1481,7 +1903,7 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 if (vd.free_fn) vd.free_fn(vd.free_user_data, owned_prims);
                 else delete[] static_cast<uint8_t*>(owned_prims);
             };
-            if (!host->context || vd.pane_id.value == 0) { free_prims(); break; }
+            if (vd.pane_id.value == 0) { free_prims(); break; }
 
             WinguiRgbaSurface* surface = nullptr;
             uint32_t surface_w = 0;
@@ -1809,48 +2231,6 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
         return false;
     }
 
-    WinguiContextDesc context_desc{};
-    context_desc.hwnd = wingui_window_hwnd(host->window);
-    context_desc.width = static_cast<uint32_t>(std::max(client_width, 1));
-    context_desc.height = static_cast<uint32_t>(std::max(client_height, 1));
-    context_desc.buffer_count = 2;
-    context_desc.vsync_interval = 1;
-    if (!wingui_create_context(&context_desc, &host->context)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_CONTEXT_CREATE, wingui_last_error_utf8());
-        return false;
-    }
-
-    WinguiTextGridRendererDesc renderer_desc{};
-    renderer_desc.context = host->context;
-    renderer_desc.shader_path_utf8 = host->desc.text_shader_path_utf8 && *host->desc.text_shader_path_utf8 ? host->desc.text_shader_path_utf8 : kDefaultShaderPath;
-    if (!wingui_create_text_grid_renderer(&renderer_desc, &host->text_renderer)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
-        return false;
-    }
-    if (!wingui_text_grid_renderer_set_atlas(host->text_renderer, &host->atlas)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
-        return false;
-    }
-
-    WinguiIndexedGraphicsRendererDesc indexed_desc{};
-    indexed_desc.context = host->context;
-    indexed_desc.graphics_shader_path_utf8 = kDefaultGraphicsShaderPath;
-    indexed_desc.sprite_shader_path_utf8 = kDefaultSpriteShaderPath;
-    if (!wingui_create_indexed_graphics_renderer(&indexed_desc, &host->indexed_renderer)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
-        return false;
-    }
-    host->sprite_atlas_packer.init(indexed_desc.sprite_atlas_size ? indexed_desc.sprite_atlas_size : 2048u);
-
-    WinguiRgbaPaneRendererDesc rgba_desc{};
-    rgba_desc.context = host->context;
-    rgba_desc.shader_path_utf8 = kDefaultGraphicsShaderPath;
-    rgba_desc.buffer_count = 2;
-    if (!wingui_create_rgba_pane_renderer(&rgba_desc, &host->rgba_renderer)) {
-        setHostError(host, SUPERTERMINAL_HOST_ERROR_RENDERER_CREATE, wingui_last_error_utf8());
-        return false;
-    }
-
     WinguiNativeCallbacks native_callbacks{};
     native_callbacks.dispatch_event_json = nativeDispatchEventJson;
     wingui_native_set_callbacks(&native_callbacks);
@@ -1867,6 +2247,7 @@ bool initWindowAndRenderer(SuperTerminalRuntimeHost* host) {
         return false;
     }
     host->native_attached = true;
+    host->sprite_atlas_packer.init(2048u);
     return true;
 }
 
@@ -1944,6 +2325,9 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
     {
         std::lock_guard<std::mutex> lock(host->pane_mutex);
         for (RegisteredPane& pane : host->panes) {
+            if (pane.text_grid_context || pane.pane_text_renderer) {
+                destroyPaneTextGridPresenter(pane);
+            }
             if (pane.rgba_surface_handle) {
                 destroyPaneRgbaPresenter(pane);
             }
@@ -2345,12 +2729,9 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_resolve_pane_id_utf8(
 
     {
         std::lock_guard<std::mutex> lock(ctx->host->pane_mutex);
-        RegisteredPane* pane = ensureRegisteredPaneLocked(ctx->host, pane_id);
-        if (!pane) {
-            wingui_set_last_error_string_internal("super_terminal_resolve_pane_id_utf8: failed to allocate pane state");
+        if (!assignPaneNodeIdLocked(ctx->host, pane_id, node_id_utf8, "super_terminal_resolve_pane_id_utf8")) {
             return 0;
         }
-        pane->node_id = node_id_utf8;
     }
 
     *out_pane_id = pane_id;
@@ -2479,12 +2860,25 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_text_grid_write_cells(
         wingui_set_last_error_string_internal("super_terminal_text_grid_write_cells: invalid arguments");
         return 0;
     }
+    SuperTerminalTextGridCell* owned_cells = nullptr;
+    if (cell_count != 0) {
+        owned_cells = static_cast<SuperTerminalTextGridCell*>(std::malloc(static_cast<size_t>(cell_count) * sizeof(SuperTerminalTextGridCell)));
+        if (!owned_cells) {
+            wingui_set_last_error_string_internal("super_terminal_text_grid_write_cells: out of memory");
+            return 0;
+        }
+        std::memcpy(owned_cells, cells, static_cast<size_t>(cell_count) * sizeof(SuperTerminalTextGridCell));
+    }
     SuperTerminalCommand command{};
     command.type = SUPERTERMINAL_CMD_TEXT_GRID_WRITE_CELLS;
     command.data.text_grid_write_cells.pane_id = pane_id;
-    command.data.text_grid_write_cells.cells = cells;
+    command.data.text_grid_write_cells.cells = owned_cells;
     command.data.text_grid_write_cells.cell_count = cell_count;
-    return super_terminal_enqueue(ctx, &command);
+    const int32_t result = super_terminal_enqueue(ctx, &command);
+    if (!result) {
+        free(owned_cells);
+    }
+    return result;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_frame_text_grid_write_cells(
@@ -2511,6 +2905,30 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_frame_text_grid_write_c
     write_cells.cells = cells;
     write_cells.cell_count = cell_count;
     writeCellsToSurface(surface, write_cells, *ctx->host);
+    {
+        std::lock_guard<std::mutex> lock(ctx->host->pane_mutex);
+        if (RegisteredPane* pane = registeredPaneForIdLocked(ctx->host, pane_id, false)) {
+            pane->text_grid_cache_dirty[tick->buffer_index & 1u] = true;
+        }
+    }
+    {
+        const std::string node_id = paneNodeIdForTrace(ctx->host, pane_id);
+        if (shouldTraceWorkspacePaneNodeId(node_id)) {
+            const SuperTerminalTextGridCell& first = cells[0];
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "frame-write-cells id=%s pane=%llu buf=%u count=%u first=(r%u,c%u,cp%u)",
+                          node_id.c_str(),
+                          static_cast<unsigned long long>(pane_id.value),
+                          static_cast<unsigned>(tick->buffer_index),
+                          static_cast<unsigned>(cell_count),
+                          static_cast<unsigned>(first.row),
+                          static_cast<unsigned>(first.column),
+                          static_cast<unsigned>(first.codepoint));
+            traceNativePatchEvent(buffer);
+        }
+    }
     wingui_clear_last_error_internal();
     return 1;
 }
@@ -2572,6 +2990,30 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_frame_text_grid_clear_r
     clear_region.foreground = foreground;
     clear_region.background = background;
     clearSurfaceRegion(surface, clear_region);
+    {
+        std::lock_guard<std::mutex> lock(ctx->host->pane_mutex);
+        if (RegisteredPane* pane = registeredPaneForIdLocked(ctx->host, pane_id, false)) {
+            pane->text_grid_cache_dirty[tick->buffer_index & 1u] = true;
+        }
+    }
+    {
+        const std::string node_id = paneNodeIdForTrace(ctx->host, pane_id);
+        if (shouldTraceWorkspacePaneNodeId(node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "frame-clear-region id=%s pane=%llu buf=%u row=%u col=%u w=%u h=%u fill=%u",
+                          node_id.c_str(),
+                          static_cast<unsigned long long>(pane_id.value),
+                          static_cast<unsigned>(tick->buffer_index),
+                          static_cast<unsigned>(row),
+                          static_cast<unsigned>(column),
+                          static_cast<unsigned>(width),
+                          static_cast<unsigned>(height),
+                          static_cast<unsigned>(fill_codepoint));
+            traceNativePatchEvent(buffer);
+        }
+    }
     wingui_clear_last_error_internal();
     return 1;
 }

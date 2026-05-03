@@ -94,6 +94,28 @@ WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_get_patch_metrics(
     WinguiSpecBindRuntime* runtime,
     SuperTerminalNativeUiPatchMetrics* out_metrics);
 
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_id_utf8(
+    WinguiSpecBindRuntime* runtime,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_text_grid_write_cells(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    const SuperTerminalTextGridCell* cells,
+    uint32_t cell_count);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_text_grid_clear_region(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    uint32_t row,
+    uint32_t column,
+    uint32_t width,
+    uint32_t height,
+    uint32_t fill_codepoint,
+    WinguiGraphicsColour foreground,
+    WinguiGraphicsColour background);
+
 WINGUI_API uint64_t WINGUI_CALL wingui_spec_bind_frame_index(
     const WinguiSpecBindFrameView* frame_view);
 

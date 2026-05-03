@@ -305,6 +305,12 @@ From `FrameView` you can:
 
 This part of the wrapper is still intentionally close to the underlying runtime API because it maps directly onto the pane graphics surface.
 
+Current implementation note for text-grid panes:
+
+- Prefer `frame.writeFrameTextGridCells(...)` and `frame.clearFrameTextGridRegion(...)` when text is part of a frame-driven pane; they target the current frame buffer.
+- The older `frame.textGridWriteCells(...)` and `frame.textGridClearRegion(...)` names remain as compatibility aliases.
+- For retained-style text, use `runtime.writeRetainedTextGridCells(...)` and `runtime.clearRetainedTextGridRegion(...)`; rewrite only when the retained text actually changes.
+
 ## Real-time keyboard input
 
 The Zig wrapper now exposes frame-scoped keyboard polling for frame-driven interactions.

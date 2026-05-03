@@ -100,6 +100,7 @@ WINGUI_API int64_t WINGUI_CALL wingui_native_handle_host_command(int32_t command
 WINGUI_API int64_t WINGUI_CALL wingui_native_get_content_size(int32_t* out_width, int32_t* out_height);
 WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds);
 WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd);
+WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_type_utf8(const char* node_id_utf8, char* buffer_utf8, uint32_t buffer_size);
 WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size);
 WINGUI_API int64_t WINGUI_CALL wingui_native_get_patch_metrics(WinguiNativePatchMetrics* out_metrics);
 WINGUI_API int64_t WINGUI_CALL wingui_native_open_url(const char* utf8);

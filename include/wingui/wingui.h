@@ -336,6 +336,17 @@ WINGUI_API void WINGUI_CALL wingui_free_glyph_atlas_bitmap(WinguiGlyphAtlasBitma
 WINGUI_API int32_t WINGUI_CALL wingui_create_text_grid_renderer(const WinguiTextGridRendererDesc* desc, WinguiTextGridRenderer** out_renderer);
 WINGUI_API void WINGUI_CALL wingui_destroy_text_grid_renderer(WinguiTextGridRenderer* renderer);
 WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_set_atlas(WinguiTextGridRenderer* renderer, const WinguiGlyphAtlasBitmap* bitmap);
+WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_upload_instances(
+    WinguiTextGridRenderer* renderer,
+    const WinguiGlyphInstance* instances,
+    uint32_t instance_count);
+WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_render_uploaded(
+    WinguiTextGridRenderer* renderer,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    const WinguiTextGridUniforms* uniforms);
 WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_render(
     WinguiTextGridRenderer* renderer,
     int32_t viewport_x,

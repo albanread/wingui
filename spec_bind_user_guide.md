@@ -319,6 +319,12 @@ int32_t wingui_spec_bind_frame_text_grid_clear_region(
 
 Use these when the declarative spec includes a `text-grid` pane.
 
+Current implementation note:
+
+- `wingui_spec_bind_frame_text_grid_write_cells(...)` and `wingui_spec_bind_frame_text_grid_clear_region(...)` target the current frame buffer.
+- Use these in frame callbacks when text is part of a frame-driven surface and should follow the same buffer-index semantics as other frame-local pane drawing.
+- `wingui_spec_bind_runtime_text_grid_write_cells(...)` and `wingui_spec_bind_runtime_text_grid_clear_region(...)` are the retained-style alternatives for updates outside the frame callback; those follow the mirrored text-buffer path and should be called again only when the retained text changes.
+
 ### Indexed pane helpers
 
 ```c

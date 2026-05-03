@@ -580,6 +580,103 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_get_patch_met
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_resolve_pane_id_utf8(
+    WinguiSpecBindRuntime* runtime,
+    const char* node_id_utf8,
+    SuperTerminalPaneId* out_pane_id) {
+    if (!runtime || !node_id_utf8 || !node_id_utf8[0] || !out_pane_id) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_utf8: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_utf8: runtime is not active");
+        return 0;
+    }
+    if (!super_terminal_resolve_pane_id_utf8(active_context, node_id_utf8, out_pane_id)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_resolve_pane_id_utf8: pane resolution failed");
+        return 0;
+    }
+
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_text_grid_write_cells(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    const SuperTerminalTextGridCell* cells,
+    uint32_t cell_count) {
+    if (!runtime) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_write_cells: runtime was null");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_write_cells: runtime is not active");
+        return 0;
+    }
+    if (!super_terminal_text_grid_write_cells(active_context, pane_id, cells, cell_count)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_write_cells: write failed");
+        return 0;
+    }
+
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_text_grid_clear_region(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    uint32_t row,
+    uint32_t column,
+    uint32_t width,
+    uint32_t height,
+    uint32_t fill_codepoint,
+    WinguiGraphicsColour foreground,
+    WinguiGraphicsColour background) {
+    if (!runtime) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_clear_region: runtime was null");
+        return 0;
+    }
+
+    SuperTerminalClientContext* active_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        active_context = runtime->active_context;
+    }
+    if (!active_context) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_clear_region: runtime is not active");
+        return 0;
+    }
+    if (!super_terminal_text_grid_clear_region(
+            active_context,
+            pane_id,
+            row,
+            column,
+            width,
+            height,
+            fill_codepoint,
+            foreground,
+            background)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_runtime_text_grid_clear_region: clear failed");
+        return 0;
+    }
+
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
 extern "C" WINGUI_API uint64_t WINGUI_CALL wingui_spec_bind_frame_index(
     const WinguiSpecBindFrameView* frame_view) {
     return (frame_view && frame_view->tick) ? frame_view->tick->frame_index : 0;
@@ -720,7 +817,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_text_grid_write
         !validatePaneRef(pane, "wingui_spec_bind_frame_text_grid_write_cells")) {
         return 0;
     }
-    if (!super_terminal_text_grid_write_cells(frame_view->ctx, pane.pane_id, cells, cell_count)) {
+    if (!super_terminal_frame_text_grid_write_cells(frame_view->ctx, frame_view->tick, pane.pane_id, cells, cell_count)) {
         wingui_set_last_error_string_internal("wingui_spec_bind_frame_text_grid_write_cells: write failed");
         return 0;
     }
@@ -742,8 +839,9 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_text_grid_clear
         !validatePaneRef(pane, "wingui_spec_bind_frame_text_grid_clear_region")) {
         return 0;
     }
-    if (!super_terminal_text_grid_clear_region(
+    if (!super_terminal_frame_text_grid_clear_region(
             frame_view->ctx,
+            frame_view->tick,
             pane.pane_id,
             row,
             column,

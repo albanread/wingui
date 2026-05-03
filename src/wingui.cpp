@@ -72,6 +72,7 @@ struct WinguiTextGridRenderer {
     ID3D11Texture2D* atlas_texture = nullptr;
     ID3D11ShaderResourceView* atlas_srv = nullptr;
     size_t instance_capacity = 0;
+    uint32_t uploaded_instance_count = 0;
     WinguiGlyphAtlasInfo atlas_info{};
 };
 
@@ -1334,6 +1335,93 @@ HRESULT ensureTextGridInstanceBuffer(WinguiTextGridRenderer& renderer, size_t ne
     return S_OK;
 }
 
+int32_t uploadTextGridInstances(WinguiTextGridRenderer* renderer,
+                                const WinguiGlyphInstance* instances,
+                                uint32_t instance_count,
+                                const char* error_prefix) {
+    if (!renderer || !renderer->context || !renderer->context->device_context) {
+        setLastErrorString(error_prefix);
+        return 0;
+    }
+    if (!instances || instance_count == 0) {
+        setLastErrorString(error_prefix);
+        return 0;
+    }
+
+    HRESULT hr = ensureTextGridInstanceBuffer(*renderer, instance_count);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_text_grid_renderer_upload_instances: instance buffer allocation failed", hr);
+        return 0;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    hr = renderer->context->device_context->Map(renderer->instance_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_text_grid_renderer_upload_instances: instance buffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(mapped.pData, instances, static_cast<size_t>(instance_count) * sizeof(WinguiGlyphInstance));
+    renderer->context->device_context->Unmap(renderer->instance_buffer, 0);
+    renderer->uploaded_instance_count = instance_count;
+    g_last_error.clear();
+    return 1;
+}
+
+int32_t renderUploadedTextGridInstances(WinguiTextGridRenderer* renderer,
+                                        int32_t viewport_x,
+                                        int32_t viewport_y,
+                                        int32_t viewport_width,
+                                        int32_t viewport_height,
+                                        const WinguiTextGridUniforms* uniforms,
+                                        const char* error_prefix) {
+    if (!renderer || !renderer->context || !renderer->context->device_context || !renderer->context->render_target_view || !uniforms) {
+        setLastErrorString(error_prefix);
+        return 0;
+    }
+    if (!renderer->atlas_srv || !renderer->instance_buffer || renderer->uploaded_instance_count == 0 || viewport_width <= 0 || viewport_height <= 0) {
+        setLastErrorString(error_prefix);
+        return 0;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = renderer->context->device_context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_text_grid_renderer_render_uploaded: constant buffer map failed", hr);
+        return 0;
+    }
+    std::memcpy(mapped.pData, uniforms, sizeof(*uniforms));
+    renderer->context->device_context->Unmap(renderer->constant_buffer, 0);
+
+    const D3D11_VIEWPORT viewport{
+        static_cast<float>(viewport_x),
+        static_cast<float>(viewport_y),
+        static_cast<float>(viewport_width),
+        static_cast<float>(viewport_height),
+        0.0f,
+        1.0f
+    };
+    const D3D11_RECT scissor{ viewport_x, viewport_y, viewport_x + viewport_width, viewport_y + viewport_height };
+    const UINT stride = sizeof(WinguiGlyphInstance);
+    const UINT offset = 0;
+
+    renderer->context->device_context->OMSetRenderTargets(1, &renderer->context->render_target_view, nullptr);
+    renderer->context->device_context->RSSetState(renderer->rasterizer);
+    renderer->context->device_context->RSSetViewports(1, &viewport);
+    renderer->context->device_context->RSSetScissorRects(1, &scissor);
+    renderer->context->device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    renderer->context->device_context->IASetInputLayout(renderer->input_layout);
+    renderer->context->device_context->IASetVertexBuffers(0, 1, &renderer->instance_buffer, &stride, &offset);
+    renderer->context->device_context->VSSetShader(renderer->vertex_shader, nullptr, 0);
+    renderer->context->device_context->PSSetShader(renderer->pixel_shader, nullptr, 0);
+    renderer->context->device_context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+    renderer->context->device_context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
+    renderer->context->device_context->PSSetSamplers(0, 1, &renderer->sampler);
+    renderer->context->device_context->DrawInstanced(6, renderer->uploaded_instance_count, 0, 0);
+
+    g_last_error.clear();
+    return 1;
+}
+
 HRESULT createTextGridAtlasTexture(WinguiTextGridRenderer& renderer, const WinguiGlyphAtlasBitmap& bitmap) {
     if (!renderer.context || !renderer.context->device || !bitmap.pixels_rgba || bitmap.width == 0 || bitmap.height == 0) {
         return E_INVALIDARG;
@@ -1933,6 +2021,30 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_set_atlas(Wi
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_upload_instances(
+    WinguiTextGridRenderer* renderer,
+    const WinguiGlyphInstance* instances,
+    uint32_t instance_count) {
+    return uploadTextGridInstances(renderer, instances, instance_count, "wingui_text_grid_renderer_upload_instances: invalid arguments");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_render_uploaded(
+    WinguiTextGridRenderer* renderer,
+    int32_t viewport_x,
+    int32_t viewport_y,
+    int32_t viewport_width,
+    int32_t viewport_height,
+    const WinguiTextGridUniforms* uniforms) {
+    return renderUploadedTextGridInstances(
+        renderer,
+        viewport_x,
+        viewport_y,
+        viewport_width,
+        viewport_height,
+        uniforms,
+        "wingui_text_grid_renderer_render_uploaded: renderer is not ready");
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_render(
     WinguiTextGridRenderer* renderer,
     int32_t viewport_x,
@@ -1948,58 +2060,17 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_text_grid_renderer_render(
         setLastErrorString("wingui_text_grid_renderer_render: renderer is not ready");
         return 0;
     }
-
-    HRESULT hr = ensureTextGridInstanceBuffer(*renderer, frame->instance_count);
-    if (FAILED(hr)) {
-        setLastErrorHresult("wingui_text_grid_renderer_render: instance buffer allocation failed", hr);
+    if (!uploadTextGridInstances(renderer, frame->instances, frame->instance_count, "wingui_text_grid_renderer_render: invalid frame instances")) {
         return 0;
     }
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    hr = renderer->context->device_context->Map(renderer->instance_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        setLastErrorHresult("wingui_text_grid_renderer_render: instance buffer map failed", hr);
-        return 0;
-    }
-    std::memcpy(mapped.pData, frame->instances, static_cast<size_t>(frame->instance_count) * sizeof(WinguiGlyphInstance));
-    renderer->context->device_context->Unmap(renderer->instance_buffer, 0);
-
-    hr = renderer->context->device_context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) {
-        setLastErrorHresult("wingui_text_grid_renderer_render: constant buffer map failed", hr);
-        return 0;
-    }
-    std::memcpy(mapped.pData, &frame->uniforms, sizeof(frame->uniforms));
-    renderer->context->device_context->Unmap(renderer->constant_buffer, 0);
-
-    const D3D11_VIEWPORT viewport{
-        static_cast<float>(viewport_x),
-        static_cast<float>(viewport_y),
-        static_cast<float>(viewport_width),
-        static_cast<float>(viewport_height),
-        0.0f,
-        1.0f
-    };
-    const D3D11_RECT scissor{ viewport_x, viewport_y, viewport_x + viewport_width, viewport_y + viewport_height };
-    const UINT stride = sizeof(WinguiGlyphInstance);
-    const UINT offset = 0;
-
-    renderer->context->device_context->OMSetRenderTargets(1, &renderer->context->render_target_view, nullptr);
-    renderer->context->device_context->RSSetState(renderer->rasterizer);
-    renderer->context->device_context->RSSetViewports(1, &viewport);
-    renderer->context->device_context->RSSetScissorRects(1, &scissor);
-    renderer->context->device_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    renderer->context->device_context->IASetInputLayout(renderer->input_layout);
-    renderer->context->device_context->IASetVertexBuffers(0, 1, &renderer->instance_buffer, &stride, &offset);
-    renderer->context->device_context->VSSetShader(renderer->vertex_shader, nullptr, 0);
-    renderer->context->device_context->PSSetShader(renderer->pixel_shader, nullptr, 0);
-    renderer->context->device_context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
-    renderer->context->device_context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
-    renderer->context->device_context->PSSetSamplers(0, 1, &renderer->sampler);
-    renderer->context->device_context->DrawInstanced(6, frame->instance_count, 0, 0);
-
-    g_last_error.clear();
-    return 1;
+    return renderUploadedTextGridInstances(
+        renderer,
+        viewport_x,
+        viewport_y,
+        viewport_width,
+        viewport_height,
+        &frame->uniforms,
+        "wingui_text_grid_renderer_render: renderer is not ready");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_indexed_graphics_renderer(

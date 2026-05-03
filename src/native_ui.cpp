@@ -391,6 +391,13 @@ void traceNativeUiEvent(const ordered_json& event) {
 
 void setNativeLastError(const std::string& error);
 
+bool shouldTraceWorkspacePaneNodeId(const char* node_id_utf8) {
+    if (!node_id_utf8 || !*node_id_utf8) return false;
+    return std::strcmp(node_id_utf8, "workspace_editor") == 0 ||
+        std::strcmp(node_id_utf8, "workspace_graphics") == 0 ||
+        std::strcmp(node_id_utf8, "workspace_repl") == 0;
+}
+
 bool tryGetNativeNodeBounds(const char* node_id_utf8, WinguiNativeNodeBounds* out_bounds) {
     if (!node_id_utf8 || !out_bounds) {
         setNativeLastError("Native UI node bounds query requires an id and output buffer.");
@@ -428,6 +435,21 @@ bool tryGetNativeNodeBounds(const char* node_id_utf8, WinguiNativeNodeBounds* ou
     out_bounds->width = std::max(0, static_cast<int32_t>(rect.right - rect.left));
     out_bounds->height = std::max(0, static_cast<int32_t>(rect.bottom - rect.top));
     out_bounds->visible = IsWindowVisible(node_hwnd) ? 1 : 0;
+    if (shouldTraceWorkspacePaneNodeId(node_id_utf8)) {
+        char buffer[512];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "node-bounds id=%s hwnd=%p target=%p x=%ld y=%ld w=%ld h=%ld visible=%d",
+                      node_id_utf8,
+                      node_hwnd,
+                      target_hwnd,
+                      static_cast<long>(out_bounds->x),
+                      static_cast<long>(out_bounds->y),
+                      static_cast<long>(out_bounds->width),
+                      static_cast<long>(out_bounds->height),
+                      static_cast<int>(out_bounds->visible));
+        traceNativePatchEvent(buffer);
+    }
     return true;
 }
 
@@ -447,7 +469,42 @@ bool tryGetNativeNodeHwnd(const char* node_id_utf8, void** out_hwnd) {
     }
 
     *out_hwnd = (node_hwnd && IsWindow(node_hwnd)) ? node_hwnd : nullptr;
+    if (shouldTraceWorkspacePaneNodeId(node_id_utf8)) {
+        char buffer[256];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "node-hwnd id=%s hwnd=%p",
+                      node_id_utf8,
+                      *out_hwnd);
+        traceNativePatchEvent(buffer);
+    }
     return *out_hwnd != nullptr;
+}
+
+bool tryGetNativeNodeTypeUtf8(const char* node_id_utf8, char* buffer_utf8, uint32_t buffer_size) {
+    if (!node_id_utf8 || !buffer_utf8 || buffer_size == 0) {
+        setNativeLastError("Native UI node type query requires an id and output buffer.");
+        return false;
+    }
+
+    std::string type;
+    {
+        std::lock_guard<std::mutex> lock(g_native.mutex);
+        auto node_it = g_native.node_controls.find(node_id_utf8);
+        if (node_it == g_native.node_controls.end()) {
+            buffer_utf8[0] = '\0';
+            return false;
+        }
+        auto binding_it = g_native.bindings.find(node_it->second);
+        if (binding_it == g_native.bindings.end()) {
+            buffer_utf8[0] = '\0';
+            return false;
+        }
+        type = binding_it->second.type;
+    }
+
+    std::snprintf(buffer_utf8, buffer_size, "%s", type.c_str());
+    return buffer_utf8[0] != '\0';
 }
 
 bool findFocusedPaneIdInNode(const ordered_json& node, std::string& out_id) {
@@ -2437,6 +2494,16 @@ void registerNodeControl(HWND hwnd, const ControlBinding& binding) {
     g_native.bindings[hwnd] = binding;
     if (!binding.node_id.empty()) {
         g_native.node_controls[binding.node_id] = hwnd;
+        if (shouldTraceWorkspacePaneNodeId(binding.node_id.c_str())) {
+            char buffer[256];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "register-node id=%s hwnd=%p type=%s",
+                          binding.node_id.c_str(),
+                          hwnd,
+                          binding.type.c_str());
+            traceNativePatchEvent(buffer);
+        }
     }
 }
 
@@ -5412,7 +5479,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
             cursor_y += static_cast<int>(label_size.cy + 8);
         }
         const int pane_height = std::max(24, measured.height - (cursor_y - y));
-        HWND pane_host = createChildControl(L"STATIC", L"", 0, x, cursor_y, control_width, pane_height, parent, nullptr);
+        HWND pane_host = createChildControl(L"STATIC", L"", WS_CLIPCHILDREN | WS_CLIPSIBLINGS, x, cursor_y, control_width, pane_height, parent, nullptr);
         if (pane_host) {
             attachContainerForwarding(pane_host);
             attachTransparentPaneSubclass(pane_host);
@@ -7099,6 +7166,19 @@ LRESULT CALLBACK nativeWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
     case WM_TIMER:
         if (wparam == kResizeTimerId) {
             KillTimer(hwnd, kResizeTimerId);
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                const int width = std::max(1, static_cast<int>(client.right - client.left));
+                const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+                if (g_native.content_host &&
+                    width == g_native.raw_client_width &&
+                    height == g_native.raw_client_height) {
+                    traceNativePatchEvent("resize-timer skip-rebuild current-size-already-laid-out");
+                    refreshNativeViewport(hwnd);
+                    return 0;
+                }
+            }
             rebuildNativeWindow(hwnd);
             return 0;
         }
@@ -8278,6 +8358,11 @@ extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_bounds(cons
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_hwnd(const char* node_id_utf8, void** out_hwnd) {
     clearNativeLastError();
     return tryGetNativeNodeHwnd(node_id_utf8, out_hwnd) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_try_get_node_type_utf8(const char* node_id_utf8, char* buffer_utf8, uint32_t buffer_size) {
+    clearNativeLastError();
+    return tryGetNativeNodeTypeUtf8(node_id_utf8, buffer_utf8, buffer_size) ? 1 : 0;
 }
 
 extern "C" WINGUI_API int64_t WINGUI_CALL wingui_native_copy_focused_pane_id_utf8(char* buffer_utf8, uint32_t buffer_size) {
