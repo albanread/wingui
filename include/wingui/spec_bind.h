@@ -414,6 +414,30 @@ WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_run(
     const WinguiSpecBindRunDesc* desc,
     SuperTerminalRunResult* out_result);
 
+// ---------------------------------------------------------------------------
+// Pane inbox — per-pane SPSC ring buffer (CP event thread → D3D11 frame thread)
+// ---------------------------------------------------------------------------
+
+/// Post a (kind, detail) message to pane_id's inbox.
+/// Safe to call from any thread (typically the CP event thread).
+/// Returns 1 on success, 0 if the inbox is full (message is dropped).
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_post_pane_msg(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    const char* kind_utf8,
+    const char* detail_utf8);
+
+/// Drain one message from pane_id's inbox.
+/// Must be called from inside a frame callback (D3D11 frame thread only).
+/// Returns 1 if a message was dequeued into kind_out/detail_out, 0 if empty.
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_poll_pane_msg(
+    const WinguiSpecBindFrameView* frame_view,
+    SuperTerminalPaneId pane_id,
+    char* kind_out,
+    uint32_t kind_cap,
+    char* detail_out,
+    uint32_t detail_cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -10,10 +10,13 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -35,12 +38,83 @@ struct WinguiSpecBindRuntime {
     void* frame_user_data = nullptr;
     SuperTerminalClientContext* active_context = nullptr;
     bool running = false;
+    // Per-pane inbox map — key is pane_id.value
+    std::mutex inbox_map_mutex;
+    std::unordered_map<uint64_t, std::unique_ptr<struct PaneInbox>> pane_inboxes;
 };
 
 struct WinguiSpecBindFrameView {
     SuperTerminalClientContext* ctx = nullptr;
     const SuperTerminalFrameTick* tick = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// Pane inbox — SPSC lock-free ring buffer
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kPaneInboxCapacity = 64;
+constexpr uint32_t kPaneMsgKindCap    = 32;
+constexpr uint32_t kPaneMsgDetailCap  = 128;
+
+struct PaneMsg {
+    char kind[kPaneMsgKindCap];
+    char detail[kPaneMsgDetailCap];
+};
+
+struct PaneInbox {
+    std::atomic<uint32_t> write_pos{0};
+    std::atomic<uint32_t> read_pos{0};
+    PaneMsg slots[kPaneInboxCapacity];
+
+    bool post(const char* kind, const char* detail) {
+        const uint32_t w = write_pos.load(std::memory_order_relaxed);
+        const uint32_t r = read_pos.load(std::memory_order_acquire);
+        if (w - r >= kPaneInboxCapacity) {
+            return false; // full — drop
+        }
+        PaneMsg& slot = slots[w % kPaneInboxCapacity];
+        strncpy(slot.kind,   kind   ? kind   : "", kPaneMsgKindCap   - 1);
+        strncpy(slot.detail, detail ? detail : "", kPaneMsgDetailCap - 1);
+        slot.kind  [kPaneMsgKindCap   - 1] = '\0';
+        slot.detail[kPaneMsgDetailCap - 1] = '\0';
+        write_pos.store(w + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool poll(char* kind_out, uint32_t kind_cap, char* detail_out, uint32_t detail_cap) {
+        const uint32_t r = read_pos.load(std::memory_order_relaxed);
+        const uint32_t w = write_pos.load(std::memory_order_acquire);
+        if (r == w) {
+            return false; // empty
+        }
+        const PaneMsg& slot = slots[r % kPaneInboxCapacity];
+        if (kind_out   && kind_cap   > 0) { strncpy(kind_out,   slot.kind,   kind_cap   - 1); kind_out  [kind_cap   - 1] = '\0'; }
+        if (detail_out && detail_cap > 0) { strncpy(detail_out, slot.detail, detail_cap - 1); detail_out[detail_cap - 1] = '\0'; }
+        read_pos.store(r + 1, std::memory_order_release);
+        return true;
+    }
+};
+
+PaneInbox* getOrCreateInbox(WinguiSpecBindRuntime* runtime, uint64_t pane_value) {
+    std::lock_guard<std::mutex> lock(runtime->inbox_map_mutex);
+    auto it = runtime->pane_inboxes.find(pane_value);
+    if (it != runtime->pane_inboxes.end()) {
+        return it->second.get();
+    }
+    auto inbox = std::make_unique<PaneInbox>();
+    PaneInbox* ptr = inbox.get();
+    runtime->pane_inboxes.emplace(pane_value, std::move(inbox));
+    return ptr;
+}
+
+PaneInbox* findInbox(WinguiSpecBindRuntime* runtime, uint64_t pane_value) {
+    std::lock_guard<std::mutex> lock(runtime->inbox_map_mutex);
+    auto it = runtime->pane_inboxes.find(pane_value);
+    return (it != runtime->pane_inboxes.end()) ? it->second.get() : nullptr;
+}
+
+// Process-wide active runtime pointer (set at run start, cleared at shutdown).
+WinguiSpecBindRuntime* g_spec_bind_active_runtime = nullptr;
 
 namespace {
 
@@ -242,15 +316,26 @@ int32_t publishStoredSpec(WinguiSpecBindRuntime* runtime, SuperTerminalClientCon
     }
 
     if (spec_json.empty()) {
+        fprintf(stderr, "[spec_bind] publishStoredSpec: no spec JSON stored — cannot publish\n");
+        fflush(stderr);
         wingui_set_last_error_string_internal("wingui_spec_bind_runtime_run: no spec JSON has been loaded");
         return 0;
     }
 
+    fprintf(stderr, "[spec_bind] publishStoredSpec: publishing spec (len=%zu): %.300s%s\n",
+        spec_json.size(), spec_json.c_str(),
+        spec_json.size() > 300 ? "..." : "");
+    fflush(stderr);
+
     if (!super_terminal_publish_ui_json(ctx, spec_json.c_str())) {
+        fprintf(stderr, "[spec_bind] publishStoredSpec: super_terminal_publish_ui_json failed\n");
+        fflush(stderr);
         wingui_set_last_error_string_internal("wingui_spec_bind_runtime_run: failed to publish initial UI JSON");
         return 0;
     }
 
+    fprintf(stderr, "[spec_bind] publishStoredSpec: OK\n");
+    fflush(stderr);
     wingui_clear_last_error_internal();
     return 1;
 }
@@ -262,6 +347,7 @@ int32_t WINGUI_CALL runtimeSetup(SuperTerminalClientContext* ctx, void* user_dat
         runtime->active_context = ctx;
         runtime->running = true;
     }
+    g_spec_bind_active_runtime = runtime;
     return publishStoredSpec(runtime, ctx);
 }
 
@@ -354,6 +440,7 @@ void WINGUI_CALL runtimeShutdown(void* user_data) {
     std::lock_guard<std::mutex> lock(runtime->mutex);
     runtime->active_context = nullptr;
     runtime->running = false;
+    g_spec_bind_active_runtime = nullptr;
 }
 
 } // namespace
@@ -404,11 +491,22 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_load_spec_jso
         publish_json = runtime->spec_json;
     }
 
+    fprintf(stderr, "[spec_bind] load_spec_json: stored spec (len=%zu) active_ctx=%s\n",
+        publish_json.size(), active_context ? "yes" : "no (will publish on run)");
+    fflush(stderr);
+
     if (active_context) {
+        fprintf(stderr, "[spec_bind] load_spec_json: live publish/patch: %.300s%s\n",
+            publish_json.c_str(), publish_json.size() > 300 ? "..." : "");
+        fflush(stderr);
         if (!publishOrPatchSpec(active_context, previous_json, publish_json)) {
+            fprintf(stderr, "[spec_bind] load_spec_json: live publish/patch FAILED\n");
+            fflush(stderr);
             wingui_set_last_error_string_internal("wingui_spec_bind_runtime_load_spec_json: live publish/patch failed");
             return 0;
         }
+        fprintf(stderr, "[spec_bind] load_spec_json: live publish/patch OK\n");
+        fflush(stderr);
     }
 
     wingui_clear_last_error_internal();
@@ -1498,4 +1596,54 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_runtime_run(
 
     wingui_clear_last_error_internal();
     return super_terminal_run_hosted_app(&hosted, out_result);
+}
+
+// ---------------------------------------------------------------------------
+// Pane inbox public API
+// ---------------------------------------------------------------------------
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_post_pane_msg(
+    WinguiSpecBindRuntime* runtime,
+    SuperTerminalPaneId pane_id,
+    const char* kind_utf8,
+    const char* detail_utf8)
+{
+    if (!runtime || pane_id.value == 0) {
+        return 0;
+    }
+    PaneInbox* inbox = getOrCreateInbox(runtime, pane_id.value);
+    return inbox->post(kind_utf8, detail_utf8) ? 1 : 0;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_poll_pane_msg(
+    const WinguiSpecBindFrameView* frame_view,
+    SuperTerminalPaneId pane_id,
+    char* kind_out,
+    uint32_t kind_cap,
+    char* detail_out,
+    uint32_t detail_cap)
+{
+    if (!frame_view || !frame_view->ctx || pane_id.value == 0) {
+        return 0;
+    }
+    // Find runtime via frame_view context — locate runtime from active_context.
+    // We use a simple approach: search the frame_view's runtime field stored
+    // as user_data. The frame handler receives the runtime pointer as user_data
+    // via the callback, but the frame_view itself doesn't carry it.
+    // Instead, use a module-level accessor: the frame_view's context lets us
+    // reach the runtime through the stored pointer in runtimeOnFrame's closure.
+    // Practical approach: the pane inbox lookup only needs the runtime pointer.
+    // Since there is only one runtime per process in the NewCP design, we can
+    // use a global accessor similar to the Rust side.
+    // The runtime is stored in the active_context field at run start.
+    // We expose a simple global for this purpose.
+    WinguiSpecBindRuntime* runtime = g_spec_bind_active_runtime;
+    if (!runtime) {
+        return 0;
+    }
+    PaneInbox* inbox = findInbox(runtime, pane_id.value);
+    if (!inbox) {
+        return 0;
+    }
+    return inbox->poll(kind_out, kind_cap, detail_out, detail_cap) ? 1 : 0;
 }
