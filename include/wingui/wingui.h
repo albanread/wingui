@@ -669,6 +669,38 @@ typedef struct WinguiVectorPrimitive {
                     The arc opens symmetrically around the +Y axis after rotation.
    GLYPH            param0 = (uv_min_x, uv_min_y, uv_max_x, uv_max_y) */
 
+typedef enum WinguiSurfacePrimitiveKind {
+    WINGUI_SURFACE_FILL_RECT = 0,
+    WINGUI_SURFACE_STROKE_RECT = 1,
+    WINGUI_SURFACE_DRAW_LINE = 2,
+    WINGUI_SURFACE_FILL_ELLIPSE = 3,
+    WINGUI_SURFACE_STROKE_ELLIPSE = 4,
+    WINGUI_SURFACE_DRAW_ARC = 5,
+    WINGUI_SURFACE_DRAW_PATH = 6,
+} WinguiSurfacePrimitiveKind;
+
+enum {
+    WINGUI_SURFACE_PATH_CLOSED = 1u << 0,
+};
+
+typedef struct WinguiSurfacePrimitive {
+    float param0[4];
+    float param1[4];
+    float color[4];
+    uint32_t kind;        /* WinguiSurfacePrimitiveKind */
+    uint32_t flags;       /* WINGUI_SURFACE_PATH_* */
+    uint32_t point_offset;
+    uint32_t point_count;
+} WinguiSurfacePrimitive;
+/* Parameter encoding:
+   FILL_RECT       param0 = (x0, y0, x1, y1)                 param1.x = corner_radius
+   STROKE_RECT     param0 = (x0, y0, x1, y1)                 param1 = (corner_radius, half_thickness, _, _)
+   DRAW_LINE       param0 = (x0, y0, x1, y1)                 param1.x = half_thickness
+   FILL_ELLIPSE    param0 = (cx, cy, radius_x, radius_y)
+   STROKE_ELLIPSE  param0 = (cx, cy, radius_x, radius_y)     param1.x = half_thickness
+   DRAW_ARC        param0 = (cx, cy, radius, half_thickness) param1 = (rotation_rad, half_aperture_rad, _, _)
+   DRAW_PATH       point_offset/point_count index into a shared XY point array; param1.x = half_thickness */
+
 WINGUI_API int32_t WINGUI_CALL wingui_create_vector_renderer(
     WinguiContext* context,
     const char* shader_path_utf8,
@@ -731,6 +763,32 @@ WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_clear(
     float color_g,
     float color_b,
     float color_a);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_draw_text_utf8(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const char* font_family_utf8,
+    float font_size_pixels,
+    float dpi_scale,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    uint32_t blend_mode,
+    const float clip_rect_xyxy[4]);
+WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_draw_primitives(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const WinguiSurfacePrimitive* primitives,
+    uint32_t primitive_count,
+    const float* path_points_xy,
+    uint32_t path_point_count,
+    uint32_t blend_mode,
+    float offset_x,
+    float offset_y,
+    const float clip_rect_xyxy[4]);
 
 WINGUI_API int32_t WINGUI_CALL wingui_audio_init(void);
 WINGUI_API void WINGUI_CALL wingui_audio_shutdown(void);

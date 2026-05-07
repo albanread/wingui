@@ -376,6 +376,55 @@ WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_arc(
     float color_b,
     float color_a);
 
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_oval(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_oval(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float half_thickness,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_path(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const float* points_xy,
+    uint32_t point_count,
+    int32_t closed,
+    float half_thickness,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
 WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_text_utf8(
     const WinguiSpecBindFrameView* frame_view,
     WinguiSpecBindPaneRef pane,
@@ -390,6 +439,129 @@ WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_text_utf8(
     float color_g,
     float color_b,
     float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_mark_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    int32_t mode,
+    float x0,
+    float y0,
+    float x1,
+    float y1);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_caret(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_selection_range(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_focus_ring(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float half_thickness,
+    float corner_radius,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_push_clip_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    float x0,
+    float y0,
+    float x1,
+    float y1);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_pop_clip_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_push_offset(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    float dx,
+    float dy);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_pop_offset(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_reset_composition(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_install_child_view_bounds(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    int32_t child_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_measure_text_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float* out_width,
+    float* out_height,
+    uint32_t* out_char_count);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_char_index_at_point_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float x,
+    float y,
+    uint32_t* out_char_index);
+
+WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_point_at_char_index_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    uint32_t char_index,
+    float* out_x,
+    float* out_y);
 
 WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_indexed_fill_rect(
     const WinguiSpecBindFrameView* frame_view,

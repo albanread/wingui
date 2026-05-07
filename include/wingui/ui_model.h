@@ -413,6 +413,8 @@ std::string ui_rtf_from_markdown(std::string markdown);
 // Custom D3D surfaces
 UiNode ui_text_grid(int64_t columns, int64_t rows, std::string event_name = "");
 UiNode ui_text_grid(std::string id, int64_t columns, int64_t rows, std::string event_name = "", bool focused = false);
+UiNode ui_surface(int64_t width, int64_t height, std::string event_name = "");
+UiNode ui_surface(std::string id, int64_t width, int64_t height, std::string event_name = "", bool focused = false);
 UiNode ui_indexed_graphics(int64_t width, int64_t height, std::string event_name = "");
 UiNode ui_indexed_graphics(std::string id, int64_t width, int64_t height, std::string event_name = "", bool focused = false);
 UiNode ui_rgba_pane(int64_t width, int64_t height, std::string event_name = "");

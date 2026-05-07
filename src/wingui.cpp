@@ -16,8 +16,10 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <d2d1_1.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dwrite.h>
 #include <dxgi.h>
 #include <wincodec.h>
 
@@ -56,8 +58,13 @@ struct WinguiContext {
     UINT buffer_count = 2;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* device_context = nullptr;
+    IDXGIDevice* dxgi_device = nullptr;
     IDXGISwapChain* swap_chain = nullptr;
     ID3D11RenderTargetView* render_target_view = nullptr;
+    ID2D1Factory1* d2d_factory = nullptr;
+    ID2D1Device* d2d_device = nullptr;
+    ID2D1DeviceContext* d2d_device_context = nullptr;
+    IDWriteFactory* dwrite_factory = nullptr;
 };
 
 struct WinguiTextGridRenderer {
@@ -1471,6 +1478,59 @@ HRESULT createRenderTargetView(WinguiContext& context) {
     hr = context.device->CreateRenderTargetView(backbuffer, nullptr, &context.render_target_view);
     safeRelease(backbuffer);
     return hr;
+}
+
+void destroyDirect2DInterop(WinguiContext& context) {
+    safeRelease(context.dwrite_factory);
+    safeRelease(context.d2d_device_context);
+    safeRelease(context.d2d_device);
+    safeRelease(context.d2d_factory);
+    safeRelease(context.dxgi_device);
+}
+
+HRESULT createDirect2DInterop(WinguiContext& context) {
+    HRESULT hr = context.device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&context.dxgi_device));
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    D2D1_FACTORY_OPTIONS options{};
+#if defined(_DEBUG)
+    options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
+#endif
+
+    hr = D2D1CreateFactory(
+        D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        __uuidof(ID2D1Factory1),
+        &options,
+        reinterpret_cast<void**>(&context.d2d_factory));
+    if (FAILED(hr)) {
+        destroyDirect2DInterop(context);
+        return hr;
+    }
+
+    hr = context.d2d_factory->CreateDevice(context.dxgi_device, &context.d2d_device);
+    if (FAILED(hr)) {
+        destroyDirect2DInterop(context);
+        return hr;
+    }
+
+    hr = context.d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &context.d2d_device_context);
+    if (FAILED(hr)) {
+        destroyDirect2DInterop(context);
+        return hr;
+    }
+
+    hr = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(&context.dwrite_factory));
+    if (FAILED(hr)) {
+        destroyDirect2DInterop(context);
+        return hr;
+    }
+
+    return S_OK;
 }
 
 void destroyRenderTargetView(WinguiContext& context) {
@@ -4425,6 +4485,458 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_clear(
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_draw_text_utf8(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const char* font_family_utf8,
+    float font_size_pixels,
+    float dpi_scale,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a,
+    uint32_t blend_mode,
+    const float clip_rect_xyxy[4]) {
+    if (!surface || !surface->context || !surface->context->d2d_device_context || !surface->context->dwrite_factory) {
+        setLastErrorString("wingui_rgba_surface_draw_text_utf8: invalid arguments");
+        return 0;
+    }
+    if (!text_utf8) {
+        setLastErrorString("wingui_rgba_surface_draw_text_utf8: text_utf8 was null");
+        return 0;
+    }
+    if (!text_utf8[0]) {
+        g_last_error.clear();
+        return 1;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].texture) {
+        setLastErrorString("wingui_rgba_surface_draw_text_utf8: buffer not ready");
+        return 0;
+    }
+
+    WinguiContext* context = surface->context;
+    const float resolved_dpi_scale = dpi_scale > 0.0f ? dpi_scale : 1.0f;
+    const float resolved_font_size = font_size_pixels > 0.0f ? font_size_pixels : (16.0f * resolved_dpi_scale);
+    const std::wstring font_family = utf8ToWide(
+        font_family_utf8 && *font_family_utf8 ? font_family_utf8 : "Consolas");
+    const std::wstring wide_text = utf8ToWide(text_utf8);
+    if (wide_text.empty()) {
+        g_last_error.clear();
+        return 1;
+    }
+
+    IDXGISurface* dxgi_surface = nullptr;
+    ID2D1Bitmap1* target_bitmap = nullptr;
+    ID2D1Image* previous_target = nullptr;
+    ID2D1SolidColorBrush* brush = nullptr;
+    IDWriteTextFormat* format = nullptr;
+    IDWriteTextLayout* layout = nullptr;
+
+    HRESULT hr = surface->buffers[buffer_index].texture->QueryInterface(
+        __uuidof(IDXGISurface),
+        reinterpret_cast<void**>(&dxgi_surface));
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: QueryInterface(IDXGISurface) failed", hr);
+        return 0;
+    }
+
+    const float dpi = 96.0f * resolved_dpi_scale;
+    const D2D1_BITMAP_PROPERTIES1 bitmap_props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        dpi,
+        dpi);
+    hr = context->d2d_device_context->CreateBitmapFromDxgiSurface(dxgi_surface, &bitmap_props, &target_bitmap);
+    if (FAILED(hr)) {
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: CreateBitmapFromDxgiSurface failed", hr);
+        return 0;
+    }
+
+    hr = context->dwrite_factory->CreateTextFormat(
+        font_family.empty() ? L"Consolas" : font_family.c_str(),
+        nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        resolved_font_size,
+        L"en-us",
+        &format);
+    if (FAILED(hr)) {
+        safeRelease(target_bitmap);
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: CreateTextFormat failed", hr);
+        return 0;
+    }
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    hr = context->dwrite_factory->CreateTextLayout(
+        wide_text.c_str(),
+        static_cast<UINT32>(wide_text.size()),
+        format,
+        32768.0f,
+        32768.0f,
+        &layout);
+    if (FAILED(hr)) {
+        safeRelease(format);
+        safeRelease(target_bitmap);
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: CreateTextLayout failed", hr);
+        return 0;
+    }
+
+    hr = context->d2d_device_context->CreateSolidColorBrush(
+        D2D1::ColorF(color_r, color_g, color_b, color_a),
+        &brush);
+    if (FAILED(hr)) {
+        safeRelease(layout);
+        safeRelease(format);
+        safeRelease(target_bitmap);
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: CreateSolidColorBrush failed", hr);
+        return 0;
+    }
+
+    context->d2d_device_context->GetTarget(&previous_target);
+    context->d2d_device_context->SetTarget(target_bitmap);
+    context->d2d_device_context->SetPrimitiveBlend(
+        blend_mode == WINGUI_RGBA_BLIT_OPAQUE ? D2D1_PRIMITIVE_BLEND_COPY : D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+    context->d2d_device_context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    context->d2d_device_context->BeginDraw();
+    bool clip_pushed = false;
+    if (clip_rect_xyxy) {
+        const float left = std::min(clip_rect_xyxy[0], clip_rect_xyxy[2]);
+        const float top = std::min(clip_rect_xyxy[1], clip_rect_xyxy[3]);
+        const float right = std::max(clip_rect_xyxy[0], clip_rect_xyxy[2]);
+        const float bottom = std::max(clip_rect_xyxy[1], clip_rect_xyxy[3]);
+        if (right <= left || bottom <= top) {
+            hr = context->d2d_device_context->EndDraw();
+            context->d2d_device_context->SetTarget(previous_target);
+            context->d2d_device_context->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            safeRelease(brush);
+            safeRelease(layout);
+            safeRelease(format);
+            safeRelease(previous_target);
+            safeRelease(target_bitmap);
+            safeRelease(dxgi_surface);
+            g_last_error.clear();
+            return SUCCEEDED(hr) ? 1 : 0;
+        }
+        context->d2d_device_context->PushAxisAlignedClip(D2D1::RectF(left, top, right, bottom), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        clip_pushed = true;
+    }
+    context->d2d_device_context->DrawTextLayout(
+        D2D1::Point2F(origin_x, origin_y),
+        layout,
+        brush,
+        D2D1_DRAW_TEXT_OPTIONS_NO_SNAP);
+    if (clip_pushed) {
+        context->d2d_device_context->PopAxisAlignedClip();
+    }
+    hr = context->d2d_device_context->EndDraw();
+    context->d2d_device_context->SetTarget(previous_target);
+    context->d2d_device_context->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+
+    safeRelease(brush);
+    safeRelease(layout);
+    safeRelease(format);
+    safeRelease(previous_target);
+    safeRelease(target_bitmap);
+    safeRelease(dxgi_surface);
+
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_rgba_surface_draw_text_utf8: EndDraw failed", hr);
+        return 0;
+    }
+
+    g_last_error.clear();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_rgba_surface_draw_primitives(
+    WinguiRgbaSurface* surface,
+    uint32_t buffer_index,
+    const WinguiSurfacePrimitive* primitives,
+    uint32_t primitive_count,
+    const float* path_points_xy,
+    uint32_t path_point_count,
+    uint32_t blend_mode,
+    float offset_x,
+    float offset_y,
+    const float clip_rect_xyxy[4]) {
+    if (!surface || !surface->context || !surface->context->d2d_device_context || !surface->context->d2d_factory) {
+        setLastErrorString("wingui_rgba_surface_draw_primitives: invalid arguments");
+        return 0;
+    }
+    if (primitive_count > 0 && !primitives) {
+        setLastErrorString("wingui_rgba_surface_draw_primitives: primitives was null");
+        return 0;
+    }
+    if (path_point_count > 0 && !path_points_xy) {
+        setLastErrorString("wingui_rgba_surface_draw_primitives: path_points_xy was null");
+        return 0;
+    }
+    if (primitive_count == 0) {
+        g_last_error.clear();
+        return 1;
+    }
+    if (buffer_index >= surface->buffers.size() || !surface->buffers[buffer_index].texture) {
+        setLastErrorString("wingui_rgba_surface_draw_primitives: buffer not ready");
+        return 0;
+    }
+
+    constexpr float kHalfPi = 1.57079632679489661923f;
+    constexpr float kPi = 3.14159265358979323846f;
+
+    WinguiContext* context = surface->context;
+    IDXGISurface* dxgi_surface = nullptr;
+    ID2D1Bitmap1* target_bitmap = nullptr;
+    ID2D1Image* previous_target = nullptr;
+    ID2D1SolidColorBrush* brush = nullptr;
+
+    HRESULT hr = surface->buffers[buffer_index].texture->QueryInterface(
+        __uuidof(IDXGISurface),
+        reinterpret_cast<void**>(&dxgi_surface));
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_rgba_surface_draw_primitives: QueryInterface(IDXGISurface) failed", hr);
+        return 0;
+    }
+
+    const D2D1_BITMAP_PROPERTIES1 bitmap_props = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f,
+        96.0f);
+    hr = context->d2d_device_context->CreateBitmapFromDxgiSurface(dxgi_surface, &bitmap_props, &target_bitmap);
+    if (FAILED(hr)) {
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_primitives: CreateBitmapFromDxgiSurface failed", hr);
+        return 0;
+    }
+
+    hr = context->d2d_device_context->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &brush);
+    if (FAILED(hr)) {
+        safeRelease(target_bitmap);
+        safeRelease(dxgi_surface);
+        setLastErrorHresult("wingui_rgba_surface_draw_primitives: CreateSolidColorBrush failed", hr);
+        return 0;
+    }
+
+    context->d2d_device_context->GetTarget(&previous_target);
+    context->d2d_device_context->SetTarget(target_bitmap);
+    context->d2d_device_context->SetPrimitiveBlend(
+        blend_mode == WINGUI_RGBA_BLIT_OPAQUE ? D2D1_PRIMITIVE_BLEND_COPY : D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+    context->d2d_device_context->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    context->d2d_device_context->BeginDraw();
+    bool clip_pushed = false;
+    if (clip_rect_xyxy) {
+        const float left = std::min(clip_rect_xyxy[0], clip_rect_xyxy[2]);
+        const float top = std::min(clip_rect_xyxy[1], clip_rect_xyxy[3]);
+        const float right = std::max(clip_rect_xyxy[0], clip_rect_xyxy[2]);
+        const float bottom = std::max(clip_rect_xyxy[1], clip_rect_xyxy[3]);
+        if (right <= left || bottom <= top) {
+            hr = context->d2d_device_context->EndDraw();
+            context->d2d_device_context->SetTarget(previous_target);
+            context->d2d_device_context->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            safeRelease(brush);
+            safeRelease(previous_target);
+            safeRelease(target_bitmap);
+            safeRelease(dxgi_surface);
+            g_last_error.clear();
+            return SUCCEEDED(hr) ? 1 : 0;
+        }
+        context->d2d_device_context->PushAxisAlignedClip(D2D1::RectF(left, top, right, bottom), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        clip_pushed = true;
+    }
+
+    bool invalid_primitive = false;
+    for (uint32_t index = 0; index < primitive_count; ++index) {
+        const WinguiSurfacePrimitive& primitive = primitives[index];
+        brush->SetColor(D2D1::ColorF(
+            primitive.color[0],
+            primitive.color[1],
+            primitive.color[2],
+            primitive.color[3]));
+
+        switch (primitive.kind) {
+            case WINGUI_SURFACE_FILL_RECT: {
+                const float left = std::min(primitive.param0[0], primitive.param0[2]) + offset_x;
+                const float top = std::min(primitive.param0[1], primitive.param0[3]) + offset_y;
+                const float right = std::max(primitive.param0[0], primitive.param0[2]) + offset_x;
+                const float bottom = std::max(primitive.param0[1], primitive.param0[3]) + offset_y;
+                const float radius = std::max(primitive.param1[0], 0.0f);
+                const D2D1_ROUNDED_RECT rect = D2D1::RoundedRect(D2D1::RectF(left, top, right, bottom), radius, radius);
+                if (radius > 0.0f) context->d2d_device_context->FillRoundedRectangle(rect, brush);
+                else context->d2d_device_context->FillRectangle(rect.rect, brush);
+                break;
+            }
+            case WINGUI_SURFACE_STROKE_RECT: {
+                const float left = std::min(primitive.param0[0], primitive.param0[2]) + offset_x;
+                const float top = std::min(primitive.param0[1], primitive.param0[3]) + offset_y;
+                const float right = std::max(primitive.param0[0], primitive.param0[2]) + offset_x;
+                const float bottom = std::max(primitive.param0[1], primitive.param0[3]) + offset_y;
+                const float radius = std::max(primitive.param1[0], 0.0f);
+                const float stroke_width = std::max(primitive.param1[1] * 2.0f, 0.001f);
+                const D2D1_ROUNDED_RECT rect = D2D1::RoundedRect(D2D1::RectF(left, top, right, bottom), radius, radius);
+                if (radius > 0.0f) context->d2d_device_context->DrawRoundedRectangle(rect, brush, stroke_width);
+                else context->d2d_device_context->DrawRectangle(rect.rect, brush, stroke_width);
+                break;
+            }
+            case WINGUI_SURFACE_DRAW_LINE: {
+                const float stroke_width = std::max(primitive.param1[0] * 2.0f, 0.001f);
+                context->d2d_device_context->DrawLine(
+                    D2D1::Point2F(primitive.param0[0] + offset_x, primitive.param0[1] + offset_y),
+                    D2D1::Point2F(primitive.param0[2] + offset_x, primitive.param0[3] + offset_y),
+                    brush,
+                    stroke_width);
+                break;
+            }
+            case WINGUI_SURFACE_FILL_ELLIPSE: {
+                const D2D1_ELLIPSE ellipse = D2D1::Ellipse(
+                    D2D1::Point2F(primitive.param0[0] + offset_x, primitive.param0[1] + offset_y),
+                    std::max(primitive.param0[2], 0.0f),
+                    std::max(primitive.param0[3], 0.0f));
+                context->d2d_device_context->FillEllipse(ellipse, brush);
+                break;
+            }
+            case WINGUI_SURFACE_STROKE_ELLIPSE: {
+                const float stroke_width = std::max(primitive.param1[0] * 2.0f, 0.001f);
+                const D2D1_ELLIPSE ellipse = D2D1::Ellipse(
+                    D2D1::Point2F(primitive.param0[0] + offset_x, primitive.param0[1] + offset_y),
+                    std::max(primitive.param0[2], 0.0f),
+                    std::max(primitive.param0[3], 0.0f));
+                context->d2d_device_context->DrawEllipse(ellipse, brush, stroke_width);
+                break;
+            }
+            case WINGUI_SURFACE_DRAW_ARC: {
+                ID2D1PathGeometry* geometry = nullptr;
+                ID2D1GeometrySink* sink = nullptr;
+                const float center_x = primitive.param0[0] + offset_x;
+                const float center_y = primitive.param0[1] + offset_y;
+                const float radius = std::max(primitive.param0[2], 0.0f);
+                const float stroke_width = std::max(primitive.param0[3] * 2.0f, 0.001f);
+                const float center_angle = primitive.param1[0] + kHalfPi;
+                const float start_angle = center_angle - primitive.param1[1];
+                const float end_angle = center_angle + primitive.param1[1];
+                const D2D1_POINT_2F start_point = D2D1::Point2F(
+                    center_x + std::cos(start_angle) * radius,
+                    center_y + std::sin(start_angle) * radius);
+                const D2D1_POINT_2F end_point = D2D1::Point2F(
+                    center_x + std::cos(end_angle) * radius,
+                    center_y + std::sin(end_angle) * radius);
+                hr = context->d2d_factory->CreatePathGeometry(&geometry);
+                if (SUCCEEDED(hr)) hr = geometry->Open(&sink);
+                if (FAILED(hr)) {
+                    safeRelease(sink);
+                    safeRelease(geometry);
+                    invalid_primitive = true;
+                    break;
+                }
+                sink->BeginFigure(start_point, D2D1_FIGURE_BEGIN_HOLLOW);
+                D2D1_ARC_SEGMENT segment{};
+                segment.point = end_point;
+                segment.size = D2D1::SizeF(radius, radius);
+                segment.rotationAngle = 0.0f;
+                segment.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+                segment.arcSize = primitive.param1[1] > (kPi * 0.5f) ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL;
+                sink->AddArc(segment);
+                sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                hr = sink->Close();
+                safeRelease(sink);
+                if (FAILED(hr)) {
+                    safeRelease(geometry);
+                    invalid_primitive = true;
+                    break;
+                }
+                context->d2d_device_context->DrawGeometry(geometry, brush, stroke_width);
+                safeRelease(geometry);
+                break;
+            }
+            case WINGUI_SURFACE_DRAW_PATH: {
+                if (primitive.point_count < 2 || primitive.point_offset + primitive.point_count > path_point_count) {
+                    invalid_primitive = true;
+                    break;
+                }
+                ID2D1PathGeometry* geometry = nullptr;
+                ID2D1GeometrySink* sink = nullptr;
+                hr = context->d2d_factory->CreatePathGeometry(&geometry);
+                if (SUCCEEDED(hr)) hr = geometry->Open(&sink);
+                if (FAILED(hr)) {
+                    safeRelease(sink);
+                    safeRelease(geometry);
+                    invalid_primitive = true;
+                    break;
+                }
+                const uint32_t start = primitive.point_offset;
+                sink->BeginFigure(
+                    D2D1::Point2F(path_points_xy[start * 2u] + offset_x, path_points_xy[start * 2u + 1u] + offset_y),
+                    D2D1_FIGURE_BEGIN_HOLLOW);
+                for (uint32_t point_index = 1; point_index < primitive.point_count; ++point_index) {
+                    const uint32_t point = start + point_index;
+                    sink->AddLine(D2D1::Point2F(path_points_xy[point * 2u] + offset_x, path_points_xy[point * 2u + 1u] + offset_y));
+                }
+                sink->EndFigure((primitive.flags & WINGUI_SURFACE_PATH_CLOSED) ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+                hr = sink->Close();
+                safeRelease(sink);
+                if (FAILED(hr)) {
+                    safeRelease(geometry);
+                    invalid_primitive = true;
+                    break;
+                }
+                context->d2d_device_context->DrawGeometry(
+                    geometry,
+                    brush,
+                    std::max(primitive.param1[0] * 2.0f, 0.001f));
+                safeRelease(geometry);
+                break;
+            }
+            default:
+                invalid_primitive = true;
+                break;
+        }
+
+        if (invalid_primitive) {
+            if (clip_pushed) {
+                context->d2d_device_context->PopAxisAlignedClip();
+            }
+            context->d2d_device_context->SetTarget(previous_target);
+            context->d2d_device_context->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            context->d2d_device_context->EndDraw();
+            safeRelease(brush);
+            safeRelease(previous_target);
+            safeRelease(target_bitmap);
+            safeRelease(dxgi_surface);
+            setLastErrorString("wingui_rgba_surface_draw_primitives: invalid primitive payload");
+            return 0;
+        }
+    }
+
+    if (clip_pushed) {
+        context->d2d_device_context->PopAxisAlignedClip();
+    }
+    hr = context->d2d_device_context->EndDraw();
+    context->d2d_device_context->SetTarget(previous_target);
+    context->d2d_device_context->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+
+    safeRelease(brush);
+    safeRelease(previous_target);
+    safeRelease(target_bitmap);
+    safeRelease(dxgi_surface);
+
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_rgba_surface_draw_primitives: EndDraw failed", hr);
+        return 0;
+    }
+
+    g_last_error.clear();
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // Indexed fill renderer (compute-shader rect fill into R8_UINT surfaces)
 // ---------------------------------------------------------------------------
@@ -4686,6 +5198,9 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiCont
     swap_desc.SwapEffect = is_child_window ? DXGI_SWAP_EFFECT_SEQUENTIAL : DXGI_SWAP_EFFECT_DISCARD;
 
     UINT flags = 0;
+#if !defined(WINGUI_DISABLE_D2D_INTEROP)
+    flags |= D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#endif
 #if defined(_DEBUG)
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -4724,6 +5239,13 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiCont
         return 0;
     }
 
+    hr = createDirect2DInterop(*context);
+    if (FAILED(hr)) {
+        setLastErrorHresult("wingui_create_context: Direct2D/DirectWrite init failed", hr);
+        wingui_destroy_context(context);
+        return 0;
+    }
+
     *out_context = context;
     g_last_error.clear();
     return 1;
@@ -4732,6 +5254,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_create_context(const WinguiCont
 extern "C" WINGUI_API void WINGUI_CALL wingui_destroy_context(WinguiContext* context) {
     if (!context) return;
     destroyRenderTargetView(*context);
+    destroyDirect2DInterop(*context);
     safeRelease(context->swap_chain);
     safeRelease(context->device_context);
     safeRelease(context->device);

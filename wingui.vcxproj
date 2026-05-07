@@ -62,7 +62,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;winmm.lib;Comctl32.lib;Msimg32.lib;Ole32.lib;user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;winmm.lib;Comctl32.lib;Msimg32.lib;Ole32.lib;user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)wingui.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -85,7 +85,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;winmm.lib;Comctl32.lib;Msimg32.lib;Ole32.lib;user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d2d1.lib;dwrite.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;windowscodecs.lib;winmm.lib;Comctl32.lib;Msimg32.lib;Ole32.lib;user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)wingui.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>

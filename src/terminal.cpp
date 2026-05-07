@@ -118,6 +118,26 @@ struct TerminalSurface {
     std::vector<TerminalCell> cells;
 };
 
+struct SurfaceClipState {
+    bool active = false;
+    float x0 = 0.0f;
+    float y0 = 0.0f;
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+};
+
+struct SurfaceOffsetState {
+    float dx = 0.0f;
+    float dy = 0.0f;
+};
+
+struct SurfaceChildViewBounds {
+    float x0 = 0.0f;
+    float y0 = 0.0f;
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+};
+
 struct BufferedTerminalSurface {
     TerminalSurface buffers[2];
 };
@@ -126,6 +146,7 @@ enum PaneRenderKind : uint32_t {
     PANE_RENDER_TEXT_GRID = 0,
     PANE_RENDER_INDEXED = 1,
     PANE_RENDER_RGBA = 2,
+    PANE_RENDER_SURFACE = 3,
 };
 
 /* One entry in a per-pane sprite bank. Mirrors WinguiSpriteAtlasEntry plus
@@ -201,10 +222,71 @@ struct RegisteredPane {
     void* rgba_hwnd = nullptr;
     WinguiContext* rgba_context = nullptr;
     WinguiRgbaPaneRenderer* pane_rgba_renderer = nullptr;
+    WinguiRgbaSurface* surface_surface_handle = nullptr;
+    uint32_t surface_content_buffer_mode = SUPERTERMINAL_RGBA_CONTENT_BUFFER_FRAME;
+    uint32_t surface_buffer_count = 0;
+    uint32_t surface_screen_width = 0;
+    uint32_t surface_screen_height = 0;
+    uint32_t surface_pixel_aspect_num = 1;
+    uint32_t surface_pixel_aspect_den = 1;
+    void* surface_hwnd = nullptr;
+    WinguiContext* surface_context = nullptr;
+    WinguiRgbaPaneRenderer* pane_surface_renderer = nullptr;
     WinguiVectorRenderer* pane_vector_renderer = nullptr;
     int32_t pane_vector_renderer_atlas_set = 0;
+    bool surface_clear_pending[2]{true, true};
+    std::vector<SurfaceClipState> surface_clip_stack;
+    std::vector<SurfaceOffsetState> surface_offset_stack;
+    std::unordered_map<int32_t, SurfaceChildViewBounds> surface_child_view_bounds;
     std::vector<SpriteBankEntry> sprite_bank;
 };
+
+SurfaceClipState normalizeSurfaceClip(SurfaceClipState clip) {
+    if (!clip.active) return clip;
+    if (clip.x0 > clip.x1) std::swap(clip.x0, clip.x1);
+    if (clip.y0 > clip.y1) std::swap(clip.y0, clip.y1);
+    return clip;
+}
+
+SurfaceClipState intersectSurfaceClips(SurfaceClipState a, SurfaceClipState b) {
+    if (!a.active) return normalizeSurfaceClip(b);
+    if (!b.active) return normalizeSurfaceClip(a);
+    a = normalizeSurfaceClip(a);
+    b = normalizeSurfaceClip(b);
+    SurfaceClipState result{};
+    result.active = true;
+    result.x0 = std::max(a.x0, b.x0);
+    result.y0 = std::max(a.y0, b.y0);
+    result.x1 = std::min(a.x1, b.x1);
+    result.y1 = std::min(a.y1, b.y1);
+    return result;
+}
+
+bool surfaceClipHasArea(const SurfaceClipState& clip) {
+    return !clip.active || (clip.x1 > clip.x0 && clip.y1 > clip.y0);
+}
+
+void resetSurfaceCompositionState(RegisteredPane& pane) {
+    pane.surface_clip_stack.clear();
+    pane.surface_clip_stack.push_back(SurfaceClipState{});
+    pane.surface_offset_stack.clear();
+    pane.surface_offset_stack.push_back(SurfaceOffsetState{});
+    pane.surface_child_view_bounds.clear();
+}
+
+void ensureSurfaceCompositionState(RegisteredPane& pane) {
+    if (pane.surface_clip_stack.empty() || pane.surface_offset_stack.empty()) {
+        resetSurfaceCompositionState(pane);
+    }
+}
+
+SurfaceClipState currentSurfaceClip(const RegisteredPane& pane) {
+    return pane.surface_clip_stack.empty() ? SurfaceClipState{} : pane.surface_clip_stack.back();
+}
+
+SurfaceOffsetState currentSurfaceOffset(const RegisteredPane& pane) {
+    return pane.surface_offset_stack.empty() ? SurfaceOffsetState{} : pane.surface_offset_stack.back();
+}
 
 template <typename T>
 struct RingQueue {
@@ -441,8 +523,13 @@ RegisteredPane* registeredPaneForIdLocked(SuperTerminalRuntimeHost* host, SuperT
     return create_if_missing ? ensureRegisteredPaneLocked(host, pane_id) : findRegisteredPaneLocked(host, pane_id);
 }
 
+bool paneRenderKindUsesRgbaPresenter(uint32_t render_kind) {
+    return render_kind == PANE_RENDER_RGBA;
+}
+
 uint32_t paneRenderKindForNodeType(const char* node_type_utf8) {
     if (!node_type_utf8 || !*node_type_utf8) return PANE_RENDER_TEXT_GRID;
+    if (std::strcmp(node_type_utf8, "surface") == 0) return PANE_RENDER_SURFACE;
     if (std::strcmp(node_type_utf8, "rgba-pane") == 0) return PANE_RENDER_RGBA;
     if (std::strcmp(node_type_utf8, "indexed-graphics") == 0) return PANE_RENDER_INDEXED;
     return PANE_RENDER_TEXT_GRID;
@@ -528,6 +615,24 @@ bool copyPaneLayoutFromCache(SuperTerminalRuntimeHost* host, SuperTerminalPaneId
     if (!pane) return false;
     *out_layout = pane->layout;
     return pane->layout.width > 0 && pane->layout.height > 0;
+}
+
+bool copySurfaceChildViewBoundsFromCache(
+    SuperTerminalRuntimeHost* host,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    SuperTerminalChildViewBounds* out_bounds) {
+    if (!host || !out_bounds || pane_id.value == 0) return false;
+    std::lock_guard<std::mutex> lock(host->pane_mutex);
+    RegisteredPane* pane = findRegisteredPaneLocked(host, pane_id);
+    if (!pane || pane->render_kind != PANE_RENDER_SURFACE) return false;
+    const auto it = pane->surface_child_view_bounds.find(child_id);
+    if (it == pane->surface_child_view_bounds.end()) return false;
+    out_bounds->x0 = it->second.x0;
+    out_bounds->y0 = it->second.y0;
+    out_bounds->x1 = it->second.x1;
+    out_bounds->y1 = it->second.y1;
+    return true;
 }
 
 bool resolvePaneLayout(SuperTerminalRuntimeHost* host, SuperTerminalPaneId pane_id, SuperTerminalPaneLayout* out_layout) {
@@ -1095,10 +1200,6 @@ bool renderIndexedPane(SuperTerminalRuntimeHost* host,
 }
 
 void destroyPaneRgbaPresenter(RegisteredPane& pane) {
-    if (pane.pane_vector_renderer) {
-        wingui_destroy_vector_renderer(pane.pane_vector_renderer);
-        pane.pane_vector_renderer = nullptr;
-    }
     if (pane.pane_rgba_renderer) {
         wingui_destroy_rgba_pane_renderer(pane.pane_rgba_renderer);
         pane.pane_rgba_renderer = nullptr;
@@ -1113,7 +1214,31 @@ void destroyPaneRgbaPresenter(RegisteredPane& pane) {
     }
     pane.rgba_hwnd = nullptr;
     pane.rgba_surface_buffer_count = 0;
+}
+
+void destroyPaneSurfacePresenter(RegisteredPane& pane) {
+    if (pane.pane_vector_renderer) {
+        wingui_destroy_vector_renderer(pane.pane_vector_renderer);
+        pane.pane_vector_renderer = nullptr;
+    }
+    if (pane.pane_surface_renderer) {
+        wingui_destroy_rgba_pane_renderer(pane.pane_surface_renderer);
+        pane.pane_surface_renderer = nullptr;
+    }
+    if (pane.surface_surface_handle) {
+        wingui_destroy_rgba_surface(pane.surface_surface_handle);
+        pane.surface_surface_handle = nullptr;
+    }
+    if (pane.surface_context) {
+        wingui_destroy_context(pane.surface_context);
+        pane.surface_context = nullptr;
+    }
+    pane.surface_hwnd = nullptr;
+    pane.surface_buffer_count = 0;
     pane.pane_vector_renderer_atlas_set = 0;
+    pane.surface_clear_pending[0] = true;
+    pane.surface_clear_pending[1] = true;
+    resetSurfaceCompositionState(pane);
 }
 
 void destroyPaneTextGridPresenter(RegisteredPane& pane) {
@@ -1300,6 +1425,9 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
     const int32_t target_height = std::max(layout.height, 1);
     const uint32_t required_surface_buffer_count =
         pane.rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 1u : 2u;
+    const bool size_changed =
+        pane.rgba_screen_width != static_cast<uint32_t>(target_width) ||
+        pane.rgba_screen_height != static_cast<uint32_t>(target_height);
     if (pane.rgba_hwnd != node_hwnd_raw || !pane.rgba_context || !pane.pane_rgba_renderer ||
         !pane.rgba_surface_handle || !pane.pane_vector_renderer ||
         pane.rgba_surface_buffer_count != required_surface_buffer_count) {
@@ -1354,6 +1482,8 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
 
         pane.rgba_hwnd = node_hwnd_raw;
         pane.rgba_surface_buffer_count = required_surface_buffer_count;
+        pane.surface_clear_pending[0] = true;
+        pane.surface_clear_pending[1] = true;
     }
 
     if (pane.pane_vector_renderer && !pane.pane_vector_renderer_atlas_set && host->atlas.pixels_rgba) {
@@ -1379,10 +1509,124 @@ bool ensurePaneRgbaPresenter(SuperTerminalRuntimeHost* host,
                       static_cast<unsigned>(pane.rgba_surface_buffer_count));
         traceNativePatchEvent(buffer);
     }
-    return wingui_rgba_surface_ensure_buffers(
+    const bool ensured = wingui_rgba_surface_ensure_buffers(
         pane.rgba_surface_handle,
         pane.rgba_screen_width,
         pane.rgba_screen_height) != 0;
+    if (ensured && (size_changed || pane.render_kind == PANE_RENDER_SURFACE)) {
+        pane.surface_clear_pending[0] = true;
+        pane.surface_clear_pending[1] = true;
+    }
+    return ensured;
+}
+
+bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
+                                RegisteredPane& pane,
+                                const SuperTerminalPaneLayout& layout) {
+    if (!host || pane.node_id.empty() || layout.width <= 0 || layout.height <= 0) return false;
+
+    void* node_hwnd_raw = nullptr;
+    if (!wingui_native_session_try_get_node_hwnd(host->native_session, pane.node_id.c_str(), &node_hwnd_raw) || !node_hwnd_raw) {
+        return false;
+    }
+
+    const int32_t target_width = std::max(layout.width, 1);
+    const int32_t target_height = std::max(layout.height, 1);
+    const uint32_t required_surface_buffer_count =
+        pane.surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 1u : 2u;
+    const bool size_changed =
+        pane.surface_screen_width != static_cast<uint32_t>(target_width) ||
+        pane.surface_screen_height != static_cast<uint32_t>(target_height);
+    if (pane.surface_hwnd != node_hwnd_raw || !pane.surface_context || !pane.pane_surface_renderer ||
+        !pane.surface_surface_handle || !pane.pane_vector_renderer ||
+        pane.surface_buffer_count != required_surface_buffer_count) {
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            char buffer[512];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "attach-surface-presenter id=%s hwnd=%p old_hwnd=%p w=%d h=%d buffers=%u mode=%u",
+                          pane.node_id.c_str(),
+                          node_hwnd_raw,
+                          pane.surface_hwnd,
+                          static_cast<int>(target_width),
+                          static_cast<int>(target_height),
+                          static_cast<unsigned>(required_surface_buffer_count),
+                          static_cast<unsigned>(pane.surface_content_buffer_mode));
+            traceNativePatchEvent(buffer);
+        }
+        destroyPaneSurfacePresenter(pane);
+
+        WinguiContextDesc context_desc{};
+        context_desc.hwnd = node_hwnd_raw;
+        context_desc.width = static_cast<uint32_t>(target_width);
+        context_desc.height = static_cast<uint32_t>(target_height);
+        context_desc.buffer_count = 2;
+        context_desc.vsync_interval = 1;
+        if (!wingui_create_context(&context_desc, &pane.surface_context)) {
+            destroyPaneSurfacePresenter(pane);
+            return false;
+        }
+
+        WinguiRgbaPaneRendererDesc rgba_desc{};
+        rgba_desc.context = pane.surface_context;
+        rgba_desc.shader_path_utf8 = kDefaultGraphicsShaderPath;
+        rgba_desc.buffer_count = 2;
+        if (!wingui_create_rgba_pane_renderer(&rgba_desc, &pane.pane_surface_renderer)) {
+            destroyPaneSurfacePresenter(pane);
+            return false;
+        }
+
+        if (!wingui_create_rgba_surface(pane.surface_context, required_surface_buffer_count, &pane.surface_surface_handle)) {
+            destroyPaneSurfacePresenter(pane);
+            return false;
+        }
+
+        if (!wingui_create_vector_renderer(pane.surface_context, nullptr, &pane.pane_vector_renderer)) {
+            destroyPaneSurfacePresenter(pane);
+            return false;
+        }
+        if (host->atlas.pixels_rgba && wingui_vector_renderer_set_glyph_atlas(pane.pane_vector_renderer, &host->atlas)) {
+            pane.pane_vector_renderer_atlas_set = 1;
+        }
+
+        pane.surface_hwnd = node_hwnd_raw;
+        pane.surface_buffer_count = required_surface_buffer_count;
+        pane.surface_clear_pending[0] = true;
+        pane.surface_clear_pending[1] = true;
+    }
+
+    if (pane.pane_vector_renderer && !pane.pane_vector_renderer_atlas_set && host->atlas.pixels_rgba) {
+        if (wingui_vector_renderer_set_glyph_atlas(pane.pane_vector_renderer, &host->atlas)) {
+            pane.pane_vector_renderer_atlas_set = 1;
+        }
+    }
+
+    wingui_resize_context(pane.surface_context, static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height));
+    pane.surface_screen_width = static_cast<uint32_t>(target_width);
+    pane.surface_screen_height = static_cast<uint32_t>(target_height);
+    pane.surface_pixel_aspect_num = pane.surface_pixel_aspect_num ? pane.surface_pixel_aspect_num : 1u;
+    pane.surface_pixel_aspect_den = pane.surface_pixel_aspect_den ? pane.surface_pixel_aspect_den : 1u;
+    if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        char buffer[256];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "resize-surface-context id=%s hwnd=%p w=%d h=%d buffers=%u",
+                      pane.node_id.c_str(),
+                      pane.surface_hwnd,
+                      static_cast<int>(target_width),
+                      static_cast<int>(target_height),
+                      static_cast<unsigned>(pane.surface_buffer_count));
+        traceNativePatchEvent(buffer);
+    }
+    const bool ensured = wingui_rgba_surface_ensure_buffers(
+        pane.surface_surface_handle,
+        pane.surface_screen_width,
+        pane.surface_screen_height) != 0;
+    if (ensured && size_changed) {
+        pane.surface_clear_pending[0] = true;
+        pane.surface_clear_pending[1] = true;
+    }
+    return ensured;
 }
 
 void resizeHostWindowToNativeContent(SuperTerminalRuntimeHost* host) {
@@ -1460,6 +1704,10 @@ bool renderRgbaPane(SuperTerminalRuntimeHost* host,
     if (!ensurePaneRgbaPresenter(host, pane, layout)) return true;
     const uint32_t pane_buffer_index =
         pane.rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (buffer_index & 1u);
+    if (pane.render_kind == PANE_RENDER_SURFACE && pane.surface_clear_pending[pane_buffer_index & 1u]) {
+        wingui_rgba_surface_clear(pane.rgba_surface_handle, pane_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
+        pane.surface_clear_pending[pane_buffer_index & 1u] = false;
+    }
     if (!wingui_begin_frame(pane.rgba_context, 0.0f, 0.0f, 0.0f, 1.0f)) return false;
     const bool ok = wingui_rgba_surface_render(
         pane.pane_rgba_renderer,
@@ -1476,6 +1724,36 @@ bool renderRgbaPane(SuperTerminalRuntimeHost* host,
         nullptr) != 0;
     if (!ok) return false;
     return wingui_present(pane.rgba_context, 1) != 0;
+}
+
+bool renderSurfacePane(SuperTerminalRuntimeHost* host,
+                       RegisteredPane& pane,
+                       const SuperTerminalPaneLayout& layout,
+                       uint32_t buffer_index) {
+    if (layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
+    if (!ensurePaneSurfacePresenter(host, pane, layout)) return true;
+    const uint32_t pane_buffer_index =
+        pane.surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (buffer_index & 1u);
+    if (pane.surface_clear_pending[pane_buffer_index & 1u]) {
+        wingui_rgba_surface_clear(pane.surface_surface_handle, pane_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
+        pane.surface_clear_pending[pane_buffer_index & 1u] = false;
+    }
+    if (!wingui_begin_frame(pane.surface_context, 0.0f, 0.0f, 0.0f, 1.0f)) return false;
+    const bool ok = wingui_rgba_surface_render(
+        pane.pane_surface_renderer,
+        pane.surface_surface_handle,
+        0,
+        0,
+        layout.width,
+        layout.height,
+        pane.surface_screen_width,
+        pane.surface_screen_height,
+        pane.surface_pixel_aspect_num,
+        pane.surface_pixel_aspect_den,
+        pane_buffer_index,
+        nullptr) != 0;
+    if (!ok) return false;
+    return wingui_present(pane.surface_context, 1) != 0;
 }
 
 bool renderSurface(SuperTerminalRuntimeHost* host) {
@@ -1533,16 +1811,24 @@ bool renderSurface(SuperTerminalRuntimeHost* host) {
             continue;
         }
 
-        if (render_kind == PANE_RENDER_RGBA) {
-            bool has_handle = false;
+        if (render_kind == PANE_RENDER_SURFACE) {
             bool ok = true;
             {
                 std::lock_guard<std::mutex> lock(host->pane_mutex);
                 if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
-                    has_handle = pane->rgba_surface_handle != nullptr;
-                    if (has_handle) {
-                        ok = renderRgbaPane(host, *pane, layout, display_buffer_index);
-                    }
+                    ok = renderSurfacePane(host, *pane, layout, display_buffer_index);
+                }
+            }
+            if (!ok) return false;
+            continue;
+        }
+
+        if (paneRenderKindUsesRgbaPresenter(render_kind)) {
+            bool ok = true;
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, pane_id, false)) {
+                    ok = renderRgbaPane(host, *pane, layout, display_buffer_index);
                 }
             }
             if (!ok) return false;
@@ -1688,6 +1974,22 @@ SuperTerminalWindowId commandWindowId(const SuperTerminalCommand& command) {
             return command.data.indexed_fill_rect.window_id;
         case SUPERTERMINAL_CMD_INDEXED_DRAW_LINE:
             return command.data.indexed_draw_line.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_DRAW_TEXT_OWNED:
+            return command.data.surface_draw_text_owned.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_DRAW_PRIMITIVES_OWNED:
+            return command.data.surface_draw_primitives_owned.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_PUSH_CLIP_RECT:
+            return command.data.surface_push_clip_rect.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_POP_CLIP_RECT:
+            return command.data.surface_pop_clip_rect.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_PUSH_OFFSET:
+            return command.data.surface_push_offset.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_POP_OFFSET:
+            return command.data.surface_pop_offset.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_RESET_COMPOSITION:
+            return command.data.surface_reset_composition.window_id;
+        case SUPERTERMINAL_CMD_SURFACE_INSTALL_CHILD_VIEW_BOUNDS:
+            return command.data.surface_install_child_view_bounds.window_id;
         default:
             return {};
     }
@@ -1867,24 +2169,79 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
             }
             WinguiRgbaSurface* dst_handle = nullptr;
             WinguiRgbaSurface* src_handle = nullptr;
+            uint32_t dst_buffer_index = cp.dst_buffer_index & 1u;
+            uint32_t src_buffer_index = cp.src_buffer_index & 1u;
+            bool apply_surface_composition = false;
+            SurfaceClipState dst_clip{};
+            SurfaceOffsetState dst_offset{};
             {
                 std::lock_guard<std::mutex> lock(host->pane_mutex);
                 if (RegisteredPane* dst_pane = registeredPaneForIdLocked(host, cp.dst_pane_id, false)) {
-                    dst_handle = dst_pane->rgba_surface_handle;
+                    if (dst_pane->render_kind == PANE_RENDER_SURFACE) {
+                        ensureSurfaceCompositionState(*dst_pane);
+                        dst_handle = dst_pane->surface_surface_handle;
+                        dst_buffer_index =
+                            dst_pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (cp.dst_buffer_index & 1u);
+                        if (cp.dst_pane_id.value == cp.src_pane_id.value) {
+                            apply_surface_composition = true;
+                            dst_clip = currentSurfaceClip(*dst_pane);
+                            dst_offset = currentSurfaceOffset(*dst_pane);
+                        }
+                    } else {
+                        dst_handle = dst_pane->rgba_surface_handle;
+                    }
                 }
                 if (RegisteredPane* src_pane = registeredPaneForIdLocked(host, cp.src_pane_id, false)) {
-                    src_handle = src_pane->rgba_surface_handle;
+                    if (src_pane->render_kind == PANE_RENDER_SURFACE) {
+                        src_handle = src_pane->surface_surface_handle;
+                        src_buffer_index =
+                            src_pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (cp.src_buffer_index & 1u);
+                    } else {
+                        src_handle = src_pane->rgba_surface_handle;
+                    }
                 }
             }
             if (dst_handle && src_handle) {
-                WinguiRectU32 region{ cp.src_x, cp.src_y, cp.region_width, cp.region_height };
+                float dst_x = static_cast<float>(cp.dst_x);
+                float dst_y = static_cast<float>(cp.dst_y);
+                float src_x = static_cast<float>(cp.src_x);
+                float src_y = static_cast<float>(cp.src_y);
+                float width = static_cast<float>(cp.region_width);
+                float height = static_cast<float>(cp.region_height);
+                if (apply_surface_composition) {
+                    dst_x += dst_offset.dx;
+                    dst_y += dst_offset.dy;
+                    src_x += dst_offset.dx;
+                    src_y += dst_offset.dy;
+                    if (dst_clip.active) {
+                        const float clipped_x0 = std::max(dst_x, dst_clip.x0);
+                        const float clipped_y0 = std::max(dst_y, dst_clip.y0);
+                        const float clipped_x1 = std::min(dst_x + width, dst_clip.x1);
+                        const float clipped_y1 = std::min(dst_y + height, dst_clip.y1);
+                        if (clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0) {
+                            break;
+                        }
+                        src_x += clipped_x0 - dst_x;
+                        src_y += clipped_y0 - dst_y;
+                        dst_x = clipped_x0;
+                        dst_y = clipped_y0;
+                        width = clipped_x1 - clipped_x0;
+                        height = clipped_y1 - clipped_y0;
+                    }
+                }
+                WinguiRectU32 region{
+                    static_cast<uint32_t>(std::max(src_x, 0.0f)),
+                    static_cast<uint32_t>(std::max(src_y, 0.0f)),
+                    static_cast<uint32_t>(std::max(width, 0.0f)),
+                    static_cast<uint32_t>(std::max(height, 0.0f))
+                };
                 wingui_rgba_surface_copy_from_surface(
                     dst_handle,
-                    cp.dst_buffer_index & 1u,
-                    cp.dst_x,
-                    cp.dst_y,
+                    dst_buffer_index,
+                    static_cast<uint32_t>(std::max(dst_x, 0.0f)),
+                    static_cast<uint32_t>(std::max(dst_y, 0.0f)),
                     src_handle,
-                    cp.src_buffer_index & 1u,
+                    src_buffer_index,
                     region);
                 host->render_dirty.store(1, std::memory_order_release);
             }
@@ -2188,15 +2545,15 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 std::lock_guard<std::mutex> lock(host->pane_mutex);
                 RegisteredPane* pane = ensureRegisteredPaneLocked(host, vd.pane_id);
                 if (pane) {
-                    pane->render_kind = PANE_RENDER_RGBA;
-                    pane->rgba_content_buffer_mode = vd.content_buffer_mode;
-                    if (ensurePaneRgbaPresenter(host, *pane, layout)) {
-                        surface = pane->rgba_surface_handle;
-                        surface_w = pane->rgba_screen_width;
-                        surface_h = pane->rgba_screen_height;
+                    pane->render_kind = PANE_RENDER_SURFACE;
+                    pane->surface_content_buffer_mode = vd.content_buffer_mode;
+                    if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        surface = pane->surface_surface_handle;
+                        surface_w = pane->surface_screen_width;
+                        surface_h = pane->surface_screen_height;
                         vector_renderer = pane->pane_vector_renderer;
                         target_buffer_index =
-                            pane->rgba_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (vd.buffer_index & 1u);
+                            pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (vd.buffer_index & 1u);
                     }
                 }
             }
@@ -2210,6 +2567,22 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 break;
             }
             if (!vector_renderer) { free_prims(); break; }
+
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, vd.pane_id, false)) {
+                    if (pane->render_kind == PANE_RENDER_SURFACE && pane->surface_clear_pending[target_buffer_index & 1u]) {
+                        wingui_rgba_surface_clear(
+                            surface,
+                            target_buffer_index,
+                            0.0f,
+                            0.0f,
+                            0.0f,
+                            0.0f);
+                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
+                    }
+                }
+            }
 
             if (vd.clear_before) {
                 wingui_rgba_surface_clear(
@@ -2228,6 +2601,262 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
             }
             host->render_dirty.store(1, std::memory_order_release);
             free_prims();
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_DRAW_TEXT_OWNED: {
+            const SuperTerminalSurfaceDrawTextOwned& td = command.data.surface_draw_text_owned;
+            void* owned_text = td.text_utf8;
+            auto free_text = [&]() {
+                if (!owned_text) return;
+                if (td.free_fn) td.free_fn(td.free_user_data, owned_text);
+                else std::free(owned_text);
+            };
+            if (td.pane_id.value == 0 || !owned_text) {
+                free_text();
+                break;
+            }
+
+            WinguiRgbaSurface* surface = nullptr;
+            uint32_t target_buffer_index = 0;
+            SurfaceClipState clip_state{};
+            SurfaceOffsetState offset_state{};
+            SuperTerminalPaneLayout layout{};
+            resolvePaneLayout(host, td.pane_id, &layout);
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                RegisteredPane* pane = ensureRegisteredPaneLocked(host, td.pane_id);
+                if (pane) {
+                    pane->render_kind = PANE_RENDER_SURFACE;
+                    pane->surface_content_buffer_mode = td.content_buffer_mode;
+                    ensureSurfaceCompositionState(*pane);
+                    if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        surface = pane->surface_surface_handle;
+                        target_buffer_index =
+                            pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (td.buffer_index & 1u);
+                        clip_state = currentSurfaceClip(*pane);
+                        offset_state = currentSurfaceOffset(*pane);
+                    }
+                }
+            }
+            if (!surface) {
+                free_text();
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, td.pane_id, false)) {
+                    if (pane->surface_clear_pending[target_buffer_index & 1u]) {
+                        wingui_rgba_surface_clear(surface, target_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
+                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
+                    }
+                }
+            }
+
+            if (td.clear_before) {
+                wingui_rgba_surface_clear(
+                    surface,
+                    target_buffer_index,
+                    td.clear_color[0],
+                    td.clear_color[1],
+                    td.clear_color[2],
+                    td.clear_color[3]);
+            }
+            if (!surfaceClipHasArea(clip_state)) {
+                free_text();
+                break;
+            }
+
+            const char* font_family_utf8 = host->desc.font_family_utf8 && *host->desc.font_family_utf8
+                ? host->desc.font_family_utf8
+                : "Consolas";
+            const float dpi_scale = host->desc.dpi_scale > 0.0f ? host->desc.dpi_scale : 1.0f;
+            const float font_size = static_cast<float>(host->desc.font_pixel_height > 0 ? host->desc.font_pixel_height : 16) * dpi_scale;
+            float clip_rect[4] = { clip_state.x0, clip_state.y0, clip_state.x1, clip_state.y1 };
+            if (wingui_rgba_surface_draw_text_utf8(
+                    surface,
+                    target_buffer_index,
+                    font_family_utf8,
+                    font_size,
+                    dpi_scale,
+                    static_cast<const char*>(owned_text),
+                    td.origin_x + offset_state.dx,
+                    td.origin_y + offset_state.dy,
+                    td.color[0],
+                    td.color[1],
+                    td.color[2],
+                    td.color[3],
+                    td.blend_mode,
+                    clip_state.active ? clip_rect : nullptr)) {
+                host->render_dirty.store(1, std::memory_order_release);
+            }
+            free_text();
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_DRAW_PRIMITIVES_OWNED: {
+            const SuperTerminalSurfaceDrawPrimitivesOwned& pd = command.data.surface_draw_primitives_owned;
+            void* owned_primitives = pd.primitives;
+            void* owned_points = pd.path_points_xy;
+            auto free_payload = [&]() {
+                if (pd.free_fn) {
+                    if (owned_primitives) pd.free_fn(pd.free_user_data, owned_primitives);
+                    if (owned_points) pd.free_fn(pd.free_user_data, owned_points);
+                } else {
+                    delete[] static_cast<uint8_t*>(owned_primitives);
+                    delete[] static_cast<uint8_t*>(owned_points);
+                }
+            };
+            if (pd.pane_id.value == 0 || (pd.primitive_count > 0 && !owned_primitives)) {
+                free_payload();
+                break;
+            }
+
+            WinguiRgbaSurface* surface = nullptr;
+            uint32_t target_buffer_index = 0;
+            SurfaceClipState clip_state{};
+            SurfaceOffsetState offset_state{};
+            SuperTerminalPaneLayout layout{};
+            resolvePaneLayout(host, pd.pane_id, &layout);
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                RegisteredPane* pane = ensureRegisteredPaneLocked(host, pd.pane_id);
+                if (pane) {
+                    pane->render_kind = PANE_RENDER_SURFACE;
+                    pane->surface_content_buffer_mode = pd.content_buffer_mode;
+                    ensureSurfaceCompositionState(*pane);
+                    if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        surface = pane->surface_surface_handle;
+                        target_buffer_index =
+                            pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (pd.buffer_index & 1u);
+                        clip_state = currentSurfaceClip(*pane);
+                        offset_state = currentSurfaceOffset(*pane);
+                    }
+                }
+            }
+            if (!surface) {
+                free_payload();
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(host->pane_mutex);
+                if (RegisteredPane* pane = registeredPaneForIdLocked(host, pd.pane_id, false)) {
+                    if (pane->surface_clear_pending[target_buffer_index & 1u]) {
+                        wingui_rgba_surface_clear(surface, target_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
+                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
+                    }
+                }
+            }
+
+            if (pd.clear_before) {
+                wingui_rgba_surface_clear(
+                    surface,
+                    target_buffer_index,
+                    pd.clear_color[0],
+                    pd.clear_color[1],
+                    pd.clear_color[2],
+                    pd.clear_color[3]);
+            }
+            if (!surfaceClipHasArea(clip_state)) {
+                free_payload();
+                break;
+            }
+
+            if (pd.primitive_count > 0) {
+                float clip_rect[4] = { clip_state.x0, clip_state.y0, clip_state.x1, clip_state.y1 };
+                if (wingui_rgba_surface_draw_primitives(
+                        surface,
+                        target_buffer_index,
+                        static_cast<const WinguiSurfacePrimitive*>(owned_primitives),
+                        pd.primitive_count,
+                        static_cast<const float*>(owned_points),
+                        pd.path_point_count,
+                        pd.blend_mode,
+                        offset_state.dx,
+                        offset_state.dy,
+                        clip_state.active ? clip_rect : nullptr)) {
+                    host->render_dirty.store(1, std::memory_order_release);
+                }
+            }
+            free_payload();
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_PUSH_CLIP_RECT: {
+            const SuperTerminalSurfacePushClipRect& push = command.data.surface_push_clip_rect;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = ensureRegisteredPaneLocked(host, push.pane_id)) {
+                pane->render_kind = PANE_RENDER_SURFACE;
+                ensureSurfaceCompositionState(*pane);
+                const SurfaceOffsetState offset = currentSurfaceOffset(*pane);
+                SurfaceClipState next{};
+                next.active = true;
+                next.x0 = push.x0 + offset.dx;
+                next.y0 = push.y0 + offset.dy;
+                next.x1 = push.x1 + offset.dx;
+                next.y1 = push.y1 + offset.dy;
+                pane->surface_clip_stack.push_back(intersectSurfaceClips(currentSurfaceClip(*pane), next));
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_POP_CLIP_RECT: {
+            const SuperTerminalSurfacePopClipRect& pop = command.data.surface_pop_clip_rect;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = registeredPaneForIdLocked(host, pop.pane_id, false)) {
+                ensureSurfaceCompositionState(*pane);
+                if (pane->surface_clip_stack.size() > 1) {
+                    pane->surface_clip_stack.pop_back();
+                }
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_PUSH_OFFSET: {
+            const SuperTerminalSurfacePushOffset& push = command.data.surface_push_offset;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = ensureRegisteredPaneLocked(host, push.pane_id)) {
+                pane->render_kind = PANE_RENDER_SURFACE;
+                ensureSurfaceCompositionState(*pane);
+                const SurfaceOffsetState current = currentSurfaceOffset(*pane);
+                pane->surface_offset_stack.push_back(SurfaceOffsetState{ current.dx + push.dx, current.dy + push.dy });
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_POP_OFFSET: {
+            const SuperTerminalSurfacePopOffset& pop = command.data.surface_pop_offset;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = registeredPaneForIdLocked(host, pop.pane_id, false)) {
+                ensureSurfaceCompositionState(*pane);
+                if (pane->surface_offset_stack.size() > 1) {
+                    pane->surface_offset_stack.pop_back();
+                }
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_RESET_COMPOSITION: {
+            const SuperTerminalSurfaceResetComposition& reset = command.data.surface_reset_composition;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = registeredPaneForIdLocked(host, reset.pane_id, false)) {
+                if (pane->render_kind == PANE_RENDER_SURFACE) {
+                    resetSurfaceCompositionState(*pane);
+                }
+            }
+            break;
+        }
+        case SUPERTERMINAL_CMD_SURFACE_INSTALL_CHILD_VIEW_BOUNDS: {
+            const SuperTerminalSurfaceInstallChildViewBounds& child = command.data.surface_install_child_view_bounds;
+            std::lock_guard<std::mutex> lock(host->pane_mutex);
+            if (RegisteredPane* pane = ensureRegisteredPaneLocked(host, child.pane_id)) {
+                pane->render_kind = PANE_RENDER_SURFACE;
+                ensureSurfaceCompositionState(*pane);
+                const SurfaceOffsetState offset = currentSurfaceOffset(*pane);
+                SurfaceChildViewBounds bounds{};
+                bounds.x0 = child.x0 + offset.dx;
+                bounds.y0 = child.y0 + offset.dy;
+                bounds.x1 = child.x1 + offset.dx;
+                bounds.y1 = child.y1 + offset.dy;
+                if (bounds.x0 > bounds.x1) std::swap(bounds.x0, bounds.x1);
+                if (bounds.y0 > bounds.y1) std::swap(bounds.y0, bounds.y1);
+                pane->surface_child_view_bounds[child.child_id] = bounds;
+            }
             break;
         }
         case SUPERTERMINAL_CMD_INDEXED_FILL_RECT: {
@@ -2653,6 +3282,21 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
                     if (vd.free_fn) vd.free_fn(vd.free_user_data, vd.primitives);
                     else delete[] static_cast<uint8_t*>(vd.primitives);
                 }
+            } else if (leftover.type == SUPERTERMINAL_CMD_SURFACE_DRAW_TEXT_OWNED) {
+                const auto& td = leftover.data.surface_draw_text_owned;
+                if (td.text_utf8) {
+                    if (td.free_fn) td.free_fn(td.free_user_data, td.text_utf8);
+                    else std::free(td.text_utf8);
+                }
+            } else if (leftover.type == SUPERTERMINAL_CMD_SURFACE_DRAW_PRIMITIVES_OWNED) {
+                const auto& pd = leftover.data.surface_draw_primitives_owned;
+                auto free_blob = [&](void* ptr) {
+                    if (!ptr) return;
+                    if (pd.free_fn) pd.free_fn(pd.free_user_data, ptr);
+                    else delete[] static_cast<uint8_t*>(ptr);
+                };
+                free_blob(pd.primitives);
+                free_blob(pd.path_points_xy);
             }
         }
     }
@@ -2671,6 +3315,9 @@ void shutdownHost(SuperTerminalRuntimeHost* host) {
             }
             if (pane.rgba_surface_handle) {
                 destroyPaneRgbaPresenter(pane);
+            }
+            if (pane.surface_surface_handle) {
+                destroyPaneSurfacePresenter(pane);
             }
             if (pane.indexed_surface_handle) {
                 wingui_destroy_indexed_surface(pane.indexed_surface_handle);
@@ -3206,6 +3853,43 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout_for_win
     return 1;
 }
 
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_surface_child_view_bounds(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    SuperTerminalChildViewBounds* out_bounds) {
+    if (!ctx || !ctx->host || !out_bounds) {
+        wingui_set_last_error_string_internal("super_terminal_get_surface_child_view_bounds: invalid arguments");
+        return 0;
+    }
+    return super_terminal_get_surface_child_view_bounds_for_window(ctx, ctx->host->window_id, pane_id, child_id, out_bounds);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_surface_child_view_bounds_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    SuperTerminalChildViewBounds* out_bounds) {
+    if (!ctx || !ctx->app_host || !out_bounds) {
+        wingui_set_last_error_string_internal("super_terminal_get_surface_child_view_bounds_for_window: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalRuntimeHost* host = findWindowHost(ctx->app_host, window_id);
+    if (!host) {
+        wingui_set_last_error_string_internal("super_terminal_get_surface_child_view_bounds_for_window: window not found");
+        return 0;
+    }
+
+    if (!copySurfaceChildViewBoundsFromCache(host, pane_id, child_id, out_bounds)) {
+        wingui_set_last_error_string_internal("super_terminal_get_surface_child_view_bounds: child bounds are unavailable");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_mouse_state(
     SuperTerminalClientContext* ctx,
     WinguiMouseState* out_state) {
@@ -3214,6 +3898,38 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_mouse_state(
         return 0;
     }
     return wingui_window_get_mouse_state(ctx->host->window, out_state);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_text_config(
+    SuperTerminalClientContext* ctx,
+    const char** out_font_family_utf8,
+    int32_t* out_font_pixel_height,
+    float* out_dpi_scale) {
+    if (!ctx) {
+        wingui_set_last_error_string_internal("super_terminal_get_text_config: invalid arguments");
+        return 0;
+    }
+
+    SuperTerminalRuntimeHost* host = ctx->host ? ctx->host : primaryWindowHost(ctx->app_host);
+    if (!host) {
+        wingui_set_last_error_string_internal("super_terminal_get_text_config: host not available");
+        return 0;
+    }
+
+    if (out_font_family_utf8) {
+        *out_font_family_utf8 = host->desc.font_family_utf8 && *host->desc.font_family_utf8
+            ? host->desc.font_family_utf8
+            : "Consolas";
+    }
+    if (out_font_pixel_height) {
+        *out_font_pixel_height = host->desc.font_pixel_height > 0 ? host->desc.font_pixel_height : 16;
+    }
+    if (out_dpi_scale) {
+        *out_dpi_scale = host->desc.dpi_scale > 0.0f ? host->desc.dpi_scale : 1.0f;
+    }
+
+    wingui_clear_last_error_internal();
+    return 1;
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_get_native_ui_patch_metrics(
@@ -3776,6 +4492,246 @@ extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_vector_draw(
         return 0;
     }
     return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_draw_text_utf8(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_text_utf8: invalid arguments");
+        return 0;
+    }
+    if (!text_utf8) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_text_utf8: text_utf8 was null");
+        return 0;
+    }
+    if (!text_utf8[0]) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+
+    char* owned = duplicateUtf8Owned(text_utf8);
+    if (!owned) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_text_utf8: out of memory");
+        return 0;
+    }
+
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_DRAW_TEXT_OWNED;
+    SuperTerminalSurfaceDrawTextOwned& td = command.data.surface_draw_text_owned;
+    td.pane_id = pane_id;
+    td.buffer_index = buffer_index;
+    td.content_buffer_mode = content_buffer_mode;
+    td.blend_mode = blend_mode;
+    td.clear_before = clear_before;
+    if (clear_color_rgba) {
+        td.clear_color[0] = clear_color_rgba[0];
+        td.clear_color[1] = clear_color_rgba[1];
+        td.clear_color[2] = clear_color_rgba[2];
+        td.clear_color[3] = clear_color_rgba[3];
+    }
+    td.origin_x = origin_x;
+    td.origin_y = origin_y;
+    td.color[0] = color_r;
+    td.color[1] = color_g;
+    td.color[2] = color_b;
+    td.color[3] = color_a;
+    td.text_utf8 = owned;
+    td.free_fn = nullptr;
+    td.free_user_data = nullptr;
+    if (!super_terminal_enqueue(ctx, &command)) {
+        std::free(owned);
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_draw_primitives(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const WinguiSurfacePrimitive* primitives,
+    uint32_t primitive_count,
+    const float* path_points_xy,
+    uint32_t path_point_count) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_primitives: invalid arguments");
+        return 0;
+    }
+    if (primitive_count > 0 && !primitives) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_primitives: primitives was null");
+        return 0;
+    }
+    if (path_point_count > 0 && !path_points_xy) {
+        wingui_set_last_error_string_internal("super_terminal_surface_draw_primitives: path_points_xy was null");
+        return 0;
+    }
+
+    uint8_t* owned_primitives = nullptr;
+    if (primitive_count > 0) {
+        const size_t bytes = static_cast<size_t>(primitive_count) * sizeof(WinguiSurfacePrimitive);
+        owned_primitives = new (std::nothrow) uint8_t[bytes];
+        if (!owned_primitives) {
+            wingui_set_last_error_string_internal("super_terminal_surface_draw_primitives: out of memory");
+            return 0;
+        }
+        std::memcpy(owned_primitives, primitives, bytes);
+    }
+
+    uint8_t* owned_points = nullptr;
+    if (path_point_count > 0) {
+        const size_t bytes = static_cast<size_t>(path_point_count) * 2u * sizeof(float);
+        owned_points = new (std::nothrow) uint8_t[bytes];
+        if (!owned_points) {
+            delete[] owned_primitives;
+            wingui_set_last_error_string_internal("super_terminal_surface_draw_primitives: out of memory");
+            return 0;
+        }
+        std::memcpy(owned_points, path_points_xy, bytes);
+    }
+
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_DRAW_PRIMITIVES_OWNED;
+    SuperTerminalSurfaceDrawPrimitivesOwned& pd = command.data.surface_draw_primitives_owned;
+    pd.pane_id = pane_id;
+    pd.buffer_index = buffer_index;
+    pd.content_buffer_mode = content_buffer_mode;
+    pd.blend_mode = blend_mode;
+    pd.clear_before = clear_before;
+    if (clear_color_rgba) {
+        pd.clear_color[0] = clear_color_rgba[0];
+        pd.clear_color[1] = clear_color_rgba[1];
+        pd.clear_color[2] = clear_color_rgba[2];
+        pd.clear_color[3] = clear_color_rgba[3];
+    }
+    pd.primitives = owned_primitives;
+    pd.primitive_count = primitive_count;
+    pd.path_points_xy = owned_points;
+    pd.path_point_count = path_point_count;
+    pd.free_fn = nullptr;
+    pd.free_user_data = nullptr;
+    if (!super_terminal_enqueue(ctx, &command)) {
+        delete[] owned_primitives;
+        delete[] owned_points;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_push_clip_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_push_clip_rect: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_PUSH_CLIP_RECT;
+    command.data.surface_push_clip_rect.pane_id = pane_id;
+    command.data.surface_push_clip_rect.x0 = x0;
+    command.data.surface_push_clip_rect.y0 = y0;
+    command.data.surface_push_clip_rect.x1 = x1;
+    command.data.surface_push_clip_rect.y1 = y1;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_pop_clip_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_pop_clip_rect: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_POP_CLIP_RECT;
+    command.data.surface_pop_clip_rect.pane_id = pane_id;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_push_offset(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    float dx,
+    float dy) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_push_offset: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_PUSH_OFFSET;
+    command.data.surface_push_offset.pane_id = pane_id;
+    command.data.surface_push_offset.dx = dx;
+    command.data.surface_push_offset.dy = dy;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_pop_offset(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_pop_offset: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_POP_OFFSET;
+    command.data.surface_pop_offset.pane_id = pane_id;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_reset_composition(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_reset_composition: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_RESET_COMPOSITION;
+    command.data.surface_reset_composition.pane_id = pane_id;
+    return super_terminal_enqueue(ctx, &command);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_surface_install_child_view_bounds(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1) {
+    if (!ctx || !ctx->host || !pane_id.value) {
+        wingui_set_last_error_string_internal("super_terminal_surface_install_child_view_bounds: invalid arguments");
+        return 0;
+    }
+    SuperTerminalCommand command{};
+    command.type = SUPERTERMINAL_CMD_SURFACE_INSTALL_CHILD_VIEW_BOUNDS;
+    command.data.surface_install_child_view_bounds.pane_id = pane_id;
+    command.data.surface_install_child_view_bounds.child_id = child_id;
+    command.data.surface_install_child_view_bounds.x0 = x0;
+    command.data.surface_install_child_view_bounds.y0 = y0;
+    command.data.surface_install_child_view_bounds.x1 = x1;
+    command.data.surface_install_child_view_bounds.y1 = y1;
+    return super_terminal_enqueue(ctx, &command);
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL super_terminal_indexed_fill_rect(

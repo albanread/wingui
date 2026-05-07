@@ -602,7 +602,7 @@ bool findFocusedPaneIdInNode(const ordered_json& node, std::string& out_id) {
     auto focused_it = node.find("focused");
     if (!node_id.empty() && focused_it != node.end() && isTruthyJson(*focused_it) &&
         (type == "split-pane" || type == "text-grid-pane" || type == "text-grid" ||
-         type == "indexed-graphics" || type == "rgba-pane" || type == "pane")) {
+         type == "indexed-graphics" || type == "rgba-pane" || type == "surface" || type == "pane")) {
         out_id = node_id;
         return true;
     }
@@ -1952,7 +1952,7 @@ MeasuredSize measureNode(HDC hdc, const ordered_json& node, int max_width) {
         return {width, height};
     }
 
-    if (type == "indexed-graphics" || type == "rgba-pane" || type == "pane") {
+    if (type == "indexed-graphics" || type == "rgba-pane" || type == "surface" || type == "pane") {
         const std::wstring label = utf8ToWide(jsonString(node, "label"));
         int width = std::max(120, jsonInt(node, "width", 320));
         int height = std::max(80, jsonInt(node, "height", 180));
@@ -5553,7 +5553,7 @@ MeasuredSize layoutNode(HWND parent, HDC hdc, const ordered_json& node, int x, i
         return {control_width, (cursor_y - y) + control_height};
     }
 
-    if (type == "text-grid" || type == "text-grid-pane" || type == "indexed-graphics" || type == "rgba-pane" || type == "pane") {
+    if (type == "text-grid" || type == "text-grid-pane" || type == "indexed-graphics" || type == "rgba-pane" || type == "surface" || type == "pane") {
         const std::wstring label = utf8ToWide(jsonString(node, "label"));
         MeasuredSize measured = measureNode(hdc, node, max_width);
         const int control_width = std::max(24, measured.width);

@@ -2,6 +2,10 @@
 #define WINGUI_BUILD_DLL
 #endif
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "wingui/spec_bind.h"
 
 #include "wingui/ui_model.h"
@@ -9,8 +13,12 @@
 #include "wingui_internal.h"
 #include "nlohmann/json.hpp"
 
+#include <windows.h>
+#include <dwrite.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -266,32 +274,37 @@ bool bindPaneRef(const WinguiSpecBindFrameView* frame_view,
     return true;
 }
 
-WinguiVectorPrimitive makePrimitiveBase(float color_r,
-                                        float color_g,
-                                        float color_b,
-                                        float color_a,
-                                        uint32_t shape) {
-    WinguiVectorPrimitive primitive{};
+WinguiSurfacePrimitive makeSurfacePrimitiveBase(float color_r,
+                                                float color_g,
+                                                float color_b,
+                                                float color_a,
+                                                uint32_t kind) {
+    WinguiSurfacePrimitive primitive{};
     primitive.color[0] = color_r;
     primitive.color[1] = color_g;
     primitive.color[2] = color_b;
     primitive.color[3] = color_a;
-    primitive.shape = shape;
+    primitive.kind = kind;
     return primitive;
 }
 
-int32_t drawSinglePrimitive(const WinguiSpecBindFrameView* frame_view,
-                            WinguiSpecBindPaneRef pane,
-                            uint32_t content_buffer_mode,
-                            uint32_t blend_mode,
-                            int32_t clear_before,
-                            const float clear_color_rgba[4],
-                            const WinguiVectorPrimitive& primitive,
-                            const char* caller) {
+int32_t drawSurfacePrimitiveBatch(const WinguiSpecBindFrameView* frame_view,
+                                  WinguiSpecBindPaneRef pane,
+                                  uint32_t content_buffer_mode,
+                                  uint32_t blend_mode,
+                                  int32_t clear_before,
+                                  const float clear_color_rgba[4],
+                                  const std::vector<WinguiSurfacePrimitive>& primitives,
+                                  const std::vector<float>& path_points_xy,
+                                  const char* caller) {
     if (!validateFrameView(frame_view, caller) || !validatePaneRef(pane, caller)) {
         return 0;
     }
-    if (!super_terminal_vector_draw(
+    if (primitives.empty()) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+    if (!super_terminal_surface_draw_primitives(
             frame_view->ctx,
             pane.pane_id,
             pane.buffer_index,
@@ -299,13 +312,387 @@ int32_t drawSinglePrimitive(const WinguiSpecBindFrameView* frame_view,
             blend_mode,
             clear_before,
             clear_color_rgba,
-            &primitive,
-            1)) {
+            primitives.data(),
+            static_cast<uint32_t>(primitives.size()),
+            path_points_xy.empty() ? nullptr : path_points_xy.data(),
+            static_cast<uint32_t>(path_points_xy.size() / 2u))) {
         wingui_set_last_error_string_internal((std::string(caller) + ": draw failed").c_str());
         return 0;
     }
     wingui_clear_last_error_internal();
     return 1;
+}
+
+int32_t drawSingleSurfacePrimitive(const WinguiSpecBindFrameView* frame_view,
+                                   WinguiSpecBindPaneRef pane,
+                                   uint32_t content_buffer_mode,
+                                   uint32_t blend_mode,
+                                   int32_t clear_before,
+                                   const float clear_color_rgba[4],
+                                   const WinguiSurfacePrimitive& primitive,
+                                   const char* caller) {
+    const std::vector<WinguiSurfacePrimitive> primitives{primitive};
+    const std::vector<float> path_points_xy;
+    return drawSurfacePrimitiveBatch(
+        frame_view,
+        pane,
+        content_buffer_mode,
+        blend_mode,
+        clear_before,
+        clear_color_rgba,
+        primitives,
+        path_points_xy,
+        caller);
+}
+
+WinguiSurfacePrimitive makeLineSurfacePrimitive(float x0,
+                                                float y0,
+                                                float x1,
+                                                float y1,
+                                                float half_thickness,
+                                                float color_r,
+                                                float color_g,
+                                                float color_b,
+                                                float color_a) {
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(
+        color_r,
+        color_g,
+        color_b,
+        color_a,
+        WINGUI_SURFACE_DRAW_LINE);
+    primitive.param0[0] = x0;
+    primitive.param0[1] = y0;
+    primitive.param0[2] = x1;
+    primitive.param0[3] = y1;
+    primitive.param1[0] = half_thickness;
+    return primitive;
+}
+
+uint32_t oval_segment_count(float radius_x, float radius_y) {
+    const float max_radius = std::max(radius_x, radius_y);
+    const float estimate = std::ceil(max_radius * 0.75f);
+    return static_cast<uint32_t>(std::clamp(estimate, 16.0f, 256.0f));
+}
+
+struct TextLayoutLine {
+    uint32_t start_index = 0;
+    uint32_t length = 0;
+    float y = 0.0f;
+};
+
+struct TextLayoutInfo {
+    std::vector<std::pair<float, float>> insertion_points;
+    std::vector<TextLayoutLine> lines;
+    float width = 0.0f;
+    float height = 0.0f;
+    uint32_t char_count = 0;
+};
+
+bool decodeUtf8Codepoint(const char*& cursor, const char* end, uint32_t& out_cp) {
+    if (cursor >= end) {
+        return false;
+    }
+    const unsigned char b0 = static_cast<unsigned char>(*cursor++);
+    if (b0 < 0x80) {
+        out_cp = b0;
+        return true;
+    }
+    auto consumeContinuation = [&](uint32_t& acc, int count) -> bool {
+        for (int i = 0; i < count; ++i) {
+            if (cursor >= end) {
+                return false;
+            }
+            const unsigned char b = static_cast<unsigned char>(*cursor++);
+            if ((b & 0xC0) != 0x80) {
+                return false;
+            }
+            acc = (acc << 6) | (b & 0x3F);
+        }
+        return true;
+    };
+
+    uint32_t acc = 0;
+    if ((b0 & 0xE0) == 0xC0) {
+        acc = b0 & 0x1F;
+        if (!consumeContinuation(acc, 1)) {
+            return false;
+        }
+    } else if ((b0 & 0xF0) == 0xE0) {
+        acc = b0 & 0x0F;
+        if (!consumeContinuation(acc, 2)) {
+            return false;
+        }
+    } else if ((b0 & 0xF8) == 0xF0) {
+        acc = b0 & 0x07;
+        if (!consumeContinuation(acc, 3)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    out_cp = acc;
+    return true;
+}
+
+bool buildTextLayoutInfo(const WinguiGlyphAtlasInfo& atlas_info,
+                         const char* text_utf8,
+                         float origin_x,
+                         float origin_y,
+                         TextLayoutInfo* out_info,
+                         const char* caller) {
+    if (!text_utf8 || !out_info) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": invalid arguments").c_str());
+        return false;
+    }
+    if (atlas_info.cell_width <= 0.0f || atlas_info.cell_height <= 0.0f) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": invalid atlas info").c_str());
+        return false;
+    }
+
+    TextLayoutInfo info{};
+    info.insertion_points.emplace_back(origin_x, origin_y);
+    info.lines.push_back(TextLayoutLine{0, 0, origin_y});
+
+    const char* cursor = text_utf8;
+    const char* end = cursor + std::strlen(text_utf8);
+    float pen_x = origin_x;
+    float pen_y = origin_y;
+    float max_x = origin_x;
+    uint32_t current_index = 0;
+    uint32_t visible_on_line = 0;
+
+    while (cursor < end) {
+        uint32_t cp = 0;
+        if (!decodeUtf8Codepoint(cursor, end, cp)) {
+            break;
+        }
+        if (cp == '\r') {
+            current_index += 1;
+            info.insertion_points.emplace_back(pen_x, pen_y);
+            continue;
+        }
+        if (cp == '\n') {
+            max_x = std::max(max_x, pen_x);
+            current_index += 1;
+            pen_x = origin_x;
+            pen_y += atlas_info.cell_height;
+            visible_on_line = 0;
+            info.insertion_points.emplace_back(pen_x, pen_y);
+            info.lines.push_back(TextLayoutLine{current_index, 0, pen_y});
+            continue;
+        }
+
+        pen_x += atlas_info.cell_width;
+        max_x = std::max(max_x, pen_x);
+        current_index += 1;
+        visible_on_line += 1;
+        info.lines.back().length = visible_on_line;
+        info.insertion_points.emplace_back(pen_x, pen_y);
+    }
+
+    info.char_count = current_index;
+    info.width = std::max(0.0f, max_x - origin_x);
+    info.height = std::max(atlas_info.cell_height, (pen_y - origin_y) + atlas_info.cell_height);
+    *out_info = std::move(info);
+    wingui_clear_last_error_internal();
+    return true;
+}
+
+bool getFrameGlyphAtlasInfo(const WinguiSpecBindFrameView* frame_view,
+                           WinguiGlyphAtlasInfo* out_info,
+                           const char* caller) {
+    if (!validateFrameView(frame_view, caller) || !out_info) {
+        return false;
+    }
+    if (!super_terminal_get_glyph_atlas_info(frame_view->ctx, out_info)) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": glyph atlas query failed").c_str());
+        return false;
+    }
+    return true;
+}
+
+template <typename T>
+void releaseCom(T*& ptr) {
+    if (ptr) {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+struct SurfaceTextConfig {
+    std::wstring font_family = L"Consolas";
+    float font_size = 16.0f;
+    float dpi_scale = 1.0f;
+};
+
+struct SurfaceDecodedText {
+    std::wstring wide_text;
+    std::vector<uint32_t> char_to_utf16;
+    uint32_t char_count = 0;
+};
+
+IDWriteFactory* getSharedDWriteFactory() {
+    static std::once_flag once;
+    static IDWriteFactory* factory = nullptr;
+    static HRESULT init_hr = E_FAIL;
+    std::call_once(once, []() {
+        init_hr = DWriteCreateFactory(
+            DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory),
+            reinterpret_cast<IUnknown**>(&factory));
+    });
+    return SUCCEEDED(init_hr) ? factory : nullptr;
+}
+
+std::wstring utf8ToWideText(const char* text_utf8) {
+    if (!text_utf8 || !*text_utf8) {
+        return {};
+    }
+    const int input_len = static_cast<int>(std::strlen(text_utf8));
+    const int needed = MultiByteToWideChar(CP_UTF8, 0, text_utf8, input_len, nullptr, 0);
+    if (needed <= 0) {
+        return {};
+    }
+    std::wstring result(static_cast<size_t>(needed), L'\0');
+    const int written = MultiByteToWideChar(CP_UTF8, 0, text_utf8, input_len, result.data(), needed);
+    if (written <= 0) {
+        return {};
+    }
+    return result;
+}
+
+bool decodeSurfaceText(const char* text_utf8,
+                       SurfaceDecodedText* out_decoded,
+                       const char* caller) {
+    if (!text_utf8 || !out_decoded) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": invalid arguments").c_str());
+        return false;
+    }
+
+    SurfaceDecodedText decoded{};
+    decoded.wide_text = utf8ToWideText(text_utf8);
+    decoded.char_to_utf16.push_back(0);
+
+    for (size_t index = 0; index < decoded.wide_text.size();) {
+        const wchar_t ch = decoded.wide_text[index];
+        size_t advance = 1;
+        if (ch >= 0xD800 && ch <= 0xDBFF) {
+            if (index + 1 < decoded.wide_text.size()) {
+                const wchar_t next = decoded.wide_text[index + 1];
+                if (next >= 0xDC00 && next <= 0xDFFF) {
+                    advance = 2;
+                }
+            }
+        }
+        index += advance;
+        decoded.char_to_utf16.push_back(static_cast<uint32_t>(index));
+        decoded.char_count += 1;
+    }
+
+    *out_decoded = std::move(decoded);
+    return true;
+}
+
+uint32_t charIndexFromUtf16Position(const SurfaceDecodedText& decoded, uint32_t utf16_position) {
+    const uint32_t clamped = std::min<uint32_t>(utf16_position, static_cast<uint32_t>(decoded.wide_text.size()));
+    const auto it = std::upper_bound(decoded.char_to_utf16.begin(), decoded.char_to_utf16.end(), clamped);
+    if (it == decoded.char_to_utf16.begin()) {
+        return 0;
+    }
+    return static_cast<uint32_t>((it - decoded.char_to_utf16.begin()) - 1);
+}
+
+bool getSurfaceTextConfig(const WinguiSpecBindFrameView* frame_view,
+                          SurfaceTextConfig* out_config,
+                          const char* caller) {
+    if (!validateFrameView(frame_view, caller) || !out_config) {
+        return false;
+    }
+
+    const char* family_utf8 = nullptr;
+    int32_t font_pixel_height = 0;
+    float dpi_scale = 1.0f;
+    if (!super_terminal_get_text_config(frame_view->ctx, &family_utf8, &font_pixel_height, &dpi_scale)) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": text config query failed").c_str());
+        return false;
+    }
+
+    SurfaceTextConfig config{};
+    config.font_family = utf8ToWideText((family_utf8 && *family_utf8) ? family_utf8 : "Consolas");
+    if (config.font_family.empty()) {
+        config.font_family = L"Consolas";
+    }
+    config.dpi_scale = dpi_scale > 0.0f ? dpi_scale : 1.0f;
+    config.font_size = static_cast<float>(font_pixel_height > 0 ? font_pixel_height : 16) * config.dpi_scale;
+    *out_config = std::move(config);
+    return true;
+}
+
+bool createSurfaceTextLayout(const WinguiSpecBindFrameView* frame_view,
+                             const char* text_utf8,
+                             IDWriteTextLayout** out_layout,
+                             SurfaceDecodedText* out_decoded,
+                             const char* caller) {
+    if (!out_layout || !out_decoded) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": invalid outputs").c_str());
+        return false;
+    }
+    *out_layout = nullptr;
+
+    IDWriteFactory* factory = getSharedDWriteFactory();
+    if (!factory) {
+        wingui_set_last_error_string_internal((std::string(caller) + ": DirectWrite factory unavailable").c_str());
+        return false;
+    }
+
+    SurfaceTextConfig config{};
+    if (!getSurfaceTextConfig(frame_view, &config, caller)) {
+        return false;
+    }
+
+    SurfaceDecodedText decoded{};
+    if (!decodeSurfaceText(text_utf8, &decoded, caller)) {
+        return false;
+    }
+
+    IDWriteTextFormat* format = nullptr;
+    HRESULT hr = factory->CreateTextFormat(
+        config.font_family.c_str(),
+        nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        config.font_size,
+        L"en-us",
+        &format);
+    if (FAILED(hr)) {
+        wingui_set_last_error_hresult_internal((std::string(caller) + ": CreateTextFormat failed").c_str(), hr);
+        return false;
+    }
+
+    format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+
+    const FLOAT max_width = 32768.0f;
+    const FLOAT max_height = 32768.0f;
+    IDWriteTextLayout* layout = nullptr;
+    hr = factory->CreateTextLayout(
+        decoded.wide_text.c_str(),
+        static_cast<UINT32>(decoded.wide_text.size()),
+        format,
+        max_width,
+        max_height,
+        &layout);
+    releaseCom(format);
+    if (FAILED(hr)) {
+        wingui_set_last_error_hresult_internal((std::string(caller) + ": CreateTextLayout failed").c_str(), hr);
+        return false;
+    }
+
+    *out_layout = layout;
+    *out_decoded = std::move(decoded);
+    return true;
 }
 
 int32_t publishStoredSpec(WinguiSpecBindRuntime* runtime, SuperTerminalClientContext* ctx) {
@@ -1263,18 +1650,9 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_line(
     float color_g,
     float color_b,
     float color_a) {
-    const float pad = half_thickness + 1.0f;
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_LINE);
-    primitive.bounds_min_x = std::min(x0, x1) - pad;
-    primitive.bounds_min_y = std::min(y0, y1) - pad;
-    primitive.bounds_max_x = std::max(x0, x1) + pad;
-    primitive.bounds_max_y = std::max(y0, y1) + pad;
-    primitive.param0[0] = x0;
-    primitive.param0[1] = y0;
-    primitive.param0[2] = x1;
-    primitive.param0[3] = y1;
-    primitive.param1[0] = half_thickness;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_draw_line");
+    const WinguiSurfacePrimitive primitive = makeLineSurfacePrimitive(
+        x0, y0, x1, y1, half_thickness, color_r, color_g, color_b, color_a);
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_draw_line");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_rect(
@@ -1293,13 +1671,13 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_rect(
     float color_g,
     float color_b,
     float color_a) {
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_RECT_FILLED);
-    primitive.bounds_min_x = x0;
-    primitive.bounds_min_y = y0;
-    primitive.bounds_max_x = x1;
-    primitive.bounds_max_y = y1;
-    primitive.param0[0] = corner_radius;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_fill_rect");
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_FILL_RECT);
+    primitive.param0[0] = x0;
+    primitive.param0[1] = y0;
+    primitive.param0[2] = x1;
+    primitive.param0[3] = y1;
+    primitive.param1[0] = corner_radius;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_fill_rect");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_rect(
@@ -1319,14 +1697,14 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_rect(
     float color_g,
     float color_b,
     float color_a) {
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_RECT_STROKED);
-    primitive.bounds_min_x = x0;
-    primitive.bounds_min_y = y0;
-    primitive.bounds_max_x = x1;
-    primitive.bounds_max_y = y1;
-    primitive.param0[0] = corner_radius;
-    primitive.param0[1] = half_thickness;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_stroke_rect");
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_STROKE_RECT);
+    primitive.param0[0] = x0;
+    primitive.param0[1] = y0;
+    primitive.param0[2] = x1;
+    primitive.param0[3] = y1;
+    primitive.param1[0] = corner_radius;
+    primitive.param1[1] = half_thickness;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_stroke_rect");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_circle(
@@ -1343,15 +1721,12 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_circle(
     float color_g,
     float color_b,
     float color_a) {
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_CIRCLE_FILLED);
-    primitive.bounds_min_x = cx - radius - 1.0f;
-    primitive.bounds_min_y = cy - radius - 1.0f;
-    primitive.bounds_max_x = cx + radius + 1.0f;
-    primitive.bounds_max_y = cy + radius + 1.0f;
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_FILL_ELLIPSE);
     primitive.param0[0] = cx;
     primitive.param0[1] = cy;
     primitive.param0[2] = radius;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_fill_circle");
+    primitive.param0[3] = radius;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_fill_circle");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_circle(
@@ -1369,17 +1744,13 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_circle(
     float color_g,
     float color_b,
     float color_a) {
-    const float outer = radius + half_thickness + 1.0f;
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_CIRCLE_STROKED);
-    primitive.bounds_min_x = cx - outer;
-    primitive.bounds_min_y = cy - outer;
-    primitive.bounds_max_x = cx + outer;
-    primitive.bounds_max_y = cy + outer;
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_STROKE_ELLIPSE);
     primitive.param0[0] = cx;
     primitive.param0[1] = cy;
     primitive.param0[2] = radius;
-    primitive.param0[3] = half_thickness;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_stroke_circle");
+    primitive.param0[3] = radius;
+    primitive.param1[0] = half_thickness;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_stroke_circle");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_arc(
@@ -1399,19 +1770,138 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_arc(
     float color_g,
     float color_b,
     float color_a) {
-    const float outer = radius + half_thickness + 1.0f;
-    WinguiVectorPrimitive primitive = makePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_VECTOR_ARC);
-    primitive.bounds_min_x = cx - outer;
-    primitive.bounds_min_y = cy - outer;
-    primitive.bounds_max_x = cx + outer;
-    primitive.bounds_max_y = cy + outer;
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_DRAW_ARC);
     primitive.param0[0] = cx;
     primitive.param0[1] = cy;
     primitive.param0[2] = radius;
     primitive.param0[3] = half_thickness;
     primitive.param1[0] = rotation_rad;
     primitive.param1[1] = half_aperture_rad;
-    return drawSinglePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_draw_arc");
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_draw_arc");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_fill_oval(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_fill_oval") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_fill_oval")) {
+        return 0;
+    }
+
+    const float left = std::min(x0, x1);
+    const float top = std::min(y0, y1);
+    const float right = std::max(x0, x1);
+    const float bottom = std::max(y0, y1);
+    const float radius_x = (right - left) * 0.5f;
+    const float radius_y = (bottom - top) * 0.5f;
+    if (radius_x <= 0.0f || radius_y <= 0.0f) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_FILL_ELLIPSE);
+    primitive.param0[0] = left + radius_x;
+    primitive.param0[1] = top + radius_y;
+    primitive.param0[2] = radius_x;
+    primitive.param0[3] = radius_y;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_fill_oval");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_stroke_oval(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float half_thickness,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_stroke_oval") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_stroke_oval")) {
+        return 0;
+    }
+
+    const float left = std::min(x0, x1);
+    const float top = std::min(y0, y1);
+    const float right = std::max(x0, x1);
+    const float bottom = std::max(y0, y1);
+    const float radius_x = (right - left) * 0.5f;
+    const float radius_y = (bottom - top) * 0.5f;
+    if (radius_x <= 0.0f || radius_y <= 0.0f) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_STROKE_ELLIPSE);
+    primitive.param0[0] = left + radius_x;
+    primitive.param0[1] = top + radius_y;
+    primitive.param0[2] = radius_x;
+    primitive.param0[3] = radius_y;
+    primitive.param1[0] = half_thickness;
+    return drawSingleSurfacePrimitive(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitive, "wingui_spec_bind_frame_stroke_oval");
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_path(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const float* points_xy,
+    uint32_t point_count,
+    int32_t closed,
+    float half_thickness,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_draw_path") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_draw_path")) {
+        return 0;
+    }
+    if (point_count == 0) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+    if (!points_xy) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_draw_path: points_xy was null");
+        return 0;
+    }
+    if (point_count < 2) {
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+
+    std::vector<WinguiSurfacePrimitive> primitives;
+    std::vector<float> path_buffer(points_xy, points_xy + static_cast<size_t>(point_count) * 2u);
+    WinguiSurfacePrimitive primitive = makeSurfacePrimitiveBase(color_r, color_g, color_b, color_a, WINGUI_SURFACE_DRAW_PATH);
+    primitive.flags = closed ? WINGUI_SURFACE_PATH_CLOSED : 0u;
+    primitive.point_offset = 0;
+    primitive.point_count = point_count;
+    primitive.param1[0] = half_thickness;
+    primitives.push_back(primitive);
+
+    return drawSurfacePrimitiveBatch(frame_view, pane, content_buffer_mode, blend_mode, clear_before, clear_color_rgba, primitives, path_buffer, "wingui_spec_bind_frame_draw_path");
 }
 
 extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_text_utf8(
@@ -1437,52 +1927,7 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_text_utf8(
         return 0;
     }
 
-    WinguiGlyphAtlasInfo atlas_info{};
-    if (!super_terminal_get_glyph_atlas_info(frame_view->ctx, &atlas_info)) {
-        wingui_set_last_error_string_internal("wingui_spec_bind_frame_draw_text_utf8: glyph atlas query failed");
-        return 0;
-    }
-
-    uint32_t primitive_count = 0;
-    if (!wingui_text_layout_with_atlas_info_utf8(
-            &atlas_info,
-            text_utf8,
-            origin_x,
-            origin_y,
-            color_r,
-            color_g,
-            color_b,
-            color_a,
-            nullptr,
-            &primitive_count,
-            0)) {
-        wingui_set_last_error_string_internal("wingui_spec_bind_frame_draw_text_utf8: text layout count failed");
-        return 0;
-    }
-    if (primitive_count == 0) {
-        wingui_clear_last_error_internal();
-        return 1;
-    }
-
-    std::vector<WinguiVectorPrimitive> primitives(primitive_count);
-    uint32_t written_count = primitive_count;
-    if (!wingui_text_layout_with_atlas_info_utf8(
-            &atlas_info,
-            text_utf8,
-            origin_x,
-            origin_y,
-            color_r,
-            color_g,
-            color_b,
-            color_a,
-            primitives.data(),
-            &written_count,
-            primitive_count)) {
-        wingui_set_last_error_string_internal("wingui_spec_bind_frame_draw_text_utf8: text layout failed");
-        return 0;
-    }
-
-    if (!super_terminal_vector_draw(
+    if (!super_terminal_surface_draw_text_utf8(
             frame_view->ctx,
             pane.pane_id,
             pane.buffer_index,
@@ -1490,12 +1935,385 @@ extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_draw_text_utf8(
             blend_mode,
             clear_before,
             clear_color_rgba,
-            primitives.data(),
-            written_count)) {
+            text_utf8,
+            origin_x,
+            origin_y,
+            color_r,
+            color_g,
+            color_b,
+            color_a)) {
         wingui_set_last_error_string_internal("wingui_spec_bind_frame_draw_text_utf8: draw failed");
         return 0;
     }
 
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_mark_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    int32_t mode,
+    float x0,
+    float y0,
+    float x1,
+    float y1) {
+    float color_r = 0.30f;
+    float color_g = 0.58f;
+    float color_b = 1.0f;
+    float color_a = 0.28f;
+    if (mode == 1) {
+        color_r = 1.0f;
+        color_g = 1.0f;
+        color_b = 1.0f;
+        color_a = 0.25f;
+    } else if (mode == 2) {
+        color_r = 0.0f;
+        color_g = 0.0f;
+        color_b = 0.0f;
+        color_a = 0.22f;
+    }
+    return wingui_spec_bind_frame_fill_rect(
+        frame_view,
+        pane,
+        content_buffer_mode,
+        blend_mode,
+        clear_before,
+        clear_color_rgba,
+        x0,
+        y0,
+        x1,
+        y1,
+        0.0f,
+        color_r,
+        color_g,
+        color_b,
+        color_a);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_caret(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    return wingui_spec_bind_frame_fill_rect(
+        frame_view,
+        pane,
+        content_buffer_mode,
+        blend_mode,
+        clear_before,
+        clear_color_rgba,
+        x0,
+        y0,
+        x1,
+        y1,
+        0.0f,
+        color_r,
+        color_g,
+        color_b,
+        color_a);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_selection_range(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    return wingui_spec_bind_frame_fill_rect(
+        frame_view,
+        pane,
+        content_buffer_mode,
+        blend_mode,
+        clear_before,
+        clear_color_rgba,
+        x0,
+        y0,
+        x1,
+        y1,
+        0.0f,
+        color_r,
+        color_g,
+        color_b,
+        color_a);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_focus_ring(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    float x0,
+    float y0,
+    float x1,
+    float y1,
+    float half_thickness,
+    float corner_radius,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a) {
+    return wingui_spec_bind_frame_stroke_rect(
+        frame_view,
+        pane,
+        content_buffer_mode,
+        blend_mode,
+        clear_before,
+        clear_color_rgba,
+        x0,
+        y0,
+        x1,
+        y1,
+        half_thickness,
+        corner_radius,
+        color_r,
+        color_g,
+        color_b,
+        color_a);
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_push_clip_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    float x0,
+    float y0,
+    float x1,
+    float y1) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_push_clip_rect") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_push_clip_rect")) {
+        return 0;
+    }
+    if (!super_terminal_surface_push_clip_rect(frame_view->ctx, pane.pane_id, x0, y0, x1, y1)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_push_clip_rect: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_pop_clip_rect(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_pop_clip_rect") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_pop_clip_rect")) {
+        return 0;
+    }
+    if (!super_terminal_surface_pop_clip_rect(frame_view->ctx, pane.pane_id)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_pop_clip_rect: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_push_offset(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    float dx,
+    float dy) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_push_offset") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_push_offset")) {
+        return 0;
+    }
+    if (!super_terminal_surface_push_offset(frame_view->ctx, pane.pane_id, dx, dy)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_push_offset: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_pop_offset(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_pop_offset") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_pop_offset")) {
+        return 0;
+    }
+    if (!super_terminal_surface_pop_offset(frame_view->ctx, pane.pane_id)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_pop_offset: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_reset_composition(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_reset_composition") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_reset_composition")) {
+        return 0;
+    }
+    if (!super_terminal_surface_reset_composition(frame_view->ctx, pane.pane_id)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_reset_composition: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_surface_install_child_view_bounds(
+    const WinguiSpecBindFrameView* frame_view,
+    WinguiSpecBindPaneRef pane,
+    int32_t child_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1) {
+    if (!validateFrameView(frame_view, "wingui_spec_bind_frame_surface_install_child_view_bounds") ||
+        !validatePaneRef(pane, "wingui_spec_bind_frame_surface_install_child_view_bounds")) {
+        return 0;
+    }
+    if (!super_terminal_surface_install_child_view_bounds(frame_view->ctx, pane.pane_id, child_id, x0, y0, x1, y1)) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_surface_install_child_view_bounds: enqueue failed");
+        return 0;
+    }
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_measure_text_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float* out_width,
+    float* out_height,
+    uint32_t* out_char_count) {
+    if (!out_width || !out_height || !out_char_count) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_measure_text_utf8: output pointer was null");
+        return 0;
+    }
+
+    IDWriteTextLayout* layout = nullptr;
+    SurfaceDecodedText decoded{};
+    if (!createSurfaceTextLayout(frame_view, text_utf8, &layout, &decoded, "wingui_spec_bind_frame_measure_text_utf8")) {
+        return 0;
+    }
+
+    DWRITE_TEXT_METRICS metrics{};
+    const HRESULT hr = layout->GetMetrics(&metrics);
+    if (FAILED(hr)) {
+        releaseCom(layout);
+        wingui_set_last_error_hresult_internal("wingui_spec_bind_frame_measure_text_utf8: GetMetrics failed", hr);
+        return 0;
+    }
+
+    *out_width = metrics.widthIncludingTrailingWhitespace;
+    *out_height = metrics.height;
+    *out_char_count = decoded.char_count;
+    releaseCom(layout);
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_char_index_at_point_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float x,
+    float y,
+    uint32_t* out_char_index) {
+    if (!out_char_index) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_char_index_at_point_utf8: out_char_index was null");
+        return 0;
+    }
+
+    IDWriteTextLayout* layout = nullptr;
+    SurfaceDecodedText decoded{};
+    if (!createSurfaceTextLayout(frame_view, text_utf8, &layout, &decoded, "wingui_spec_bind_frame_char_index_at_point_utf8")) {
+        return 0;
+    }
+
+    BOOL is_trailing_hit = FALSE;
+    BOOL is_inside = FALSE;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    const HRESULT hr = layout->HitTestPoint(
+        x - origin_x,
+        y - origin_y,
+        &is_trailing_hit,
+        &is_inside,
+        &metrics);
+    if (FAILED(hr)) {
+        releaseCom(layout);
+        wingui_set_last_error_hresult_internal("wingui_spec_bind_frame_char_index_at_point_utf8: HitTestPoint failed", hr);
+        return 0;
+    }
+
+    uint32_t utf16_position = metrics.textPosition + (is_trailing_hit ? metrics.length : 0u);
+    *out_char_index = charIndexFromUtf16Position(decoded, utf16_position);
+    releaseCom(layout);
+    wingui_clear_last_error_internal();
+    return 1;
+}
+
+extern "C" WINGUI_API int32_t WINGUI_CALL wingui_spec_bind_frame_point_at_char_index_utf8(
+    const WinguiSpecBindFrameView* frame_view,
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    uint32_t char_index,
+    float* out_x,
+    float* out_y) {
+    if (!out_x || !out_y) {
+        wingui_set_last_error_string_internal("wingui_spec_bind_frame_point_at_char_index_utf8: output pointer was null");
+        return 0;
+    }
+
+    IDWriteTextLayout* layout = nullptr;
+    SurfaceDecodedText decoded{};
+    if (!createSurfaceTextLayout(frame_view, text_utf8, &layout, &decoded, "wingui_spec_bind_frame_point_at_char_index_utf8")) {
+        return 0;
+    }
+
+    if (decoded.char_to_utf16.empty()) {
+        *out_x = origin_x;
+        *out_y = origin_y;
+        releaseCom(layout);
+        wingui_clear_last_error_internal();
+        return 1;
+    }
+
+    const uint32_t clamped_index = std::min<uint32_t>(char_index, decoded.char_count);
+    const UINT32 utf16_position = decoded.char_to_utf16[clamped_index];
+    FLOAT hit_x = 0.0f;
+    FLOAT hit_y = 0.0f;
+    DWRITE_HIT_TEST_METRICS metrics{};
+    const HRESULT hr = layout->HitTestTextPosition(utf16_position, FALSE, &hit_x, &hit_y, &metrics);
+    if (FAILED(hr)) {
+        releaseCom(layout);
+        wingui_set_last_error_hresult_internal("wingui_spec_bind_frame_point_at_char_index_utf8: HitTestTextPosition failed", hr);
+        return 0;
+    }
+
+    *out_x = origin_x + hit_x;
+    *out_y = origin_y + hit_y;
+    releaseCom(layout);
     wingui_clear_last_error_internal();
     return 1;
 }

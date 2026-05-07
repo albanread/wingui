@@ -1225,6 +1225,18 @@ UiNode ui_text_grid(std::string id_str, int64_t cols, int64_t rows, std::string 
     if (focused) n.focused(true);
     return n;
 }
+UiNode ui_surface(int64_t w, int64_t h, std::string e) {
+    UiNode n("surface"); n.width(w); n.height(h); if(!e.empty()) n.event(std::move(e)); return n;
+}
+UiNode ui_surface(std::string id_str, int64_t w, int64_t h, std::string e, bool focused) {
+    UiNode n("surface");
+    n.id(std::move(id_str));
+    n.width(w);
+    n.height(h);
+    if (!e.empty()) n.event(std::move(e));
+    if (focused) n.focused(true);
+    return n;
+}
 UiNode ui_indexed_graphics(int64_t w, int64_t h, std::string e) {
     UiNode n("indexed-graphics"); n.width(w); n.height(h); if(!e.empty()) n.event(std::move(e)); return n;
 }

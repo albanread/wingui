@@ -50,6 +50,13 @@ typedef struct SuperTerminalPaneLayout {
     float cell_height;
 } SuperTerminalPaneLayout;
 
+typedef struct SuperTerminalChildViewBounds {
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+} SuperTerminalChildViewBounds;
+
 typedef enum SuperTerminalHostErrorCode {
     SUPERTERMINAL_HOST_ERROR_NONE = 0,
     SUPERTERMINAL_HOST_ERROR_INVALID_ARGUMENT = 1,
@@ -84,6 +91,14 @@ typedef enum SuperTerminalCommandType {
     SUPERTERMINAL_CMD_VECTOR_DRAW_OWNED = 18,
     SUPERTERMINAL_CMD_INDEXED_FILL_RECT = 19,
     SUPERTERMINAL_CMD_INDEXED_DRAW_LINE = 20,
+    SUPERTERMINAL_CMD_SURFACE_DRAW_TEXT_OWNED = 21,
+    SUPERTERMINAL_CMD_SURFACE_DRAW_PRIMITIVES_OWNED = 22,
+    SUPERTERMINAL_CMD_SURFACE_PUSH_CLIP_RECT = 23,
+    SUPERTERMINAL_CMD_SURFACE_POP_CLIP_RECT = 24,
+    SUPERTERMINAL_CMD_SURFACE_PUSH_OFFSET = 25,
+    SUPERTERMINAL_CMD_SURFACE_POP_OFFSET = 26,
+    SUPERTERMINAL_CMD_SURFACE_RESET_COMPOSITION = 27,
+    SUPERTERMINAL_CMD_SURFACE_INSTALL_CHILD_VIEW_BOUNDS = 28,
 } SuperTerminalCommandType;
 
 typedef void (WINGUI_CALL *SuperTerminalFreeFn)(void* user_data, void* buffer);
@@ -364,6 +379,79 @@ typedef struct SuperTerminalIndexedDrawLine {
     uint32_t palette_index;  /* 0-255 */
 } SuperTerminalIndexedDrawLine;
 
+typedef struct SuperTerminalSurfaceDrawTextOwned {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;
+    uint32_t content_buffer_mode; /* SuperTerminalRgbaContentBufferMode */
+    uint32_t blend_mode;          /* WINGUI_RGBA_BLIT_OPAQUE or WINGUI_RGBA_BLIT_ALPHA_OVER */
+    int32_t clear_before;
+    float clear_color[4];
+    float origin_x;
+    float origin_y;
+    float color[4];
+    void* text_utf8;              /* owned UTF-8 string */
+    SuperTerminalFreeFn free_fn;
+    void* free_user_data;
+} SuperTerminalSurfaceDrawTextOwned;
+
+typedef struct SuperTerminalSurfaceDrawPrimitivesOwned {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+    uint32_t buffer_index;
+    uint32_t content_buffer_mode; /* SuperTerminalRgbaContentBufferMode */
+    uint32_t blend_mode;
+    int32_t clear_before;
+    float clear_color[4];
+    void* primitives;             /* owned WinguiSurfacePrimitive[primitive_count] */
+    uint32_t primitive_count;
+    void* path_points_xy;         /* owned float[path_point_count * 2] */
+    uint32_t path_point_count;
+    SuperTerminalFreeFn free_fn;
+    void* free_user_data;
+} SuperTerminalSurfaceDrawPrimitivesOwned;
+
+typedef struct SuperTerminalSurfacePushClipRect {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+} SuperTerminalSurfacePushClipRect;
+
+typedef struct SuperTerminalSurfacePopClipRect {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+} SuperTerminalSurfacePopClipRect;
+
+typedef struct SuperTerminalSurfacePushOffset {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+    float dx;
+    float dy;
+} SuperTerminalSurfacePushOffset;
+
+typedef struct SuperTerminalSurfacePopOffset {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+} SuperTerminalSurfacePopOffset;
+
+typedef struct SuperTerminalSurfaceResetComposition {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+} SuperTerminalSurfaceResetComposition;
+
+typedef struct SuperTerminalSurfaceInstallChildViewBounds {
+    SuperTerminalWindowId window_id;
+    SuperTerminalPaneId pane_id;
+    int32_t child_id;
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+} SuperTerminalSurfaceInstallChildViewBounds;
+
 typedef struct SuperTerminalCommand {
     SuperTerminalCommandType type;
     uint32_t sequence;
@@ -385,6 +473,14 @@ typedef struct SuperTerminalCommand {
         SuperTerminalVectorDrawOwned vector_draw_owned;
         SuperTerminalIndexedFillRect indexed_fill_rect;
         SuperTerminalIndexedDrawLine  indexed_draw_line;
+        SuperTerminalSurfaceDrawTextOwned surface_draw_text_owned;
+        SuperTerminalSurfaceDrawPrimitivesOwned surface_draw_primitives_owned;
+        SuperTerminalSurfacePushClipRect surface_push_clip_rect;
+        SuperTerminalSurfacePopClipRect surface_pop_clip_rect;
+        SuperTerminalSurfacePushOffset surface_push_offset;
+        SuperTerminalSurfacePopOffset surface_pop_offset;
+        SuperTerminalSurfaceResetComposition surface_reset_composition;
+        SuperTerminalSurfaceInstallChildViewBounds surface_install_child_view_bounds;
     } data;
 } SuperTerminalCommand;
 
@@ -618,9 +714,28 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_get_pane_layout_for_window(
     SuperTerminalPaneId pane_id,
     SuperTerminalPaneLayout* out_layout);
 
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_surface_child_view_bounds(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    SuperTerminalChildViewBounds* out_bounds);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_surface_child_view_bounds_for_window(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalWindowId window_id,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    SuperTerminalChildViewBounds* out_bounds);
+
 WINGUI_API int32_t WINGUI_CALL super_terminal_get_mouse_state(
     SuperTerminalClientContext* ctx,
     WinguiMouseState* out_state);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_get_text_config(
+    SuperTerminalClientContext* ctx,
+    const char** out_font_family_utf8,
+    int32_t* out_font_pixel_height,
+    float* out_dpi_scale);
 
 WINGUI_API int32_t WINGUI_CALL super_terminal_get_native_ui_patch_metrics(
     SuperTerminalClientContext* ctx,
@@ -792,6 +907,70 @@ WINGUI_API int32_t WINGUI_CALL super_terminal_vector_draw(
     const float clear_color_rgba[4],
     const WinguiVectorPrimitive* primitives,
     uint32_t primitive_count);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_draw_text_utf8(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const char* text_utf8,
+    float origin_x,
+    float origin_y,
+    float color_r,
+    float color_g,
+    float color_b,
+    float color_a);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_draw_primitives(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    uint32_t buffer_index,
+    uint32_t content_buffer_mode,
+    uint32_t blend_mode,
+    int32_t clear_before,
+    const float clear_color_rgba[4],
+    const WinguiSurfacePrimitive* primitives,
+    uint32_t primitive_count,
+    const float* path_points_xy,
+    uint32_t path_point_count);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_push_clip_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_pop_clip_rect(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_push_offset(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    float dx,
+    float dy);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_pop_offset(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_reset_composition(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id);
+
+WINGUI_API int32_t WINGUI_CALL super_terminal_surface_install_child_view_bounds(
+    SuperTerminalClientContext* ctx,
+    SuperTerminalPaneId pane_id,
+    int32_t child_id,
+    float x0,
+    float y0,
+    float x1,
+    float y1);
 
 /* Fill a rectangle in an indexed-colour pane buffer with a single palette index.
    Uses a compute shader; does not stall the CPU.

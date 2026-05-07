@@ -759,6 +759,7 @@ using wingui::ui_rtf_from_markdown;
 
 // D3D surface panes
 using wingui::ui_text_grid;
+using wingui::ui_surface;
 using wingui::ui_indexed_graphics;
 using wingui::ui_rgba_pane;
 
