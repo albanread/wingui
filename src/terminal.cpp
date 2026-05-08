@@ -301,9 +301,6 @@ struct RegisteredPane {
     WinguiVectorRenderer* pane_vector_renderer = nullptr;
     int32_t pane_vector_renderer_atlas_set = 0;
     bool surface_clear_pending[2]{true, true};
-    // Number of presents still owed before the swapchain back buffers are both up to date.
-    // Set to 2 (or swapchain buffer count) on any change; decremented on each successful present.
-    uint32_t surface_present_dirty = 2;
     std::vector<SurfaceClipState> surface_clip_stack;
     std::vector<SurfaceOffsetState> surface_offset_stack;
     std::unordered_map<int32_t, SurfaceChildViewBounds> surface_child_view_bounds;
@@ -1631,10 +1628,6 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
     const int32_t target_height = std::max(layout.height, 1);
     const uint32_t required_surface_buffer_count =
         pane.surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 1u : 2u;
-    const bool presenter_size_changed =
-        pane.surface_hwnd == node_hwnd_raw && pane.surface_context &&
-        (target_width != static_cast<int32_t>(pane.surface_presenter_width) ||
-         target_height != static_cast<int32_t>(pane.surface_presenter_height));
     bool created_surface = false;
     if (pane.surface_hwnd != node_hwnd_raw || !pane.surface_context || !pane.pane_surface_renderer ||
         !pane.surface_surface_handle || !pane.pane_vector_renderer ||
@@ -1731,7 +1724,6 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
         pane.surface_presenter_height = static_cast<uint32_t>(target_height);
         pane.surface_clear_pending[0] = true;
         pane.surface_clear_pending[1] = true;
-        pane.surface_present_dirty = 2;
         created_surface = true;
     }
 
@@ -1763,9 +1755,6 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
             pane.surface_surface_handle,
             pane.surface_screen_width,
             pane.surface_screen_height) != 0;
-    }
-    if (presenter_size_changed) {
-        pane.surface_present_dirty = 2;
     }
     return true;
 }
@@ -2724,7 +2713,6 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                     pane->render_kind = PANE_RENDER_SURFACE;
                     applySurfaceContentBufferMode(*pane, vd.content_buffer_mode, "vector_draw");
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
-                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         surface_w = pane->surface_screen_width;
                         surface_h = pane->surface_screen_height;
@@ -2801,7 +2789,6 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                     applySurfaceContentBufferMode(*pane, td.content_buffer_mode, "draw_text");
                     ensureSurfaceCompositionState(*pane);
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
-                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         target_buffer_index =
                             pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (td.buffer_index & 1u);
@@ -2897,7 +2884,6 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                     applySurfaceContentBufferMode(*pane, pd.content_buffer_mode, "draw_primitives");
                     ensureSurfaceCompositionState(*pane);
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
-                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         target_buffer_index =
                             pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (pd.buffer_index & 1u);
