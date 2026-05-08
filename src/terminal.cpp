@@ -100,10 +100,74 @@ void traceNativePatchEvent(const std::string& message) {
     CloseHandle(file);
 }
 
+// Pane-id allowlist, populated once at startup from environment:
+//   WINGUI_TRACE_ALL=1                trace every pane
+//   WINGUI_TRACE_NODES=foo,bar,baz    trace only those node ids (in addition
+//                                     to the built-in workspace and demo set)
+struct PaneTraceConfig {
+    bool trace_all = false;
+    std::vector<std::string> allowlist;
+};
+
+const PaneTraceConfig& paneTraceConfig() {
+    static const PaneTraceConfig config = []() {
+        PaneTraceConfig cfg;
+        auto read_env = [](const char* name, std::string& out) -> bool {
+            // Use GetEnvironmentVariableA rather than std::getenv to avoid the
+            // MSVC C4996 deprecation warning under strict secure-CRT settings.
+            // Avoid the names `small`/`big` because some Windows compat headers
+            // (`rpcndr.h`) `#define small char`.
+            char inline_buf[1024];
+            DWORD n = GetEnvironmentVariableA(name, inline_buf, sizeof(inline_buf));
+            if (n == 0) return false;
+            if (n < sizeof(inline_buf)) {
+                out.assign(inline_buf, n);
+                return true;
+            }
+            std::vector<char> heap_buf(n);
+            DWORD got = GetEnvironmentVariableA(name, heap_buf.data(), n);
+            if (got == 0 || got >= n) return false;
+            out.assign(heap_buf.data(), got);
+            return true;
+        };
+        std::string raw;
+        if (read_env("WINGUI_TRACE_ALL", raw)) {
+            cfg.trace_all = !raw.empty() && raw != "0" && raw != "false" && raw != "off";
+        }
+        if (read_env("WINGUI_TRACE_NODES", raw)) {
+            std::string current;
+            for (char c : raw) {
+                if (c == ',' || c == ';') {
+                    if (!current.empty()) cfg.allowlist.push_back(std::move(current));
+                    current.clear();
+                } else if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                    current.push_back(c);
+                }
+            }
+            if (!current.empty()) cfg.allowlist.push_back(std::move(current));
+        }
+        return cfg;
+    }();
+    return config;
+}
+
+// Despite the historical name this function gates **all** the per-pane
+// `traceNativePatchEvent` call sites in this file, not just the workspace
+// trio. The default allowlist now also covers `demo_surface` so the bring-up
+// surface pane is visible without having to set an env var.
 bool shouldTraceWorkspacePaneNodeId(const std::string& node_id) {
-    return node_id == "workspace_editor" ||
+    if (node_id == "workspace_editor" ||
         node_id == "workspace_graphics" ||
-        node_id == "workspace_repl";
+        node_id == "workspace_repl" ||
+        node_id == "demo_surface") {
+        return true;
+    }
+    const PaneTraceConfig& cfg = paneTraceConfig();
+    if (cfg.trace_all) return true;
+    for (const std::string& candidate : cfg.allowlist) {
+        if (candidate == node_id) return true;
+    }
+    return false;
 }
 
 struct TerminalCell {
@@ -227,6 +291,8 @@ struct RegisteredPane {
     uint32_t surface_buffer_count = 0;
     uint32_t surface_screen_width = 0;
     uint32_t surface_screen_height = 0;
+    uint32_t surface_presenter_width = 0;
+    uint32_t surface_presenter_height = 0;
     uint32_t surface_pixel_aspect_num = 1;
     uint32_t surface_pixel_aspect_den = 1;
     void* surface_hwnd = nullptr;
@@ -235,6 +301,9 @@ struct RegisteredPane {
     WinguiVectorRenderer* pane_vector_renderer = nullptr;
     int32_t pane_vector_renderer_atlas_set = 0;
     bool surface_clear_pending[2]{true, true};
+    // Number of presents still owed before the swapchain back buffers are both up to date.
+    // Set to 2 (or swapchain buffer count) on any change; decremented on each successful present.
+    uint32_t surface_present_dirty = 2;
     std::vector<SurfaceClipState> surface_clip_stack;
     std::vector<SurfaceOffsetState> surface_offset_stack;
     std::unordered_map<int32_t, SurfaceChildViewBounds> surface_child_view_bounds;
@@ -286,6 +355,30 @@ SurfaceClipState currentSurfaceClip(const RegisteredPane& pane) {
 
 SurfaceOffsetState currentSurfaceOffset(const RegisteredPane& pane) {
     return pane.surface_offset_stack.empty() ? SurfaceOffsetState{} : pane.surface_offset_stack.back();
+}
+
+// Update `pane.surface_content_buffer_mode` and trace if the value actually
+// changes. The mode is set per-command from the payload, so a single stray
+// FRAME-mode command in an otherwise PERSISTENT batch will flip the pane
+// and cause `ensurePaneSurfacePresenter` to recreate the presenter (losing
+// buffer contents). Diagnosing that requires seeing every flip, with the
+// command source so we know which CP-side path emitted it.
+void applySurfaceContentBufferMode(RegisteredPane& pane,
+                                   uint32_t new_mode,
+                                   const char* source_tag) {
+    const uint32_t prev_mode = pane.surface_content_buffer_mode;
+    pane.surface_content_buffer_mode = new_mode;
+    if (prev_mode != new_mode && shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        char buffer[256];
+        std::snprintf(buffer,
+                      sizeof(buffer),
+                      "surface-mode-change id=%s from=%u to=%u source=%s",
+                      pane.node_id.c_str(),
+                      static_cast<unsigned>(prev_mode),
+                      static_cast<unsigned>(new_mode),
+                      source_tag);
+        traceNativePatchEvent(buffer);
+    }
 }
 
 template <typename T>
@@ -1235,6 +1328,10 @@ void destroyPaneSurfacePresenter(RegisteredPane& pane) {
     }
     pane.surface_hwnd = nullptr;
     pane.surface_buffer_count = 0;
+    pane.surface_screen_width = 0;
+    pane.surface_screen_height = 0;
+    pane.surface_presenter_width = 0;
+    pane.surface_presenter_height = 0;
     pane.pane_vector_renderer_atlas_set = 0;
     pane.surface_clear_pending[0] = true;
     pane.surface_clear_pending[1] = true;
@@ -1534,18 +1631,55 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
     const int32_t target_height = std::max(layout.height, 1);
     const uint32_t required_surface_buffer_count =
         pane.surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 1u : 2u;
-    const bool size_changed =
-        pane.surface_screen_width != static_cast<uint32_t>(target_width) ||
-        pane.surface_screen_height != static_cast<uint32_t>(target_height);
+    const bool presenter_size_changed =
+        pane.surface_hwnd == node_hwnd_raw && pane.surface_context &&
+        (target_width != static_cast<int32_t>(pane.surface_presenter_width) ||
+         target_height != static_cast<int32_t>(pane.surface_presenter_height));
+    bool created_surface = false;
     if (pane.surface_hwnd != node_hwnd_raw || !pane.surface_context || !pane.pane_surface_renderer ||
         !pane.surface_surface_handle || !pane.pane_vector_renderer ||
         pane.surface_buffer_count != required_surface_buffer_count) {
         if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            // Determine WHY the presenter is being torn down. Exactly one of
+            // these is the primary cause (checked in the same order as the
+            // `if` guard above), but log all matching reasons since multiple
+            // can be true simultaneously e.g. on first creation everything
+            // is null. Surface buffer content is lost on every recreation,
+            // so this trace is the single most informative signal for
+            // diagnosing "surface vanished after a UI event".
+            char reasons[256] = {0};
+            size_t off = 0;
+            auto add_reason = [&](const char* tag) {
+                int n = std::snprintf(reasons + off, sizeof(reasons) - off,
+                                      off ? "|%s" : "%s", tag);
+                if (n > 0) off += static_cast<size_t>(n);
+            };
+            const bool initial_create =
+                pane.surface_hwnd == nullptr && pane.surface_context == nullptr;
+            if (initial_create) {
+                add_reason("first_create");
+            } else {
+                if (pane.surface_hwnd != node_hwnd_raw) add_reason("hwnd_changed");
+                if (!pane.surface_context) add_reason("context_lost");
+                if (!pane.pane_surface_renderer) add_reason("pane_renderer_lost");
+                if (!pane.surface_surface_handle) add_reason("surface_handle_lost");
+                if (!pane.pane_vector_renderer) add_reason("vector_renderer_lost");
+                if (pane.surface_buffer_count != required_surface_buffer_count) {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), "buffer_count_changed(%u->%u)",
+                                  static_cast<unsigned>(pane.surface_buffer_count),
+                                  static_cast<unsigned>(required_surface_buffer_count));
+                    add_reason(buf);
+                }
+            }
+            if (off == 0) add_reason("unknown");
+
             char buffer[512];
             std::snprintf(buffer,
                           sizeof(buffer),
-                          "attach-surface-presenter id=%s hwnd=%p old_hwnd=%p w=%d h=%d buffers=%u mode=%u",
+                          "attach-surface-presenter id=%s reason=%s hwnd=%p old_hwnd=%p w=%d h=%d buffers=%u mode=%u",
                           pane.node_id.c_str(),
+                          reasons,
                           node_hwnd_raw,
                           pane.surface_hwnd,
                           static_cast<int>(target_width),
@@ -1591,8 +1725,14 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
 
         pane.surface_hwnd = node_hwnd_raw;
         pane.surface_buffer_count = required_surface_buffer_count;
+        pane.surface_screen_width = static_cast<uint32_t>(target_width);
+        pane.surface_screen_height = static_cast<uint32_t>(target_height);
+        pane.surface_presenter_width = static_cast<uint32_t>(target_width);
+        pane.surface_presenter_height = static_cast<uint32_t>(target_height);
         pane.surface_clear_pending[0] = true;
         pane.surface_clear_pending[1] = true;
+        pane.surface_present_dirty = 2;
+        created_surface = true;
     }
 
     if (pane.pane_vector_renderer && !pane.pane_vector_renderer_atlas_set && host->atlas.pixels_rgba) {
@@ -1602,8 +1742,8 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
     }
 
     wingui_resize_context(pane.surface_context, static_cast<uint32_t>(target_width), static_cast<uint32_t>(target_height));
-    pane.surface_screen_width = static_cast<uint32_t>(target_width);
-    pane.surface_screen_height = static_cast<uint32_t>(target_height);
+    pane.surface_presenter_width = static_cast<uint32_t>(target_width);
+    pane.surface_presenter_height = static_cast<uint32_t>(target_height);
     pane.surface_pixel_aspect_num = pane.surface_pixel_aspect_num ? pane.surface_pixel_aspect_num : 1u;
     pane.surface_pixel_aspect_den = pane.surface_pixel_aspect_den ? pane.surface_pixel_aspect_den : 1u;
     if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
@@ -1618,15 +1758,16 @@ bool ensurePaneSurfacePresenter(SuperTerminalRuntimeHost* host,
                       static_cast<unsigned>(pane.surface_buffer_count));
         traceNativePatchEvent(buffer);
     }
-    const bool ensured = wingui_rgba_surface_ensure_buffers(
-        pane.surface_surface_handle,
-        pane.surface_screen_width,
-        pane.surface_screen_height) != 0;
-    if (ensured && size_changed) {
-        pane.surface_clear_pending[0] = true;
-        pane.surface_clear_pending[1] = true;
+    if (created_surface) {
+        return wingui_rgba_surface_ensure_buffers(
+            pane.surface_surface_handle,
+            pane.surface_screen_width,
+            pane.surface_screen_height) != 0;
     }
-    return ensured;
+    if (presenter_size_changed) {
+        pane.surface_present_dirty = 2;
+    }
+    return true;
 }
 
 void resizeHostWindowToNativeContent(SuperTerminalRuntimeHost* host) {
@@ -1730,13 +1871,37 @@ bool renderSurfacePane(SuperTerminalRuntimeHost* host,
                        RegisteredPane& pane,
                        const SuperTerminalPaneLayout& layout,
                        uint32_t buffer_index) {
-    if (layout.visible == 0 || layout.width <= 0 || layout.height <= 0) return true;
+    if (layout.visible == 0 || layout.width <= 0 || layout.height <= 0) {
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            char buffer[256];
+            std::snprintf(buffer,
+                          sizeof(buffer),
+                          "render-surface-pane-skip id=%s reason=invisible vis=%d w=%d h=%d",
+                          pane.node_id.c_str(),
+                          layout.visible,
+                          layout.width,
+                          layout.height);
+            traceNativePatchEvent(buffer);
+        }
+        return true;
+    }
     if (!ensurePaneSurfacePresenter(host, pane, layout)) return true;
     const uint32_t pane_buffer_index =
         pane.surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (buffer_index & 1u);
-    if (pane.surface_clear_pending[pane_buffer_index & 1u]) {
-        wingui_rgba_surface_clear(pane.surface_surface_handle, pane_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
-        pane.surface_clear_pending[pane_buffer_index & 1u] = false;
+    if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        char buf[256];
+        std::snprintf(buf,
+                      sizeof(buf),
+                      "render-surface-pane id=%s x=%d y=%d w=%d h=%d screen=%ux%u mode=%u bufidx=%u clear_pending=%d/%d",
+                      pane.node_id.c_str(),
+                      layout.x, layout.y, layout.width, layout.height,
+                      static_cast<unsigned>(pane.surface_screen_width),
+                      static_cast<unsigned>(pane.surface_screen_height),
+                      static_cast<unsigned>(pane.surface_content_buffer_mode),
+                      static_cast<unsigned>(pane_buffer_index),
+                      pane.surface_clear_pending[0] ? 1 : 0,
+                      pane.surface_clear_pending[1] ? 1 : 0);
+        traceNativePatchEvent(buf);
     }
     if (!wingui_begin_frame(pane.surface_context, 0.0f, 0.0f, 0.0f, 1.0f)) return false;
     const bool ok = wingui_rgba_surface_render(
@@ -1752,8 +1917,19 @@ bool renderSurfacePane(SuperTerminalRuntimeHost* host,
         pane.surface_pixel_aspect_den,
         pane_buffer_index,
         nullptr) != 0;
-    if (!ok) return false;
-    return wingui_present(pane.surface_context, 1) != 0;
+    if (!ok) {
+        if (shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+            traceNativePatchEvent(std::string("render-surface-pane-fail id=") + pane.node_id +
+                                  " stage=rgba_surface_render");
+        }
+        return false;
+    }
+    const bool presented = wingui_present(pane.surface_context, 1) != 0;
+    if (!presented && shouldTraceWorkspacePaneNodeId(pane.node_id)) {
+        traceNativePatchEvent(std::string("render-surface-pane-fail id=") + pane.node_id +
+                              " stage=present");
+    }
+    return presented;
 }
 
 bool renderSurface(SuperTerminalRuntimeHost* host) {
@@ -2546,14 +2722,25 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 RegisteredPane* pane = ensureRegisteredPaneLocked(host, vd.pane_id);
                 if (pane) {
                     pane->render_kind = PANE_RENDER_SURFACE;
-                    pane->surface_content_buffer_mode = vd.content_buffer_mode;
+                    applySurfaceContentBufferMode(*pane, vd.content_buffer_mode, "vector_draw");
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         surface_w = pane->surface_screen_width;
                         surface_h = pane->surface_screen_height;
                         vector_renderer = pane->pane_vector_renderer;
                         target_buffer_index =
                             pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (vd.buffer_index & 1u);
+                        if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "surface-cmd id=%s cmd=vector_draw bufidx=%u clear=%d count=%u",
+                                pane->node_id.c_str(),
+                                static_cast<unsigned>(target_buffer_index),
+                                vd.clear_before ? 1 : 0,
+                                static_cast<unsigned>(vd.primitive_count));
+                            traceNativePatchEvent(buf);
+                        }
                     }
                 }
             }
@@ -2567,22 +2754,6 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 break;
             }
             if (!vector_renderer) { free_prims(); break; }
-
-            {
-                std::lock_guard<std::mutex> lock(host->pane_mutex);
-                if (RegisteredPane* pane = registeredPaneForIdLocked(host, vd.pane_id, false)) {
-                    if (pane->render_kind == PANE_RENDER_SURFACE && pane->surface_clear_pending[target_buffer_index & 1u]) {
-                        wingui_rgba_surface_clear(
-                            surface,
-                            target_buffer_index,
-                            0.0f,
-                            0.0f,
-                            0.0f,
-                            0.0f);
-                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
-                    }
-                }
-            }
 
             if (vd.clear_before) {
                 wingui_rgba_surface_clear(
@@ -2627,30 +2798,31 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 RegisteredPane* pane = ensureRegisteredPaneLocked(host, td.pane_id);
                 if (pane) {
                     pane->render_kind = PANE_RENDER_SURFACE;
-                    pane->surface_content_buffer_mode = td.content_buffer_mode;
+                    applySurfaceContentBufferMode(*pane, td.content_buffer_mode, "draw_text");
                     ensureSurfaceCompositionState(*pane);
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         target_buffer_index =
                             pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (td.buffer_index & 1u);
                         clip_state = currentSurfaceClip(*pane);
                         offset_state = currentSurfaceOffset(*pane);
+                        if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "surface-cmd id=%s cmd=draw_text bufidx=%u clear=%d clip_active=%d",
+                                pane->node_id.c_str(),
+                                static_cast<unsigned>(target_buffer_index),
+                                td.clear_before ? 1 : 0,
+                                clip_state.active ? 1 : 0);
+                            traceNativePatchEvent(buf);
+                        }
                     }
                 }
             }
             if (!surface) {
                 free_text();
                 break;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(host->pane_mutex);
-                if (RegisteredPane* pane = registeredPaneForIdLocked(host, td.pane_id, false)) {
-                    if (pane->surface_clear_pending[target_buffer_index & 1u]) {
-                        wingui_rgba_surface_clear(surface, target_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
-                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
-                    }
-                }
             }
 
             if (td.clear_before) {
@@ -2722,30 +2894,32 @@ void applyCommand(SuperTerminalRuntimeHost* host, const SuperTerminalCommand& co
                 RegisteredPane* pane = ensureRegisteredPaneLocked(host, pd.pane_id);
                 if (pane) {
                     pane->render_kind = PANE_RENDER_SURFACE;
-                    pane->surface_content_buffer_mode = pd.content_buffer_mode;
+                    applySurfaceContentBufferMode(*pane, pd.content_buffer_mode, "draw_primitives");
                     ensureSurfaceCompositionState(*pane);
                     if (ensurePaneSurfacePresenter(host, *pane, layout)) {
+                        pane->surface_present_dirty = 2;
                         surface = pane->surface_surface_handle;
                         target_buffer_index =
                             pane->surface_content_buffer_mode == SUPERTERMINAL_RGBA_CONTENT_BUFFER_PERSISTENT ? 0u : (pd.buffer_index & 1u);
                         clip_state = currentSurfaceClip(*pane);
                         offset_state = currentSurfaceOffset(*pane);
+                        if (shouldTraceWorkspacePaneNodeId(pane->node_id)) {
+                            char buf[256];
+                            std::snprintf(buf, sizeof(buf),
+                                "surface-cmd id=%s cmd=draw_primitives bufidx=%u clear=%d count=%u clip_active=%d",
+                                pane->node_id.c_str(),
+                                static_cast<unsigned>(target_buffer_index),
+                                pd.clear_before ? 1 : 0,
+                                static_cast<unsigned>(pd.primitive_count),
+                                clip_state.active ? 1 : 0);
+                            traceNativePatchEvent(buf);
+                        }
                     }
                 }
             }
             if (!surface) {
                 free_payload();
                 break;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(host->pane_mutex);
-                if (RegisteredPane* pane = registeredPaneForIdLocked(host, pd.pane_id, false)) {
-                    if (pane->surface_clear_pending[target_buffer_index & 1u]) {
-                        wingui_rgba_surface_clear(surface, target_buffer_index, 0.0f, 0.0f, 0.0f, 0.0f);
-                        pane->surface_clear_pending[target_buffer_index & 1u] = false;
-                    }
-                }
             }
 
             if (pd.clear_before) {
@@ -3480,10 +3654,10 @@ int32_t hostedAppStartup(SuperTerminalClientContext* ctx, void* user_data) {
         tick.buffer_index = tick.active_buffer_index ^ 1u;
         tick.buffer_count = 2u;
         runtime->desc.on_frame(ctx, &tick, runtime->desc.user_data);
-        SuperTerminalCommand swap_cmd{};
-        swap_cmd.type = SUPERTERMINAL_CMD_FRAME_SWAP;
-        super_terminal_enqueue(ctx, &swap_cmd);
         if (runtime->desc.auto_request_present) {
+            SuperTerminalCommand swap_cmd{};
+            swap_cmd.type = SUPERTERMINAL_CMD_FRAME_SWAP;
+            super_terminal_enqueue(ctx, &swap_cmd);
             super_terminal_request_present(ctx);
         }
         last_frame_ms = now_ms;
